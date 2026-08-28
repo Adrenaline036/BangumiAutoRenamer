@@ -1159,11 +1159,10 @@ class TaskQueueManager:
         *,
         timeout: float = 60.0,
     ) -> dict:
-        """Wait for the persisted current attempt; disk remains authoritative."""
+        """Read the persisted current attempt until it reaches a terminal state."""
 
         deadline = asyncio.get_running_loop().time() + max(float(timeout), 0.1)
         while True:
-            self._repair_selection_projection(task_id)
             operation = self._read(task_id).get("selection_operation")
             if isinstance(operation, dict) and operation.get("state") in {
                 "failed", "succeeded", "interrupted",

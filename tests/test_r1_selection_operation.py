@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -181,6 +184,51 @@ class SelectionFailurePersistenceContracts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("new-request", task["selection_operation"]["request_id"])
         self.assertEqual("pending", task["selection_operation"]["state"])
 
+    async def test_wait_timeout_returns_pending_without_repairing_committed_authority(self):
+        selection = _selection()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_id = "selection-read-only-timeout"
+            tasks, decisions, plans = _seed_authority(
+                root, task_id, authority_selection=selection
+            )
+            _commit_authority(
+                DecisionStateStore(decisions),
+                PlanStore(plans),
+                _authority_plan(root, task_id, selection),
+            )
+            task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
+            task["selection_operation"] = {
+                "request_id": "request",
+                "state": "pending",
+                "candidate": selection,
+                "expected_decision_revision": 0,
+            }
+            write_task_at(tasks, task_id, task)
+            manager = TaskQueueManager(
+                task_root=tasks,
+                decision_state_root=decisions,
+                plan_root=plans,
+                recovery_abandon_audit_root=root / "audit",
+                test_mode=True,
+            )
+            task_path = tasks / f"{task_id}.json"
+            task_before = task_path.read_bytes()
+            journals_before = tuple(
+                sorted(manager.projection_commit_service.journal_root.glob("*.json"))
+            )
+            operation = await manager.wait_for_selection_result(
+                task_id, timeout=0.1
+            )
+            task_after = task_path.read_bytes()
+            journals_after = tuple(
+                sorted(manager.projection_commit_service.journal_root.glob("*.json"))
+            )
+
+        self.assertEqual("pending", operation.get("state"))
+        self.assertEqual(task_before, task_after)
+        self.assertEqual(journals_before, journals_after)
+
 
 class SelectionRestartAndCommitContracts(unittest.TestCase):
     def test_restart_interrupts_only_pending_operation(self):
@@ -265,6 +313,99 @@ class SelectionRestartAndCommitContracts(unittest.TestCase):
         self.assertEqual(decision_before, decision_after)
         self.assertEqual(plan_before, plan_after)
         self.assertEqual("succeeded", repaired["selection_operation"]["state"])
+
+
+class SelectionStartupRepairContracts(unittest.IsolatedAsyncioTestCase):
+    async def test_start_repairs_committed_authority_after_pending_journal_recovery(self):
+        selection = _selection()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_id = "selection-startup-outcome-repair"
+            tasks, decisions, plans = _seed_authority(
+                root, task_id, authority_selection=selection
+            )
+            _commit_authority(
+                DecisionStateStore(decisions),
+                PlanStore(plans),
+                _authority_plan(root, task_id, selection),
+            )
+            task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
+            task["selection_operation"] = {
+                "request_id": "request",
+                "state": "pending",
+                "candidate": selection,
+                "expected_decision_revision": 0,
+            }
+            write_task_at(tasks, task_id, task)
+            manager = TaskQueueManager(
+                task_root=tasks,
+                decision_state_root=decisions,
+                plan_root=plans,
+                recovery_abandon_audit_root=root / "audit",
+                test_mode=True,
+            )
+            order: list[str] = []
+            original_recover = manager.projection_commit_service.recover_pending
+            original_repair = manager._repair_selection_projection
+
+            def traced_recover():
+                order.append("recover_pending")
+                return original_recover()
+
+            def traced_repair(repair_task_id):
+                order.append(f"repair:{repair_task_id}")
+                return original_repair(repair_task_id)
+
+            with (
+                patch.object(
+                    manager.projection_commit_service,
+                    "recover_pending",
+                    side_effect=traced_recover,
+                ),
+                patch.object(
+                    manager,
+                    "_repair_selection_projection",
+                    side_effect=traced_repair,
+                ),
+            ):
+                await manager.start()
+                await manager.stop()
+            repaired = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
+
+        self.assertEqual("recover_pending", order[0])
+        self.assertIn(f"repair:{task_id}", order)
+        self.assertLess(order.index("recover_pending"), order.index(f"repair:{task_id}"))
+        self.assertEqual("succeeded", repaired["selection_operation"]["state"])
+
+
+class SelectionWriterAllowlistContracts(unittest.TestCase):
+    def test_live_waiter_has_no_repair_or_outcome_writer_path(self):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(TaskQueueManager)))
+        callers = {
+            "_repair_selection_projection": set(),
+            "_complete_reidentify": set(),
+        }
+        class_node = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef)
+        )
+        for function in class_node.body:
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                target = node.func
+                if isinstance(target, ast.Attribute) and target.attr in callers:
+                    callers[target.attr].add(function.name)
+
+        self.assertEqual(
+            {"_recover_active_records"},
+            callers["_repair_selection_projection"],
+        )
+        self.assertEqual(
+            {"_worker", "_repair_selection_projection"},
+            callers["_complete_reidentify"],
+        )
 
 
 class SelectionAuthorityReadbackContracts(unittest.IsolatedAsyncioTestCase):

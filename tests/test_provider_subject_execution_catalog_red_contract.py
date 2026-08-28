@@ -15,12 +15,15 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import sys
+import threading
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 import src.pages.plan_review_page as review_page
+import src.rename.projection_authority as projection_module
 import src.utils.utils as utils_module
 import tests.test_provider_subject_plan_wiring_red_contract as phase_b
 import tests.test_tv_font_series_association_red_contract as execution_fixture
@@ -40,6 +43,7 @@ from src.rename.provider_link_catalog import (
 from src.rename.rename_plan import PlanStatus
 from src.rename.series_catalog import SeriesCatalog
 from src.rename.work_catalog import WorkCatalog
+from src.task_queue import TaskQueueManager
 
 
 def _json(path: Path) -> dict:
@@ -129,6 +133,151 @@ class ProviderSubjectExecutionCatalogRedContracts(
             )
         approved = store.load(result.task_id)
         return store, review, approved, store.fingerprint(approved)
+
+    async def test_live_waiter_is_read_only_across_projection_cas_barrier(self):
+        """A live waiter must not create an unjournaled task-record third state."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cas_entered = threading.Event()
+            cas_release = threading.Event()
+            waiter_polled = threading.Event()
+            cas_lock = threading.Lock()
+            cas_count = 0
+            barrier_task_id: str | None = None
+            task_sha_at_barrier: str | None = None
+            task_sha_after_waiter: str | None = None
+            journal_during_barrier: dict[str, object] = {}
+            original_cas = projection_module.replace_task_record_at_if_sha256
+            original_read = TaskQueueManager._read
+
+            def blocked_second_cas(
+                task_root,
+                task_id,
+                *,
+                expected_sha256,
+                data,
+            ):
+                nonlocal cas_count, barrier_task_id, task_sha_at_barrier
+                with cas_lock:
+                    cas_count += 1
+                    current_count = cas_count
+                if current_count == 2:
+                    barrier_task_id = task_id
+                    task_path = Path(task_root) / f"{task_id}.json"
+                    task_sha_at_barrier = hashlib.sha256(
+                        task_path.read_bytes()
+                    ).hexdigest()
+                    cas_entered.set()
+                    if not cas_release.wait(timeout=10):
+                        raise TimeoutError("FL-07 deterministic CAS barrier timed out")
+                return original_cas(
+                    task_root,
+                    task_id,
+                    expected_sha256=expected_sha256,
+                    data=data,
+                )
+
+            def traced_read(manager, task_id):
+                result = original_read(manager, task_id)
+                caller = sys._getframe(1).f_code.co_name
+                if (
+                    caller == "wait_for_selection_result"
+                    and cas_entered.is_set()
+                    and not cas_release.is_set()
+                ):
+                    waiter_polled.set()
+                return result
+
+            flow = None
+            flow_error: BaseException | None = None
+            result = None
+            restart_error: BaseException | None = None
+            try:
+                with (
+                    patch.object(
+                        projection_module,
+                        "replace_task_record_at_if_sha256",
+                        blocked_second_cas,
+                    ),
+                    patch.object(TaskQueueManager, "_read", traced_read),
+                ):
+                    flow = asyncio.create_task(self._real_86_plan(root))
+                    self.assertTrue(
+                        await asyncio.wait_for(
+                            asyncio.to_thread(cas_entered.wait, 10), timeout=11
+                        ),
+                        "provider reidentify never reached the second projection CAS",
+                    )
+                    self.assertTrue(
+                        await asyncio.wait_for(
+                            asyncio.to_thread(waiter_polled.wait, 10), timeout=11
+                        ),
+                        "live waiter did not poll while the projection CAS was blocked",
+                    )
+                    self.assertIsNotNone(barrier_task_id)
+                    task_path = (
+                        root / "flow" / "tasks" / f"{barrier_task_id}.json"
+                    )
+                    task_sha_after_waiter = hashlib.sha256(
+                        task_path.read_bytes()
+                    ).hexdigest()
+                    journal_path = (
+                        root
+                        / "flow"
+                        / "projection_journal"
+                        / f"{barrier_task_id}.json"
+                    )
+                    journal_during_barrier = _json(journal_path)
+            finally:
+                cas_release.set()
+
+            if flow is not None:
+                try:
+                    result = await asyncio.wait_for(flow, timeout=20)
+                except BaseException as exc:
+                    flow_error = exc
+
+            journal_path = (
+                root
+                / "flow"
+                / "projection_journal"
+                / f"{barrier_task_id}.json"
+            )
+            final_journal = _json(journal_path)
+            final_task = _json(
+                root / "flow" / "tasks" / f"{barrier_task_id}.json"
+            )
+            restarted = TaskQueueManager(
+                task_root=root / "flow" / "tasks",
+                decision_state_root=root / "flow" / "decisions",
+                plan_root=root / "flow" / "plans",
+                recovery_abandon_audit_root=root / "flow" / "abandon",
+                test_mode=True,
+            )
+            try:
+                await restarted.start()
+            except BaseException as exc:
+                restart_error = exc
+            finally:
+                await restarted.stop()
+            pending_after_restart = tuple(
+                path.name
+                for path in (root / "flow" / "projection_journal").glob("*.json")
+                if _json(path).get("status") == "pending"
+            )
+
+        self.assertIsNone(flow_error)
+        self.assertIsNotNone(result)
+        self.assertEqual("plan_written", journal_during_barrier.get("phase"))
+        self.assertEqual("pending", journal_during_barrier.get("status"))
+        self.assertEqual(task_sha_at_barrier, task_sha_after_waiter)
+        self.assertEqual("completed", final_journal.get("status"))
+        self.assertEqual(
+            "succeeded", final_task["selection_operation"]["state"]
+        )
+        self.assertIsNone(restart_error)
+        self.assertEqual((), pending_after_restart)
 
     async def test_real_86_relative_execution_materializes_exact_ranges(self):
         """Real approved execution must persist both split-cour ranges."""
