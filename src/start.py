@@ -13,7 +13,7 @@ if __name__ == '__mp_main__':
 
 ui.run(
     port=int(os.getenv("BAR_UI_PORT", "5999")),
-    storage_secret='REDACTED_STORAGE_SECRET',
+    storage_secret=os.getenv("BAR_UI_STORAGE_SECRET"),
     title='番剧自动重命名',
     favicon='🍭',
     log_config=None,
