@@ -7,9 +7,8 @@ from nicegui import ui, app
 from .logger import logger
 from .models import TaskModel
 from .main_page import main_page
-from .rename.process import Rename
 from .utils.utils import no_scroll_bar
-from .pages.data_table_page import create_table
+from .task_queue import task_queue
 
 ANI_TAG = ['动漫', 'anime', '动画']
 MOVIE_TAG = ['电影', 'movie', '剧场', '剧场版']
@@ -19,6 +18,10 @@ MOVIE_TAG = ['电影', 'movie', '剧场', '剧场版']
 def main():
     ui.add_head_html(no_scroll_bar)
     main_page()
+
+
+app.on_startup(task_queue.start)
+app.on_shutdown(task_queue.stop)
 
 
 @app.post('/sendTask')
@@ -65,8 +68,19 @@ async def _send_task(request: Request):
     else:
         is_movie = None
 
-    Rename().process(_path, is_anime, is_movie)
-    create_table.refresh()
-
-    logger.info(f'[结束任务] {path}处理完成！')
-    return {'code': 200, 'data': '提交任务成功, 具体信息可以查看WebUI！'}
+    prepared = task_queue.prepare_input_batch(
+        (_path,),
+        is_anime=is_anime,
+        is_movie=is_movie,
+        use_ai=None,
+        source='webhook',
+        preview_only=False,
+    )
+    task_id = (await task_queue.enqueue_batch(**prepared))[0]
+    logger.info(f'[任务队列] webhook 任务 {task_id} 已接收')
+    return {
+        'code': 202,
+        'data': '任务已加入队列，可在 WebUI 查看排队与执行状态。',
+        'task_id': task_id,
+        'status': 'queued',
+    }

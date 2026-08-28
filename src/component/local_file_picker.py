@@ -1,15 +1,63 @@
+"""Large, mount-rooted file picker used by task and configuration dialogs."""
+
+from __future__ import annotations
+
 import platform
+import string
 from pathlib import Path
 from typing import Optional
 
-from nicegui import ui, events
+from nicegui import events, ui
 
 from ..config.config_manager import cm
-from ..element.red import RedButton, RedToogle
+
+
+NAS_SYSTEM_NAMES = {"lost+found"}
+
+
+def _is_system_entry(path: Path) -> bool:
+    """Hide NAS application/system folders which are never media roots."""
+    return path.name.startswith("@") or path.name.casefold() in NAS_SYSTEM_NAMES
+
+
+def _is_visible_entry(path: Path, *, show_hidden_files: bool = False) -> bool:
+    if _is_system_entry(path):
+        return False
+    return show_hidden_files or not path.name.startswith(".")
+
+
+def _safe_picker_root(directory: str, configured_mount: Optional[str] = None) -> Path:
+    """Prefer the configured Linux mount, otherwise retain the requested path."""
+    requested = Path(directory).expanduser()
+    if platform.system() == "Linux":
+        mount = Path(configured_mount or cm.get_config("docker_mnt") or directory)
+        mount = mount.expanduser()
+        if mount.is_dir():
+            return mount.resolve()
+    if requested.is_dir():
+        return requested.resolve()
+    return Path.home().resolve()
+
+
+def _within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _available_windows_roots() -> tuple[Path, ...]:
+    if platform.system() != "Windows":
+        return ()
+    return tuple(
+        root
+        for letter in string.ascii_uppercase
+        if (root := Path(f"{letter}:\\")).is_dir()
+    )
 
 
 class local_file_picker(ui.dialog):
-
     def __init__(
         self,
         directory: str,
@@ -17,146 +65,142 @@ class local_file_picker(ui.dialog):
         upper_limit: Optional[str] = None,
         multiple: bool = False,
         show_hidden_files: bool = False,
+        title: str = "选择路径",
+        display_root: Optional[str] = None,
     ) -> None:
-        """这是一个简单的文件选择器，允许您从运行 NiceGUI 的本地文件系统中选择文件。
-
-        参数：
-            directory: 起始目录。
-            upper_limit: 限制的最高目录（None 表示无限制，默认值为与起始目录相同）。
-            multiple: 是否允许选择多个文件。
-            show_hidden_files: 是否显示隐藏文件。
-        """
+        """Browse the server filesystem without exposing NAS system folders."""
         super().__init__()
 
-        self.path = Path(directory).expanduser()
-        if upper_limit is None:
-            self.upper_limit = None
-        else:
-            self.upper_limit = Path(
-                directory if upper_limit == ... else upper_limit
-            ).expanduser()
+        configured_mount = cm.get_config("docker_mnt")
+        root = _safe_picker_root(directory, configured_mount)
+        if upper_limit is not None:
+            candidate = Path(directory if upper_limit == ... else upper_limit).expanduser()
+            if candidate.is_dir():
+                root = candidate.resolve()
+
+        requested = Path(directory).expanduser()
+        self.root = root
+        self.path = requested.resolve() if requested.is_dir() and _within_root(requested, root) else root
+        self.root_choices = (
+            _available_windows_roots() if upper_limit is None else (self.root,)
+        )
         self.show_hidden_files = show_hidden_files
+        self.display_root = display_root
 
-        _s = 'flex-wrap: nowrap; min-width: 400px; max-width: 730px'
-        self.classes('flex w-full').style(_s)
-        with (
-            self,
-            ui.card().classes('flex w-full').style(_s),
-        ):
-            with ui.column(align_items='center') as c1:
-                c1.classes('flex w-full')
-                c1.style('flex-wrap: nowrap; flex-shrink: 0; flex-basis: auto')
-                with ui.row().classes('w-full nowrap') as r1:
-                    r1.style('flex-wrap: nowrap')
-                    self.add_drives_toggle()
-                    rs = 'multiple' if multiple else 'single'
-                    self.grid = (
-                        ui.aggrid(
+        self.classes("bar-file-picker-overlay")
+        with self, ui.card().classes("bar-file-picker-dialog"):
+            with ui.row().classes("w-full items-start justify-between no-wrap"):
+                with ui.column().classes("gap-1 min-w-0"):
+                    ui.label(title).classes("bar-dialog-title")
+                    ui.label(
+                        "双击文件夹进入；选中一项后确认，未选中则使用当前文件夹。"
+                    ).classes("bar-muted")
+                ui.button(icon="close", on_click=self.close).props(
+                    'round flat color=grey-7 aria-label="关闭路径选择器"'
+                )
+
+            with ui.row().classes("bar-picker-location w-full items-center no-wrap"):
+                ui.icon("account_tree", color="blue-7")
+                self.location_label = ui.label().classes("bar-picker-location-text")
+
+            if len(self.root_choices) > 1:
+                with ui.row().classes("w-full items-center gap-1"):
+                    ui.label("位置").classes("bar-muted")
+                    for drive_root in self.root_choices:
+                        ui.button(
+                            str(drive_root),
+                            on_click=lambda _event=None, drive=drive_root: self._switch_root(
+                                drive
+                            ),
+                        ).props("flat dense color=blue-7")
+
+            selection = "multiple" if multiple else "single"
+            self.grid = (
+                ui.aggrid(
+                    {
+                        "columnDefs": [
                             {
-                                'columnDefs': [
-                                    {
-                                        'field': 'name',
-                                        'headerName': 'File',
-                                    }
-                                ],
-                                'rowSelection': rs,
+                                "field": "name",
+                                "headerName": "文件夹或文件",
+                                "flex": 1,
+                                "minWidth": 280,
                             },
-                            html_columns=[0],
-                        )
-                        .classes('w-1/2')
-                        .style(_s)
-                        .on('cellDoubleClicked', self.handle_double_click)
-                    )
-                with ui.row().classes('w-full justify-end'):
-                    RedButton('取消', on_click=self.close).props('outline')
-                    RedButton('确定', on_click=self._handle_ok)
+                            {
+                                "field": "kind",
+                                "headerName": "类型",
+                                "width": 110,
+                            },
+                        ],
+                        "rowSelection": selection,
+                        "animateRows": False,
+                        "suppressCellFocus": True,
+                    }
+                )
+                .classes("bar-file-picker-grid w-full")
+                .on("cellDoubleClicked", self.handle_double_click)
+            )
+
+            with ui.row().classes("bar-picker-actions w-full justify-end gap-2"):
+                ui.button("取消", icon="close", on_click=self.close).props(
+                    "outline color=red-6"
+                )
+                ui.button("确定", icon="check", on_click=self._handle_ok).props(
+                    "unelevated color=red-6"
+                )
         self.update_grid()
 
-    def add_drives_toggle(self):
-        if platform.system() == 'Windows':
-            import win32api
-
-            drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
-
-            # drives = [str(i) for i in Path(drives[0]).iterdir()]
-            self.drives_toggle = RedToogle(
-                drives, value=drives[0], on_change=self.update_drive
-            )
-        elif platform.system() == 'Darwin':  # macOS
-            import os
-
-            # On macOS, we can list mount points in '/Volumes'
-            drives = [
-                drive
-                for drive in os.listdir('/Volumes')
-                if os.path.isdir(os.path.join('/Volumes', drive))
-            ]
-            self.drives_toggle = RedToogle(
-                drives, value=drives[0], on_change=self.update_drive
-            )
-
-        elif platform.system() == 'Linux':
-            import os
-
-            docker_path = cm.get_config('docker_mnt')
-            drives = [
-                drive
-                for drive in os.listdir(docker_path)
-                if os.path.isdir(os.path.join(docker_path, drive))
-            ]
-            # drives = [f'{i}' for i in drives]
-            self.drives_toggle = RedToogle(drives, value=drives[0])
-            self.drives_toggle.on_value_change(
-                lambda e: self.update_drive(docker_path),
-            )
-        self.drives_toggle.classes(add="column", remove="row inline")
-        # self.drives_toggle.classes('w-1/2')
-
-    def update_drive(self, main: Optional[str] = None):
-        if main is None:
-            path_str = self.drives_toggle.value
-        else:
-            path_str = f'{main}/{self.drives_toggle.value}'
-        self.path = Path(path_str).expanduser()  # type: ignore
-        self.update_grid()
+    def _location_text(self) -> str:
+        if not self.display_root:
+            return str(self.path)
+        relative = self.path.relative_to(self.root)
+        return str(Path(self.display_root) / relative) if relative.parts else self.display_root
 
     def update_grid(self) -> None:
-        paths = list(self.path.glob('*'))
-        paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        try:
+            paths = [
+                path
+                for path in self.path.iterdir()
+                if _is_visible_entry(path, show_hidden_files=self.show_hidden_files)
+            ]
+        except (OSError, PermissionError):
+            paths = []
+        paths.sort(key=lambda path: (not path.is_dir(), path.name.casefold()))
 
-        if not self.show_hidden_files:
-            paths = [p for p in paths if not p.name.startswith('.')]
-        paths.sort(key=lambda p: p.name.lower())
-        paths.sort(key=lambda p: not p.is_dir())
-        self.grid.options['rowData'] = [
+        rows = [
             {
-                'name': f'📁 {p.name}' if p.is_dir() else p.name,
-                'path': str(p),
+                "name": f"📁  {path.name}" if path.is_dir() else path.name,
+                "kind": "文件夹" if path.is_dir() else "文件",
+                "path": str(path),
             }
-            for p in paths
+            for path in paths
         ]
-        if (self.upper_limit is None and self.path != self.path.parent) or (
-            self.upper_limit is not None and self.path != self.upper_limit
-        ):
-            self.grid.options['rowData'].insert(
+        if self.path != self.root:
+            rows.insert(
                 0,
-                {
-                    'name': '📁 <strong>..</strong>',
-                    'path': str(self.path.parent),
-                },
+                {"name": "📁  ..", "kind": "上一级", "path": str(self.path.parent)},
             )
+        self.location_label.text = self._location_text()
+        self.grid.options["rowData"] = rows
         self.grid.update()
 
-    def handle_double_click(self, e: events.GenericEventArguments) -> None:
-        self.path = Path(e.args['data']['path'])
-        if self.path.is_dir():
+    def _switch_root(self, root: Path) -> None:
+        if root not in self.root_choices or not root.is_dir():
+            return
+        self.root = root.resolve()
+        self.path = self.root
+        self.update_grid()
+
+    def handle_double_click(self, event: events.GenericEventArguments) -> None:
+        selected = Path(event.args["data"]["path"])
+        if not _within_root(selected, self.root):
+            return
+        if selected.is_dir():
+            self.path = selected.resolve()
             self.update_grid()
         else:
-            self.submit([str(self.path)])
+            self.submit([str(selected)])
 
-    async def _handle_ok(self):
+    async def _handle_ok(self) -> None:
         rows = await self.grid.get_selected_rows()
-        if not rows:
-            self.submit([str(self.path)])
-        else:
-            self.submit([r['path'] for r in rows])
+        selected = [row["path"] for row in rows if _within_root(Path(row["path"]), self.root)]
+        self.submit(selected or [str(self.path)])

@@ -1,0 +1,979 @@
+{
+  "fixture_shape_fingerprint": "b893f15a2e748d0759800fb7c9e279ff213ea3bd25680773b7ef9546091880c6",
+  "fixtures": {
+    "entry_success_control.json": {
+      "fields": {
+        "cohort_control": {
+          "fields": {
+            "event": {
+              "type": "string"
+            },
+            "must_not_inject_resolution": {
+              "type": "boolean"
+            },
+            "must_use_public_callback": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "control_id": {
+          "type": "string"
+        },
+        "cumulative_selected_counts": {
+          "cardinality": 6,
+          "item_shapes": [
+            {
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "exact_child": {
+          "type": "string"
+        },
+        "exact_child_parent": {
+          "type": "string"
+        },
+        "expected_batch_count": {
+          "type": "integer"
+        },
+        "final_input_count": {
+          "type": "integer"
+        },
+        "parent_root_count": {
+          "type": "integer"
+        },
+        "picker_visit_count": {
+          "type": "integer"
+        },
+        "picker_visits": {
+          "cardinality": 6,
+          "item_shapes": [
+            {
+              "cardinality": 3,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "cardinality": 1,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "cardinality": 5,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "cardinality": 4,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "cardinality": 2,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            }
+          ],
+          "type": "array"
+        },
+        "sanitizer_policy_version": {
+          "type": "string"
+        },
+        "sanitizer_sha256": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "source_evidence_fingerprint": {
+          "type": "string"
+        },
+        "submit_count": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "p1_a_tv_font_projection.json": {
+      "fields": {
+        "case_count": {
+          "type": "integer"
+        },
+        "cases": {
+          "cardinality": 7,
+          "item_shapes": [
+            {
+              "fields": {
+                "case_id": {
+                  "type": "string"
+                },
+                "fixture_values": {
+                  "fields": {
+                    "archive_suffix": {
+                      "type": "string"
+                    },
+                    "font_payload_utf8": {
+                      "type": "string"
+                    },
+                    "season_number": {
+                      "type": "integer"
+                    },
+                    "series_key": {
+                      "type": "string"
+                    },
+                    "source_sha256": {
+                      "type": "string"
+                    },
+                    "source_size": {
+                      "type": "integer"
+                    },
+                    "target_name": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "frozen_expected_plan_manifest": {
+                  "fields": {
+                    "asset_fields": {
+                      "cardinality": 7,
+                      "item_shapes": [
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "schema_version": {
+                      "type": "integer"
+                    },
+                    "scope": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "source_shape": {
+                  "fields": {
+                    "authority_asset_fields": {
+                      "cardinality": 5,
+                      "item_shapes": [
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "authority_fields": {
+                      "cardinality": 15,
+                      "item_shapes": [
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "authority_manifest_fields": {
+                      "cardinality": 4,
+                      "item_shapes": [
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "decision_revision": {
+                      "type": "integer"
+                    },
+                    "decision_schema_version": {
+                      "type": "integer"
+                    },
+                    "episode_range_count": {
+                      "type": "integer"
+                    },
+                    "observation_ref_count": {
+                      "type": "integer"
+                    },
+                    "plan_entry_count": {
+                      "type": "integer"
+                    },
+                    "plan_font_entry_count": {
+                      "type": "integer"
+                    },
+                    "plan_manifest_present": {
+                      "type": "boolean"
+                    },
+                    "plan_metadata_fields": {
+                      "cardinality": 52,
+                      "item_shapes": [
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "task_workflow_status": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "array"
+        },
+        "frozen_contract_source": {
+          "type": "string"
+        },
+        "incident_id": {
+          "type": "string"
+        },
+        "sanitizer_policy_version": {
+          "type": "string"
+        },
+        "sanitizer_sha256": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "source_evidence_fingerprint": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "p1_b_cohort_anchor.json": {
+      "fields": {
+        "bangumi_relations": {
+          "cardinality": 14,
+          "item_shapes": [
+            {
+              "fields": {
+                "from": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "array"
+        },
+        "bangumi_subjects": {
+          "cardinality": 5,
+          "item_shapes": [
+            {
+              "fields": {
+                "air_date": {
+                  "type": "string"
+                },
+                "episode_count": {
+                  "type": "integer"
+                },
+                "original_title": {
+                  "type": "string"
+                },
+                "platform": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "array"
+        },
+        "frozen_contract_source": {
+          "type": "string"
+        },
+        "frozen_expected": {
+          "fields": {
+            "review_disposition": {
+              "type": "string"
+            },
+            "selected_season_number": {
+              "type": "integer"
+            },
+            "selected_subject_id": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "tmdb_tv_id": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "incident_id": {
+          "type": "string"
+        },
+        "sanitizer_policy_version": {
+          "type": "string"
+        },
+        "sanitizer_sha256": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "selected_provider": {
+          "fields": {
+            "entity_type": {
+              "type": "string"
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "provider_id": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "source_evidence_fingerprint": {
+          "type": "string"
+        },
+        "source_shape": {
+          "fields": {
+            "exact_anchor_ids": {
+              "cardinality": 3,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "provider_subject_evidence_fields": {
+              "cardinality": 9,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "query_outcomes": {
+              "cardinality": 2,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "selected_subject_query_outcomes": {
+              "cardinality": 2,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "subject_batch_fields": {
+              "cardinality": 8,
+              "item_shapes": [
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "subject_observation_count": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "subject_observations": {
+          "fields": {
+            "boundary_complete": {
+              "type": "boolean"
+            },
+            "evidence_fingerprint": {
+              "type": "string"
+            },
+            "observed_at": {
+              "type": "string"
+            },
+            "policy_version": {
+              "type": "string"
+            },
+            "schema_version": {
+              "type": "integer"
+            },
+            "selected_subject_id": {
+              "type": "string"
+            },
+            "subject_observations": {
+              "cardinality": 5,
+              "item_shapes": [
+                {
+                  "fields": {
+                    "bangumi_subject_id": {
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "type": "string"
+                    },
+                    "policy_version": {
+                      "type": "string"
+                    },
+                    "queries": {
+                      "cardinality": 2,
+                      "item_shapes": [
+                        {
+                          "fields": {
+                            "candidates": {
+                              "cardinality": 1,
+                              "item_shapes": [
+                                {
+                                  "fields": {
+                                    "entity_type": {
+                                      "type": "string"
+                                    },
+                                    "first_air_date": {
+                                      "type": "string"
+                                    },
+                                    "match_tier": {
+                                      "type": "string"
+                                    },
+                                    "namespace": {
+                                      "type": "string"
+                                    },
+                                    "original_title": {
+                                      "type": "string"
+                                    },
+                                    "provider_id": {
+                                      "type": "string"
+                                    },
+                                    "score_components": {
+                                      "fields": {
+                                        "animation_confirmed": {
+                                          "type": "boolean"
+                                        },
+                                        "animation_evidence_source": {
+                                          "type": "string"
+                                        },
+                                        "animation_policy_version": {
+                                          "type": "string"
+                                        },
+                                        "animation_reason_code": {
+                                          "type": "string"
+                                        },
+                                        "title_exact": {
+                                          "type": "boolean"
+                                        },
+                                        "year_compatible": {
+                                          "type": "boolean"
+                                        }
+                                      },
+                                      "type": "object"
+                                    },
+                                    "seasons": {
+                                      "cardinality": 4,
+                                      "item_shapes": [
+                                        {
+                                          "fields": {
+                                            "air_date": {
+                                              "type": "string"
+                                            },
+                                            "episode_count": {
+                                              "type": "integer"
+                                            },
+                                            "season_number": {
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "type": "object"
+                                        }
+                                      ],
+                                      "type": "array"
+                                    },
+                                    "title": {
+                                      "type": "string"
+                                    },
+                                    "tmdb_tv_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                }
+                              ],
+                              "type": "array"
+                            },
+                            "locale": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "query": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "year": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "response_fingerprint": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "fields": {
+                    "bangumi_subject_id": {
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "type": "string"
+                    },
+                    "policy_version": {
+                      "type": "string"
+                    },
+                    "queries": {
+                      "cardinality": 2,
+                      "item_shapes": [
+                        {
+                          "fields": {
+                            "candidates": {
+                              "cardinality": 0,
+                              "item_shapes": [],
+                              "type": "array"
+                            },
+                            "locale": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "query": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "year": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "response_fingerprint": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "fields": {
+                    "bangumi_subject_id": {
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "type": "string"
+                    },
+                    "policy_version": {
+                      "type": "string"
+                    },
+                    "queries": {
+                      "cardinality": 2,
+                      "item_shapes": [
+                        {
+                          "fields": {
+                            "candidates": {
+                              "cardinality": 1,
+                              "item_shapes": [
+                                {
+                                  "fields": {
+                                    "entity_type": {
+                                      "type": "string"
+                                    },
+                                    "first_air_date": {
+                                      "type": "string"
+                                    },
+                                    "match_tier": {
+                                      "type": "string"
+                                    },
+                                    "namespace": {
+                                      "type": "string"
+                                    },
+                                    "original_title": {
+                                      "type": "string"
+                                    },
+                                    "provider_id": {
+                                      "type": "string"
+                                    },
+                                    "score_components": {
+                                      "fields": {
+                                        "animation_confirmed": {
+                                          "type": "boolean"
+                                        },
+                                        "animation_evidence_source": {
+                                          "type": "string"
+                                        },
+                                        "animation_policy_version": {
+                                          "type": "string"
+                                        },
+                                        "animation_reason_code": {
+                                          "type": "string"
+                                        },
+                                        "title_exact": {
+                                          "type": "boolean"
+                                        },
+                                        "year_compatible": {
+                                          "type": "boolean"
+                                        }
+                                      },
+                                      "type": "object"
+                                    },
+                                    "seasons": {
+                                      "cardinality": 1,
+                                      "item_shapes": [
+                                        {
+                                          "fields": {
+                                            "air_date": {
+                                              "type": "string"
+                                            },
+                                            "episode_count": {
+                                              "type": "integer"
+                                            },
+                                            "season_number": {
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "type": "object"
+                                        }
+                                      ],
+                                      "type": "array"
+                                    },
+                                    "title": {
+                                      "type": "string"
+                                    },
+                                    "tmdb_tv_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                }
+                              ],
+                              "type": "array"
+                            },
+                            "locale": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "query": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "year": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        {
+                          "fields": {
+                            "candidates": {
+                              "cardinality": 1,
+                              "item_shapes": [
+                                {
+                                  "fields": {
+                                    "entity_type": {
+                                      "type": "string"
+                                    },
+                                    "first_air_date": {
+                                      "type": "string"
+                                    },
+                                    "match_tier": {
+                                      "type": "string"
+                                    },
+                                    "namespace": {
+                                      "type": "string"
+                                    },
+                                    "original_title": {
+                                      "type": "string"
+                                    },
+                                    "provider_id": {
+                                      "type": "string"
+                                    },
+                                    "score_components": {
+                                      "fields": {
+                                        "animation_confirmed": {
+                                          "type": "null"
+                                        },
+                                        "animation_evidence_source": {
+                                          "type": "string"
+                                        },
+                                        "animation_policy_version": {
+                                          "type": "string"
+                                        },
+                                        "animation_reason_code": {
+                                          "type": "string"
+                                        },
+                                        "title_exact": {
+                                          "type": "boolean"
+                                        },
+                                        "year_compatible": {
+                                          "type": "boolean"
+                                        }
+                                      },
+                                      "type": "object"
+                                    },
+                                    "seasons": {
+                                      "cardinality": 1,
+                                      "item_shapes": [
+                                        {
+                                          "fields": {
+                                            "air_date": {
+                                              "type": "string"
+                                            },
+                                            "episode_count": {
+                                              "type": "integer"
+                                            },
+                                            "season_number": {
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "type": "object"
+                                        }
+                                      ],
+                                      "type": "array"
+                                    },
+                                    "title": {
+                                      "type": "string"
+                                    },
+                                    "tmdb_tv_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                }
+                              ],
+                              "type": "array"
+                            },
+                            "locale": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "query": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "year": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "response_fingerprint": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "fields": {
+                    "bangumi_subject_id": {
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "type": "string"
+                    },
+                    "policy_version": {
+                      "type": "string"
+                    },
+                    "queries": {
+                      "cardinality": 2,
+                      "item_shapes": [
+                        {
+                          "fields": {
+                            "candidates": {
+                              "cardinality": 1,
+                              "item_shapes": [
+                                {
+                                  "fields": {
+                                    "entity_type": {
+                                      "type": "string"
+                                    },
+                                    "first_air_date": {
+                                      "type": "string"
+                                    },
+                                    "match_tier": {
+                                      "type": "string"
+                                    },
+                                    "namespace": {
+                                      "type": "string"
+                                    },
+                                    "original_title": {
+                                      "type": "string"
+                                    },
+                                    "provider_id": {
+                                      "type": "string"
+                                    },
+                                    "score_components": {
+                                      "fields": {
+                                        "animation_confirmed": {
+                                          "type": "boolean"
+                                        },
+                                        "animation_evidence_source": {
+                                          "type": "string"
+                                        },
+                                        "animation_policy_version": {
+                                          "type": "string"
+                                        },
+                                        "animation_reason_code": {
+                                          "type": "string"
+                                        },
+                                        "title_exact": {
+                                          "type": "boolean"
+                                        },
+                                        "year_compatible": {
+                                          "type": "boolean"
+                                        }
+                                      },
+                                      "type": "object"
+                                    },
+                                    "seasons": {
+                                      "cardinality": 1,
+                                      "item_shapes": [
+                                        {
+                                          "fields": {
+                                            "air_date": {
+                                              "type": "string"
+                                            },
+                                            "episode_count": {
+                                              "type": "integer"
+                                            },
+                                            "season_number": {
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "type": "object"
+                                        }
+                                      ],
+                                      "type": "array"
+                                    },
+                                    "title": {
+                                      "type": "string"
+                                    },
+                                    "tmdb_tv_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                }
+                              ],
+                              "type": "array"
+                            },
+                            "locale": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "query": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "year": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    "response_fingerprint": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              ],
+              "type": "array"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "policy_version": "r23-d-p1-fixture-shape-v1",
+  "sanitizer_policy_version": "r23-d-p1-incident-sanitizer-v1",
+  "sanitizer_sha256": "EAA125D05262E96852567947E1F3CCD15DAA4CE9B01243EAC876239122F282E3",
+  "schema_version": 1,
+  "source_evidence_fingerprint": "6a05c08bd1afddeb58cd655a973d84eb4e00392eb45f7bfc1fb97edcad0557ee"
+}

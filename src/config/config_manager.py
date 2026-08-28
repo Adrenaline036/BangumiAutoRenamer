@@ -1,17 +1,26 @@
 import json
+import os
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urlparse
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 from ..utils.path import CONFIG_PATH
+from ..rename.file_lock import FileLockBusyError, advisory_file_lock
 
 CONFIG_DEFAULT = {
     "api_key": "",
+    "bangumi_enabled": True,
+    "bangumi_token": "",
+    "bangumi_user_agent": "BangumiAutoRenamer/0.3 (local media organizer)",
     "bangumi_path": "",
     "movie_path": "",
     "anime_path": "",
     "anime_movie_path": "",
     "mode": "链接",
-    "docker_mnt": "/media",
+    "docker_mnt": "/volume1",
     "ai_provider": "openai",
     "ai_api_key": "",
     "ai_base_url": "https://api.openai.com/v1",
@@ -30,12 +39,15 @@ CONFIG_DEFAULT = {
 
 CN_MAP = {
     "api_key": "🔑 TMDB API密钥",
+    "bangumi_enabled": "🌐 启用 Bangumi 动画检索",
+    "bangumi_token": "🔑 Bangumi Access Token（可选）",
+    "bangumi_user_agent": "🪪 Bangumi User-Agent",
     "bangumi_path": "🎬 电视剧路径",
     "movie_path": "🎬 电影路径",
-    "anime_path": "🎬 动漫路径",
-    "anime_movie_path": "🎬 动漫电影路径",
+    "anime_path": "🎬 动画路径",
+    "anime_movie_path": "🎬 动画电影路径",
     "mode": "💿 重命名模式",
-    "docker_mnt": "📁 Docker挂载路径",
+    "docker_mnt": "📁 容器浏览根目录",
     "ai_provider": "🤖 AI提供商",
     "ai_api_key": "🤖 OpenAI API密钥",
     "ai_base_url": "🌐 OpenAI API地址",
@@ -54,68 +66,128 @@ CN_MAP = {
 
 
 class ConfigManager:
-    def __init__(self) -> None:
-        if not CONFIG_PATH.exists():
-            with open(CONFIG_PATH, 'w', encoding='UTF-8') as file:
-                json.dump(CONFIG_DEFAULT, file, indent=4, ensure_ascii=False)
+    def __init__(self, config_path: Optional[Path] = None) -> None:
+        self.config_path = Path(config_path) if config_path is not None else CONFIG_PATH
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.config_path.exists():
+            with self._config_lock():
+                if self.config_path.exists():
+                    self.config = self._read_current_unlocked()
+                else:
+                    self.config = self._normalized(CONFIG_DEFAULT.copy())
+                    self._write_unlocked(self.config)
+        else:
+            self.update_config()
 
-        self.update_config()
+    @property
+    def lock_path(self) -> Path:
+        return self.config_path.with_name(f".{self.config_path.name}.lock")
+
+    @contextmanager
+    def _config_lock(self):
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                with advisory_file_lock(
+                    self.lock_path,
+                    owner={"component": "config_manager"},
+                ):
+                    yield
+                    return
+            except FileLockBusyError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("配置文件正由另一进程保存，请稍后重试")
+                time.sleep(0.01)
+
+    @staticmethod
+    def _normalized(data: Dict[str, Any]) -> Dict[str, Any]:
+        current = {
+            key: data.get(key, default)
+            for key, default in CONFIG_DEFAULT.items()
+        }
+        if current.get("docker_mnt") == "/media":
+            current["docker_mnt"] = "/volume1"
+        for key in ("bangumi_path", "movie_path", "anime_path", "anime_movie_path"):
+            value = current.get(key)
+            if value == "/media":
+                current[key] = "/volume1/Vault/Anime"
+            elif isinstance(value, str) and value.startswith("/media/"):
+                current[key] = "/volume1/Vault/Anime/" + value[len("/media/"):]
+        return current
+
+    def _read_current_unlocked(self) -> Dict[str, Any]:
+        with open(self.config_path, "r", encoding="UTF-8") as handle:
+            value = json.load(handle)
+        if not isinstance(value, dict):
+            raise ValueError("config.json 根节点必须是对象")
+        return self._normalized(value)
+
+    def _write_unlocked(self, value: Dict[str, Any]) -> None:
+        temp_file_path = self.config_path.with_name(
+            f".{self.config_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with open(temp_file_path, "x", encoding="UTF-8") as file:
+                json.dump(value, file, indent=4, ensure_ascii=False)
+                file.flush()
+                os.fsync(file.fileno())
+            try:
+                temp_file_path.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temp_file_path, self.config_path)
+        finally:
+            if temp_file_path.exists():
+                temp_file_path.unlink()
 
     def write_config(self):
-        # 使用缓存文件避免强行关闭造成文件损坏
-        temp_file_path = CONFIG_PATH.parent / f'{CONFIG_PATH.name}.bak'
-
-        if temp_file_path.exists():
-            temp_file_path.unlink()
-
-        with open(temp_file_path, 'w', encoding='UTF-8') as file:
-            json.dump(self.config, file, indent=4, ensure_ascii=False)
-
-        CONFIG_PATH.unlink()
-        temp_file_path.rename(CONFIG_PATH)
+        with self._config_lock():
+            value = self._normalized(dict(self.config))
+            self._write_unlocked(value)
+            self.config = value
 
     def update_config(self):
-        # 打开config.json
-        with open(CONFIG_PATH, 'r', encoding='UTF-8') as f:
-            self.config: Dict[str, Any] = json.load(f)
-        # 对没有的值，添加默认值
-        for key in CONFIG_DEFAULT:
-            if key not in self.config:
-                self.config[key] = CONFIG_DEFAULT[key]
-
-        # 清空不存在的key
-        for key in list(self.config.keys()):
-            if key not in CONFIG_DEFAULT:
-                del self.config[key]
-
-        # 按照默认key排序
-        self.config = {key: self.config[key] for key in CONFIG_DEFAULT}
-
-        # 重新写回
-        self.write_config()
+        with self._config_lock():
+            with open(self.config_path, "r", encoding="UTF-8") as handle:
+                raw = json.load(handle)
+            if not isinstance(raw, dict):
+                raise ValueError("config.json 根节点必须是对象")
+            normalized = self._normalized(raw)
+            if normalized != raw:
+                self._write_unlocked(normalized)
+            self.config = normalized
 
     def get_config(self, key: str) -> str:
         if key in self.config:
             return self.config[key]
         elif key in CONFIG_DEFAULT:
-            self.update_config()
-            return self.config[key]
+            return CONFIG_DEFAULT[key]
         else:
             return ''
 
     def set_config(self, key: str, value: Union[str, bool]) -> bool:
-        if key in CONFIG_DEFAULT:
-            # 对URL类型的配置项进行特殊处理
-            if key.endswith('_base_url') and value and isinstance(value, str):
-                value = self._normalize_url(value)
-
-            # 设置值
-            self.config[key] = value
-            # 重新写回
-            self.write_config()
-            return True
-        else:
+        if key not in CONFIG_DEFAULT:
             return False
+        return self.set_configs({key: value})
+
+    def set_configs(self, values: Dict[str, Any]) -> bool:
+        if not values or any(key not in CONFIG_DEFAULT for key in values):
+            return False
+        patch = dict(values)
+        for key, value in tuple(patch.items()):
+            if key.endswith("_base_url") and value and isinstance(value, str):
+                patch[key] = self._normalize_url(value)
+        with self._config_lock():
+            current = (
+                self._read_current_unlocked()
+                if self.config_path.exists()
+                else CONFIG_DEFAULT.copy()
+            )
+            current.update(patch)
+            current = self._normalized(current)
+            self._write_unlocked(current)
+            self.config = current
+        return True
 
     def _normalize_url(self, url: str) -> str:
         """
@@ -166,6 +238,19 @@ class ConfigManager:
             return bool(parsed.netloc and parsed.scheme in ('http', 'https'))
         except Exception:
             return False
+
+
+def effective_tmdb_api_key(config_manager: ConfigManager) -> str:
+    """Return the env-first TMDB key without creating or writing config.
+
+    Callers pass their existing config authority explicitly so reading a
+    runtime credential never constructs ``ConfigManager`` or rewrites its
+    persisted file.
+    """
+    runtime_key = os.getenv("TMDB_API_KEY", "").strip()
+    if runtime_key:
+        return runtime_key
+    return str(config_manager.get_config("api_key") or "").strip()
 
 
 cm = ConfigManager()

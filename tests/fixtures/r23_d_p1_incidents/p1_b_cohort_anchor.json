@@ -1,0 +1,488 @@
+{
+  "bangumi_relations": [
+    {
+      "from": "293049",
+      "relation": "前传",
+      "to": "248175"
+    },
+    {
+      "from": "293049",
+      "relation": "续集",
+      "to": "317613"
+    },
+    {
+      "from": "248175",
+      "relation": "续集",
+      "to": "293049"
+    },
+    {
+      "from": "317613",
+      "relation": "前传",
+      "to": "293049"
+    },
+    {
+      "from": "317613",
+      "relation": "续集",
+      "to": "389474"
+    },
+    {
+      "from": "317613",
+      "relation": "续集",
+      "to": "425211"
+    },
+    {
+      "from": "389474",
+      "relation": "前传",
+      "to": "317613"
+    },
+    {
+      "from": "389474",
+      "relation": "续集",
+      "to": "565802"
+    },
+    {
+      "from": "425211",
+      "relation": "前传",
+      "to": "317613"
+    },
+    {
+      "from": "425211",
+      "relation": "续集",
+      "to": "565802"
+    },
+    {
+      "from": "565802",
+      "relation": "前传",
+      "to": "389474"
+    },
+    {
+      "from": "565802",
+      "relation": "前传",
+      "to": "425211"
+    },
+    {
+      "from": "565802",
+      "relation": "续集",
+      "to": "619013"
+    },
+    {
+      "from": "619013",
+      "relation": "前传",
+      "to": "565802"
+    }
+  ],
+  "bangumi_subjects": [
+    {
+      "air_date": "2020-04-11",
+      "episode_count": 12,
+      "original_title": "かぐや様は告らせたい?～天才たちの恋愛頭脳戦～",
+      "platform": "TV",
+      "provider_id": "293049",
+      "title": "辉夜大小姐想让我告白?～天才们的恋爱头脑战～"
+    },
+    {
+      "air_date": "2019-01-12",
+      "episode_count": 12,
+      "original_title": "かぐや様は告らせたい～天才たちの恋愛頭脳戦～",
+      "platform": "TV",
+      "provider_id": "248175",
+      "title": "辉夜大小姐想让我告白～天才们的恋爱头脑战～"
+    },
+    {
+      "air_date": "2022-04-08",
+      "episode_count": 13,
+      "original_title": "かぐや様は告らせたい-ウルトラロマンティック-",
+      "platform": "TV",
+      "provider_id": "317613",
+      "title": "辉夜大小姐想让我告白-超级浪漫-"
+    },
+    {
+      "air_date": "2023-03-31",
+      "episode_count": 4,
+      "original_title": "かぐや様は告らせたい-ファーストキッスは終わらない-",
+      "platform": "TV",
+      "provider_id": "425211",
+      "title": "辉夜大小姐想让我告白-初吻不会结束-"
+    },
+    {
+      "air_date": "2025-12-31",
+      "episode_count": 2,
+      "original_title": "かぐや様は告らせたい 大人への階段",
+      "platform": "TV",
+      "provider_id": "565802",
+      "title": "辉夜大小姐想让我告白 通往大人的阶梯"
+    }
+  ],
+  "frozen_contract_source": "CODEX-DISPOSITION-20260827-R23-D-P1-SYSTEMIC-METHOD",
+  "frozen_expected": {
+    "review_disposition": "reviewable",
+    "selected_season_number": 2,
+    "selected_subject_id": "293049",
+    "status": "inferred",
+    "tmdb_tv_id": "83121"
+  },
+  "incident_id": "R23-D-P1-B",
+  "sanitizer_policy_version": "r23-d-p1-incident-sanitizer-v1",
+  "sanitizer_sha256": "EAA125D05262E96852567947E1F3CCD15DAA4CE9B01243EAC876239122F282E3",
+  "schema_version": 1,
+  "selected_provider": {
+    "entity_type": "subject",
+    "namespace": "bangumi",
+    "provider_id": "293049"
+  },
+  "source_evidence_fingerprint": "6a05c08bd1afddeb58cd655a973d84eb4e00392eb45f7bfc1fb97edcad0557ee",
+  "source_shape": {
+    "exact_anchor_ids": [
+      "330287",
+      "330299",
+      "83121"
+    ],
+    "provider_subject_evidence_fields": [
+      "bangumi_relations",
+      "bangumi_subjects",
+      "evidence_fingerprint",
+      "provider_subject_boundary_edges",
+      "reason_codes",
+      "retry_requires_refresh",
+      "schema_version",
+      "selected_subject_id",
+      "subject_observations"
+    ],
+    "query_outcomes": [
+      "no_match",
+      "ok"
+    ],
+    "selected_subject_query_outcomes": [
+      "no_match",
+      "no_match"
+    ],
+    "subject_batch_fields": [
+      "boundary_complete",
+      "evidence_fingerprint",
+      "observed_at",
+      "policy_version",
+      "schema_version",
+      "selected_subject_id",
+      "subject_observations",
+      "truncated"
+    ],
+    "subject_observation_count": 5
+  },
+  "subject_observations": {
+    "boundary_complete": true,
+    "evidence_fingerprint": "0b23de16fe6ca719594b56b45d361fdece4baeebd9ef9883e8625a68aaf099a0",
+    "observed_at": "2026-01-01T00:00:00+00:00",
+    "policy_version": "subject-candidate-v1",
+    "schema_version": 1,
+    "selected_subject_id": "293049",
+    "subject_observations": [
+      {
+        "bangumi_subject_id": "248175",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "candidates": [
+              {
+                "entity_type": "tv",
+                "first_air_date": "2019-01-12",
+                "match_tier": "fuzzy",
+                "namespace": "tmdb",
+                "original_title": "かぐや様は告らせたい～天才たちの恋愛頭脳戦～",
+                "provider_id": "83121",
+                "score_components": {
+                  "animation_confirmed": true,
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_reason_code": "genre_id_16_present",
+                  "title_exact": false,
+                  "year_compatible": true
+                },
+                "seasons": [
+                  {
+                    "air_date": "2019-02-01",
+                    "episode_count": 6,
+                    "season_number": 0
+                  },
+                  {
+                    "air_date": "2019-01-10",
+                    "episode_count": 12,
+                    "season_number": 1
+                  },
+                  {
+                    "air_date": "2020-04-11",
+                    "episode_count": 12,
+                    "season_number": 2
+                  },
+                  {
+                    "air_date": "2022-04-09",
+                    "episode_count": 13,
+                    "season_number": 3
+                  }
+                ],
+                "title": "辉夜大小姐想让我告白",
+                "tmdb_tv_id": "83121"
+              }
+            ],
+            "locale": "localized",
+            "outcome": "ok",
+            "query": "辉夜大小姐想让我告白～天才们的恋爱头脑战～",
+            "truncated": false,
+            "year": 2019
+          },
+          {
+            "candidates": [
+              {
+                "entity_type": "tv",
+                "first_air_date": "2019-01-12",
+                "match_tier": "exact",
+                "namespace": "tmdb",
+                "original_title": "かぐや様は告らせたい～天才たちの恋愛頭脳戦～",
+                "provider_id": "83121",
+                "score_components": {
+                  "animation_confirmed": true,
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_reason_code": "genre_id_16_present",
+                  "title_exact": true,
+                  "year_compatible": true
+                },
+                "seasons": [
+                  {
+                    "air_date": "2019-02-01",
+                    "episode_count": 6,
+                    "season_number": 0
+                  },
+                  {
+                    "air_date": "2019-01-10",
+                    "episode_count": 12,
+                    "season_number": 1
+                  },
+                  {
+                    "air_date": "2020-04-11",
+                    "episode_count": 12,
+                    "season_number": 2
+                  },
+                  {
+                    "air_date": "2022-04-09",
+                    "episode_count": 13,
+                    "season_number": 3
+                  }
+                ],
+                "title": "辉夜大小姐想让我告白",
+                "tmdb_tv_id": "83121"
+              }
+            ],
+            "locale": "original",
+            "outcome": "ok",
+            "query": "かぐや様は告らせたい～天才たちの恋愛頭脳戦～",
+            "truncated": false,
+            "year": 2019
+          }
+        ],
+        "response_fingerprint": "ef67f759c49336c172313e1addc51220926a578366b0e3628cb879ee099bd765"
+      },
+      {
+        "bangumi_subject_id": "293049",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "candidates": [],
+            "locale": "localized",
+            "outcome": "no_match",
+            "query": "辉夜大小姐想让我告白?～天才们的恋爱头脑战～",
+            "truncated": false,
+            "year": 2020
+          },
+          {
+            "candidates": [],
+            "locale": "original",
+            "outcome": "no_match",
+            "query": "かぐや様は告らせたい?～天才たちの恋愛頭脳戦～",
+            "truncated": false,
+            "year": 2020
+          }
+        ],
+        "response_fingerprint": "11299e55b9012c7c5e72a8cc14a34942655bf0821be7d49029cc44ecadcc66f1"
+      },
+      {
+        "bangumi_subject_id": "317613",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "candidates": [],
+            "locale": "localized",
+            "outcome": "no_match",
+            "query": "辉夜大小姐想让我告白-超级浪漫-",
+            "truncated": false,
+            "year": 2022
+          },
+          {
+            "candidates": [],
+            "locale": "original",
+            "outcome": "no_match",
+            "query": "かぐや様は告らせたい-ウルトラロマンティック-",
+            "truncated": false,
+            "year": 2022
+          }
+        ],
+        "response_fingerprint": "72851636033e098ab5a3399a3ce5faa1c29b1e240d2340b714477d3ab6ed3660"
+      },
+      {
+        "bangumi_subject_id": "425211",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "candidates": [
+              {
+                "entity_type": "tv",
+                "first_air_date": "2023-03-31",
+                "match_tier": "exact",
+                "namespace": "tmdb",
+                "original_title": "辉夜大小姐想让我告白：初吻不会结束",
+                "provider_id": "330299",
+                "score_components": {
+                  "animation_confirmed": true,
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_reason_code": "genre_id_16_present",
+                  "title_exact": true,
+                  "year_compatible": true
+                },
+                "seasons": [
+                  {
+                    "air_date": "2023-03-31",
+                    "episode_count": 4,
+                    "season_number": 1
+                  }
+                ],
+                "title": "辉夜大小姐想让我告白：初吻不会结束",
+                "tmdb_tv_id": "330299"
+              }
+            ],
+            "locale": "localized",
+            "outcome": "ok",
+            "query": "辉夜大小姐想让我告白-初吻不会结束-",
+            "truncated": false,
+            "year": 2023
+          },
+          {
+            "candidates": [
+              {
+                "entity_type": "tv",
+                "first_air_date": "2023-04-01",
+                "match_tier": "fuzzy",
+                "namespace": "tmdb",
+                "original_title": "かぐや様は告らせたい-ファーストキッスは終わらない-",
+                "provider_id": "332819",
+                "score_components": {
+                  "animation_confirmed": null,
+                  "animation_evidence_source": "no_usable_genre_evidence",
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_reason_code": "no_usable_genre_evidence",
+                  "title_exact": true,
+                  "year_compatible": true
+                },
+                "seasons": [
+                  {
+                    "air_date": "2023-04-01",
+                    "episode_count": 4,
+                    "season_number": 1
+                  }
+                ],
+                "title": "かぐや様は告らせたい-ファーストキッスは終わらない-",
+                "tmdb_tv_id": "332819"
+              }
+            ],
+            "locale": "original",
+            "outcome": "ok",
+            "query": "かぐや様は告らせたい-ファーストキッスは終わらない-",
+            "truncated": false,
+            "year": 2023
+          }
+        ],
+        "response_fingerprint": "cbbf32b1a1cd96526d27874fe16acb9cc515c447700cde9b320886d00d75ec81"
+      },
+      {
+        "bangumi_subject_id": "565802",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "candidates": [
+              {
+                "entity_type": "tv",
+                "first_air_date": "2025-12-31",
+                "match_tier": "exact",
+                "namespace": "tmdb",
+                "original_title": "かぐや様は告らせたい 大人への階段",
+                "provider_id": "330287",
+                "score_components": {
+                  "animation_confirmed": true,
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_reason_code": "genre_id_16_present",
+                  "title_exact": true,
+                  "year_compatible": true
+                },
+                "seasons": [
+                  {
+                    "air_date": "2025-12-31",
+                    "episode_count": 2,
+                    "season_number": 1
+                  }
+                ],
+                "title": "辉夜大小姐想让我告白：通往大人的阶梯",
+                "tmdb_tv_id": "330287"
+              }
+            ],
+            "locale": "localized",
+            "outcome": "ok",
+            "query": "辉夜大小姐想让我告白 通往大人的阶梯",
+            "truncated": false,
+            "year": 2025
+          },
+          {
+            "candidates": [
+              {
+                "entity_type": "tv",
+                "first_air_date": "2025-12-31",
+                "match_tier": "exact",
+                "namespace": "tmdb",
+                "original_title": "かぐや様は告らせたい 大人への階段",
+                "provider_id": "330287",
+                "score_components": {
+                  "animation_confirmed": true,
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_reason_code": "genre_id_16_present",
+                  "title_exact": true,
+                  "year_compatible": true
+                },
+                "seasons": [
+                  {
+                    "air_date": "2025-12-31",
+                    "episode_count": 2,
+                    "season_number": 1
+                  }
+                ],
+                "title": "辉夜大小姐想让我告白：通往大人的阶梯",
+                "tmdb_tv_id": "330287"
+              }
+            ],
+            "locale": "original",
+            "outcome": "ok",
+            "query": "かぐや様は告らせたい 大人への階段",
+            "truncated": false,
+            "year": 2025
+          }
+        ],
+        "response_fingerprint": "8c1e3990ad180596f35a45b350dd4029bdc38e3ebbfd258cc3b66fe766dffe45"
+      }
+    ],
+    "truncated": false
+  }
+}

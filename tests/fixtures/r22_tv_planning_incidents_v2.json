@@ -1,0 +1,205 @@
+{
+  "schema_version": 2,
+  "fixture_kind": "sanitized_incident_shape",
+  "contains_real_absolute_paths": false,
+  "contains_credentials": false,
+  "yama_successor": {
+    "task_id": "incident-yama-s3",
+    "media_domain": "tv",
+    "selected_subject_id": "216310",
+    "source_scope": [
+      "Yama-S3/Yama [01].mkv",
+      "Yama-S3/Yama [13(OVA)].mkv",
+      "Yama-S3/Yama [Fonts].7z"
+    ],
+    "observations": [
+      {
+        "subject_id": "41658",
+        "outcome": "ok",
+        "complete": true,
+        "truncated": false,
+        "tmdb_tv_id": "53918",
+        "air_date": "2013-01-02",
+        "episode_count": 13,
+        "evidence_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      {
+        "subject_id": "86670",
+        "outcome": "no_match",
+        "complete": true,
+        "truncated": false,
+        "air_date": "2014-07-09",
+        "episode_count": 24,
+        "evidence_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      {
+        "subject_id": "216310",
+        "outcome": "no_match",
+        "complete": true,
+        "truncated": false,
+        "air_date": "2018-07-02",
+        "episode_count": 13,
+        "evidence_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      {
+        "subject_id": "290980",
+        "outcome": "no_match",
+        "complete": true,
+        "truncated": false,
+        "air_date": "2022-10-04",
+        "episode_count": 12,
+        "evidence_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444"
+      }
+    ],
+    "user_decisions": {
+      "cohort_action": "same_work",
+      "selected_boundary": ["86670", "216310"],
+      "decision_revision": 7
+    },
+    "expected": {
+      "tmdb_tv_id": "53918",
+      "season_assignments": {
+        "41658": 1,
+        "86670": 2,
+        "216310": 3,
+        "290980": 4
+      },
+      "selected_season": 3,
+      "ova_role": "extra"
+    }
+  },
+  "first_kiss": {
+    "task_id": "incident-first-kiss",
+    "media_domain": "tv",
+    "source_scope": ["First-Kiss/First Kiss [01].mkv"],
+    "observations": [
+      {
+        "namespace": "tmdb",
+        "entity_type": "tv",
+        "provider_id": "330299",
+        "title": "Kaguya-sama: Love Is War -The First Kiss That Never Ends-",
+        "localized_title": "",
+        "outcome": "ok",
+        "complete": true,
+        "truncated": false,
+        "evidence_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "first-kiss-subject",
+        "title": "かぐや様は告らせたい-ファーストキッスは終わらない-",
+        "localized_title": "辉夜大小姐想让我告白-初吻不会结束-",
+        "outcome": "ok",
+        "complete": true,
+        "truncated": false,
+        "evidence_fingerprint": "6666666666666666666666666666666666666666666666666666666666666666"
+      }
+    ],
+    "user_decisions": {
+      "confirmed_identity": ["tmdb", "tv", "330299"],
+      "confirmed_display_title": "辉夜大小姐想让我告白-初吻不会结束-",
+      "title_source": ["bangumi", "subject", "first-kiss-subject"],
+      "decision_revision": 4
+    },
+    "expected": {
+      "identity_provider_id": "330299",
+      "canonical_title": "辉夜大小姐想让我告白-初吻不会结束-",
+      "identity_unchanged_by_naming": true
+    }
+  },
+  "eighty_six": {
+    "task_id": "incident-eighty-six",
+    "media_domain": "tv",
+    "tmdb_tv_id": "100565",
+    "source_owned_segments": [
+      {
+        "bangumi_subject_id": "302189",
+        "season_number": 1,
+        "episode_start": 1,
+        "episode_end": 11,
+        "sources": ["86/86 [01].mkv", "86/86 [11].mkv"],
+        "evidence_fingerprint": "7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      {
+        "bangumi_subject_id": "331887",
+        "season_number": 1,
+        "episode_start": 12,
+        "episode_end": 23,
+        "sources": ["86/86 [12].mkv", "86/86 [23].mkv"],
+        "evidence_fingerprint": "8888888888888888888888888888888888888888888888888888888888888888"
+      }
+    ],
+    "non_regular_files": [
+      {
+        "source": "86/86 [13(OVA)].mkv",
+        "bounded_candidates": ["S00E05"]
+      },
+      {
+        "source": "86/86 [NCOP].mkv",
+        "bounded_candidates": []
+      },
+      {
+        "source": "86/86 [NCED].mkv",
+        "bounded_candidates": []
+      }
+    ],
+    "expected": {
+      "regular_episode_count": 23,
+      "official_special_decision_count": 1,
+      "manual_extra_count": 2,
+      "max_candidates_per_file": 1
+    }
+  },
+  "steins_source_overlap": {
+    "batch_id": "incident-steins-batch",
+    "parent_task_id": "incident-sg0-parent",
+    "child_task_id": "incident-23beta-child",
+    "parent_scope": ["SG0/"],
+    "child_scope": ["SG0/Steins Gate [23beta].mkv"],
+    "shared_location_key": "sg0/steins gate [23beta].mkv",
+    "shared_physical_key": "fixture-device:fixture-inode-23beta",
+    "child_media_domain": "tv",
+    "child_layout": "official_special",
+    "child_target": "S00E06",
+    "expected_parent_excludes_child": true
+  },
+  "tv_font": {
+    "task_id": "incident-yama-font",
+    "series_title": "向山进发",
+    "series_year": 2013,
+    "source": "Yama-S1/[VCB-Studio] Yama no Susume [Fonts].7z",
+    "size": 29437485,
+    "content_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "expected_scope": "series",
+    "expected_target": "向山进发 (2013) [Fonts].7z"
+  },
+  "movie_controls": [
+    {
+      "name": "Omoide Present",
+      "media_domain": "movie",
+      "font_contract": "work_font_intent",
+      "subtitle_target": "zh-Hans",
+      "extras_directory": "Extras"
+    },
+    {
+      "name": "Violet Evergarden",
+      "media_domain": "movie",
+      "font_contract": "work_font_intent",
+      "versions": ["1080p", "2160p-DoVi", "2160p-SDR"],
+      "extras_directory": "Extras"
+    }
+  ],
+  "stale_task_error": {
+    "task_id": "incident-stale-error",
+    "workflow_status_before": "invalid",
+    "error_before": "older provider selection failed",
+    "workflow_status_after": "need_confirm",
+    "error_after": null,
+    "required_history": {
+      "code": "provider_selection_failed",
+      "phase": "provider_selection",
+      "outcome": "failed"
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "cohort_control": {
+    "event": "confirm_related_subjects",
+    "must_not_inject_resolution": true,
+    "must_use_public_callback": true
+  },
+  "control_id": "R23-A-B-LIVE-ENTRY-POSITIVE",
+  "cumulative_selected_counts": [
+    3,
+    4,
+    9,
+    10,
+    14,
+    16
+  ],
+  "exact_child": "set-01/steins-zero/23beta.mkv",
+  "exact_child_parent": "set-01/steins-zero",
+  "expected_batch_count": 1,
+  "final_input_count": 16,
+  "parent_root_count": 5,
+  "picker_visit_count": 6,
+  "picker_visits": [
+    [
+      "set-01/steins-main",
+      "set-01/steins-zero",
+      "set-01/steins-movie"
+    ],
+    [
+      "set-01/steins-zero/23beta.mkv"
+    ],
+    [
+      "set-02/yama-s1",
+      "set-02/yama-s2",
+      "set-02/yama-s3",
+      "set-02/yama-s4",
+      "set-02/yama-ova"
+    ],
+    [
+      "set-03/eighty-six"
+    ],
+    [
+      "set-04/kaguya-s1",
+      "set-04/kaguya-s2",
+      "set-04/kaguya-s3",
+      "set-04/kaguya-special"
+    ],
+    [
+      "set-05/violet-1080p",
+      "set-05/violet-2160p"
+    ]
+  ],
+  "sanitizer_policy_version": "r23-d-p1-incident-sanitizer-v1",
+  "sanitizer_sha256": "EAA125D05262E96852567947E1F3CCD15DAA4CE9B01243EAC876239122F282E3",
+  "schema_version": 1,
+  "source_evidence_fingerprint": "6a05c08bd1afddeb58cd655a973d84eb4e00392eb45f7bfc1fb97edcad0557ee",
+  "submit_count": 1
+}

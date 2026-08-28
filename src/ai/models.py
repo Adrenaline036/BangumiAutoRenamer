@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from pydantic import Field, BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SeasonMapping(BaseModel):
@@ -28,9 +28,8 @@ class SeasonMapping(BaseModel):
 
         return v
 
-    class Config:
-        # Gemini API兼容配置
-        populate_by_name = True
+    # Gemini API兼容配置
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class EpisodeMapping(BaseModel):
@@ -46,9 +45,8 @@ class EpisodeMapping(BaseModel):
         default="Medium", description="置信度等级"
     )
 
-    class Config:
-        # Gemini API兼容配置
-        populate_by_name = True
+    # Gemini API兼容配置
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class AIAnalysisResult(BaseModel):
@@ -78,10 +76,9 @@ class AIAnalysisResult(BaseModel):
                 raise ValueError("高置信度结果必须包含映射信息")
         return v
 
-    class Config:
-        # Gemini API不支持additionalProperties，所以不设置extra
-        # JSON序列化时使用字段别名
-        populate_by_name = True
+    # Gemini API不支持additionalProperties，所以不设置extra。
+    # JSON序列化时使用字段别名。
+    model_config = ConfigDict(populate_by_name=True)
 
     @classmethod
     def model_json_schema(

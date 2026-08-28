@@ -1,5 +1,33 @@
+from pathlib import Path
+import unicodedata
+
+
 IGNORE_DIR = ['cd', 'scan']
 IGNORE_SUFFIX = ['.rar', '.zip', '.7z', '.webp', '.jpg', '.png']
+IGNORED_ASSET_DIRECTORY_NAMES = frozenset({
+    'cd', 'cds', 'scan', 'scans', 'bonus cds', 'bd scans',
+})
+
+
+def is_ignored_asset_directory(path: Path | str) -> bool:
+    """Match only explicit auxiliary directory names, never filename substrings."""
+
+    name = unicodedata.normalize('NFKC', Path(path).name).casefold().strip()
+    return name in IGNORED_ASSET_DIRECTORY_NAMES
+
+
+def is_font_archive(path: Path | str) -> bool:
+    """Accept only a .7z whose final stem token is the bracketed ``[Fonts]``."""
+
+    candidate = Path(path)
+    if candidate.suffix.casefold() != '.7z':
+        return False
+    stem = unicodedata.normalize('NFKC', candidate.stem).casefold().rstrip()
+    token = '[fonts]'
+    if not stem.endswith(token):
+        return False
+    prefix = stem[:-len(token)]
+    return not prefix or not prefix[-1].isalnum()
 EXTRA_TAG = [
     'NCOP',
     'NCED',
@@ -18,6 +46,7 @@ EXTRA_TAG = [
     '访谈',
     'Preview',
     'Picture Drama',
+    'Scene Cut',
     '预告',
     '特典',
     '映像',
@@ -47,6 +76,14 @@ VIDEO_SUFFIX = [
     '.rm',
     '.rmvb',
 ]
+
+JELLYFIN_EXTRAS_DIR = 'Extras'
+
+
+def jellyfin_season_dir(season: int) -> str:
+    """Return Jellyfin's canonical, zero-padded TV season directory name."""
+
+    return f'Season {int(season):02d}'
 
 keywords = [
     '01',

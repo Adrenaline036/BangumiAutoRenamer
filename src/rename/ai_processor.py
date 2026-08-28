@@ -2,10 +2,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..logger import logger
-from .utils import VIDEO_SUFFIX
+from .utils import VIDEO_SUFFIX, jellyfin_season_dir
 from ..ai.client import AIClient
 from ..ai.models import AIAnalysisResult
 from ..ai.video_analyzer import VideoAnalyzer
+from .path_safety import first_reparse_component, is_within
 
 
 class AIProcessor:
@@ -98,8 +99,20 @@ class AIProcessor:
                 episode_type = mapping.episode_type
                 confidence = mapping.confidence
 
-                # 从相对路径还原绝对路径
-                source_path = (base_path / relative_path_str).resolve()
+                # AI only names a file inside the frozen scan root.  Absolute,
+                # parent-traversal and junction-based escapes are observations,
+                # never path authority.
+                relative_path = Path(relative_path_str)
+                if relative_path.is_absolute():
+                    logger.warning("[AI处理] AI返回了绝对路径，已拒绝")
+                    continue
+                source_path = (base_path / relative_path).resolve(strict=False)
+                if (
+                    not is_within(source_path, base_path)
+                    or first_reparse_component(base_path / relative_path) is not None
+                ):
+                    logger.warning("[AI处理] AI返回路径越出来源范围，已拒绝")
+                    continue
 
                 if not source_path.exists():
                     logger.warning(f"[AI处理] AI返回的文件路径不存在: {source_path}")
@@ -107,13 +120,11 @@ class AIProcessor:
 
                 # 根据类型确定目标目录
                 if episode_type == "special":
-                    target_dir = work_path / "Season0"
+                    target_dir = work_path / jellyfin_season_dir(0)
                 elif episode_type == "movie":
                     target_dir = work_path / "Movies"
                 else:
-                    target_dir = work_path / f"Season{tmdb_season}"
-
-                target_dir.mkdir(parents=True, exist_ok=True)
+                    target_dir = work_path / jellyfin_season_dir(tmdb_season)
 
                 # 生成新的文件名
                 if episode_type in ["special", "ova"]:

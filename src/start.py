@@ -1,4 +1,5 @@
 import sys
+import os
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parents[2]))
@@ -11,7 +12,7 @@ if __name__ == '__mp_main__':
     logger.info('程序启动中...')
 
 ui.run(
-    port=5999,
+    port=int(os.getenv("BAR_UI_PORT", "5999")),
     storage_secret='REDACTED_STORAGE_SECRET',
     title='番剧自动重命名',
     favicon='🍭',

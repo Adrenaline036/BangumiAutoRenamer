@@ -1,5 +1,7 @@
 import re
+import unicodedata
 import difflib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -145,6 +147,259 @@ def remove_episode(s: str):
     for p in episode_partten:
         s = re.sub(p, '', s)
     return s.strip()
+
+
+_VIDEO_EXTENSION_PATTERN = re.compile(
+    r'\.(?:mkv|mka|mp4|avi|wmv|flv|mov|mpg|mpeg|m4v|rm|rmvb|ass)$',
+    re.IGNORECASE,
+)
+_RELEASE_GROUP_SUFFIX_PATTERN = re.compile(
+    r'\s+[-–—]\s+(?P<group>[A-Za-z0-9][A-Za-z0-9._!&+()\'-]{1,63})\s*$'
+)
+_BRACKET_BLOCK_PATTERNS = (
+    re.compile(r'\[([^\[\]]*)]'),
+    re.compile(r'【([^【】]*)】'),
+    re.compile(r'\(([^()]*)\)'),
+    re.compile(r'（([^（）]*)）'),
+)
+_TECHNICAL_TOKEN_PATTERN = re.compile(
+    r'(?:'
+    r'\b(?:bd(?:rip|remux)?|blu[- ]?ray|web[- ]?dl|webrip|hdtv|dvd(?:rip)?|'
+    r'uhd|remux|hevc|avc|av1|x26[45]|h\.?26[45]|hi10p|'
+    r'flac|aac|e-?ac-?3|ac-?3|dts(?:-?hd)?|truehd|opus|'
+    r'10\s*bit|8\s*bit|hdr10\+?|dolby[ .]?vision|dv|'
+    r'batch|complete)\b|'
+    r'\b(?:480|576|720|1080|1440|2160)[pi]\b|'
+    r'\b\d{3,4}\s*[x×]\s*\d{3,4}\b|'
+    r'\b4k\b|'
+    r'\b[a-f0-9]{8}(?:[a-f0-9]{24})?\b'
+    r'|\b(?:dual|multi)[ ._-]*audio\b'
+    r'|\b(?:dual|multi)[ ._-]*(?:sub|subs|subtitle|subtitles)\b'
+    r'|\bchap(?:ter|ters)?\b'
+    r'|(?:^|[^a-z0-9])ma\d{1,2}p(?:[^a-z0-9]|$)'
+    r'|(?:^|[^a-z0-9])x26[45](?:[^a-z0-9]|$)'
+    r'|(?:^|[^a-z0-9])(?:480|576|720|1080|1440|2160)p(?:[^a-z0-9]|$)'
+    r')',
+    re.IGNORECASE,
+)
+_EXPLICIT_SEASON_SUFFIX_PATTERN = re.compile(
+    r'(?:^|\s+|\s*[-–—]\s*)'
+    r'(?:S(?:eason)?\s*\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s+Season|'
+    r'(?:First|Second|Third|Fourth|Fifth)\s+Season|'
+    r'第[\d一二三四五六七八九零]{1,2}(?:季|部|部分))\s*$',
+    re.IGNORECASE,
+)
+_EXPLICIT_EPISODE_SUFFIX_PATTERN = re.compile(
+    r'(?:^|\s+|\s*[-–—]\s*)'
+    r'(?:S\d{1,2}E\d{1,3}|E(?:P)?\s*\d{1,3}|'
+    r'第\d{1,3}[话話集])\s*$',
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class SearchTitleCandidate:
+    title: str
+    year: int
+    reason: str
+
+    @property
+    def key(self) -> Tuple[str, int]:
+        return self.title, self.year
+
+
+@dataclass(frozen=True)
+class ParsedReleaseTitle:
+    original: str
+    technical_tags: Tuple[str, ...]
+    release_group: Optional[str]
+    candidates: Tuple[SearchTitleCandidate, ...]
+
+    @property
+    def primary(self) -> SearchTitleCandidate:
+        return self.candidates[0]
+
+
+def _normalize_spaces(value: str) -> str:
+    return re.sub(r'\s+', ' ', value).strip(' ._-')
+
+
+def _is_technical_block(content: str) -> bool:
+    normalized = unicodedata.normalize('NFKC', content)
+    return _TECHNICAL_TOKEN_PATTERN.search(normalized) is not None
+
+
+def _remove_technical_blocks(value: str) -> Tuple[str, Tuple[str, ...]]:
+    technical_tags: List[str] = []
+    cleaned = value
+    for pattern in _BRACKET_BLOCK_PATTERNS:
+        def replace(match):
+            content = match.group(1).strip()
+            if _is_technical_block(content):
+                technical_tags.append(content)
+                return ' '
+            return match.group(0)
+
+        cleaned = pattern.sub(replace, cleaned)
+    return _normalize_spaces(cleaned), tuple(technical_tags)
+
+
+def _flatten_title_brackets(value: str) -> str:
+    flattened = value
+    for pattern in _BRACKET_BLOCK_PATTERNS:
+        flattened = pattern.sub(lambda match: f' {match.group(1)} ', flattened)
+    return _normalize_spaces(flattened)
+
+
+def _strip_explicit_season_or_episode(value: str) -> str:
+    stripped = _EXPLICIT_EPISODE_SUFFIX_PATTERN.sub('', value)
+    stripped = _EXPLICIT_SEASON_SUFFIX_PATTERN.sub('', stripped)
+    return _normalize_spaces(stripped)
+
+
+def _has_meaningful_title(value: str) -> bool:
+    stripped = _strip_explicit_season_or_episode(value)
+    return len(re.findall(r'[A-Za-z\u3040-\u30ff\u4e00-\u9fff]', stripped)) >= 2
+
+
+def _append_candidate(
+    candidates: List[SearchTitleCandidate],
+    title: str,
+    year: int,
+    reason: str,
+) -> None:
+    normalized = _normalize_spaces(title)
+    if not normalized:
+        return
+    normalized_key = (unicodedata.normalize('NFKC', normalized).casefold(), year)
+    if any(
+        (unicodedata.normalize('NFKC', item.title).casefold(), item.year)
+        == normalized_key
+        for item in candidates
+    ):
+        return
+    candidates.append(SearchTitleCandidate(normalized, year, reason))
+
+
+def parse_release_title(value: str) -> ParsedReleaseTitle:
+    """Parse a release name into reversible, bounded TMDB search candidates."""
+    original = value
+    source = _VIDEO_EXTENSION_PATTERN.sub('', value).strip()
+    without_technical, technical_tags = _remove_technical_blocks(source)
+
+    release_group: Optional[str] = None
+    # A suffix is release metadata only when it appears after the final
+    # technical block in the original name.  This preserves titles such as
+    # ``Steins;Gate - Zero [BD]`` while accepting ``[BD] - Group``.
+    suffix_match = _RELEASE_GROUP_SUFFIX_PATTERN.search(source)
+    without_suffix = without_technical
+    if suffix_match and technical_tags:
+        release_group = suffix_match.group('group')
+        cleaned_suffix = _RELEASE_GROUP_SUFFIX_PATTERN.search(without_technical)
+        if cleaned_suffix:
+            without_suffix = without_technical[: cleaned_suffix.start()].rstrip()
+    elif technical_tags:
+        bracket_group = re.search(
+            r'\[(?P<group>[A-Za-z0-9][A-Za-z0-9._!&+\'-]{1,31})]\s*$',
+            source,
+        )
+        if bracket_group and not _is_technical_block(bracket_group.group('group')):
+            release_group = bracket_group.group('group')
+            cleaned_group = re.search(
+                r'\[[A-Za-z0-9][A-Za-z0-9._!&+\'-]{1,31}]\s*$',
+                without_technical,
+            )
+            if cleaned_group:
+                without_suffix = without_technical[: cleaned_group.start()].rstrip()
+
+    base_variants: List[Tuple[str, str]] = []
+    leading_match = re.match(r'^\[([^\[\]]+)]\s*(.+)$', without_suffix)
+    possible_leading_title = (
+        _flatten_title_brackets(leading_match.group(2))
+        if leading_match
+        else ''
+    )
+    meaningful_leading_title = bool(
+        possible_leading_title
+        and _has_meaningful_title(possible_leading_title)
+    )
+    if leading_match and technical_tags and meaningful_leading_title:
+        base_variants.append(
+            (possible_leading_title, '移除结构明确的前置发布组候选')
+        )
+
+    flattened = _flatten_title_brackets(without_suffix)
+    base_variants.append((flattened, '仅移除高置信技术标签'))
+    if leading_match and not technical_tags and meaningful_leading_title:
+        base_variants.append(
+            (
+                possible_leading_title,
+                '保留原始标题后尝试移除可能的前置发布组',
+            )
+        )
+    if release_group:
+        conservative = _flatten_title_brackets(without_technical)
+        base_variants.append((conservative, '保留可能属于标题的发布组后缀'))
+        base_variants.append(
+            (_flatten_title_brackets(source), '保留全部括号字段的原始回退候选')
+        )
+
+    candidates: List[SearchTitleCandidate] = []
+    for base_title, base_reason in base_variants:
+        year_match = re.search(r'(?<!\d)((?:19|20)\d{2})\s*$', base_title)
+        if year_match:
+            year = int(year_match.group(1))
+            if 1901 <= year <= 2035:
+                without_year = _normalize_spaces(base_title[: year_match.start()])
+                without_season = _strip_explicit_season_or_episode(without_year)
+                _append_candidate(
+                    candidates,
+                    without_season,
+                    year,
+                    f'{base_reason}；末尾年份作为过滤条件',
+                )
+                _append_candidate(
+                    candidates,
+                    without_year,
+                    year,
+                    f'{base_reason}；保留季度文本并使用年份过滤',
+                )
+                _append_candidate(
+                    candidates,
+                    base_title,
+                    0,
+                    f'{base_reason}；年份保留为标题字面量',
+                )
+                continue
+
+        without_season = _strip_explicit_season_or_episode(base_title)
+        _append_candidate(
+            candidates,
+            without_season,
+            0,
+            f'{base_reason}；显式季度或集号作为独立字段',
+        )
+        _append_candidate(
+            candidates,
+            base_title,
+            0,
+            f'{base_reason}；保留季度或集号文本',
+        )
+
+    if not candidates:
+        _append_candidate(candidates, source, 0, '保守使用原始名称')
+
+    return ParsedReleaseTitle(
+        original=original,
+        technical_tags=technical_tags,
+        release_group=release_group,
+        candidates=tuple(candidates[:6]),
+    )
+
+
+def prepare_search_title(value: str) -> Tuple[str, int]:
+    """Compatibility wrapper returning the highest-priority candidate."""
+    return parse_release_title(value).primary.key
 
 
 def is_chinese_percentage_sufficient(text: str):

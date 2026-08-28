@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "source": "R22 C1 local Plan-only incident, sanitized semantic replay",
+    "observed_shape": "selected subject exact TMDB TV; every successor query returned complete no_match",
+    "old_fixture_difference": "the earlier C1 fixture returned the selected TMDB TV for seasons 3 and 4 and only forced season 2 to no_match",
+    "privacy_removed": [
+      "local absolute paths",
+      "task UUID",
+      "credentials",
+      "runtime log text",
+      "complete media manifest"
+    ]
+  },
+  "yama": {
+    "selected_subject_id": "41658",
+    "subjects": [
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "41658",
+        "title": "向山进发",
+        "original_title": "ヤマノススメ",
+        "air_date": "2013-01-02",
+        "episode_count": 13,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "86670",
+        "title": "向山进发 第二季",
+        "original_title": "ヤマノススメ セカンドシーズン",
+        "air_date": "2014-07-09",
+        "episode_count": 24,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "216310",
+        "title": "向山进发 第三季",
+        "original_title": "ヤマノススメ サードシーズン",
+        "air_date": "2018-07-02",
+        "episode_count": 13,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "290980",
+        "title": "向山进发 Next Summit",
+        "original_title": "ヤマノススメ Next Summit",
+        "air_date": "2022-10-04",
+        "episode_count": 12,
+        "platform": "TV",
+        "type": 2
+      }
+    ],
+    "relations": [
+      {"from": "41658", "to": "86670", "relation": "续集"},
+      {"from": "86670", "to": "216310", "relation": "续集"},
+      {"from": "216310", "to": "290980", "relation": "续集"}
+    ],
+    "observations": [
+      {
+        "bangumi_subject_id": "41658",
+        "observed_at": "2026-08-25T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "original",
+            "query": "ヤマノススメ",
+            "year": 2013,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "53918",
+                "tmdb_tv_id": "53918",
+                "match_tier": "exact",
+                "title": "向山进发",
+                "original_title": "ヤマノススメ",
+                "first_air_date": "2013-01-03",
+                "seasons": [
+                  {"season_number": 1, "air_date": "2013-01-03", "episode_count": 12},
+                  {"season_number": 2, "air_date": "2014-07-09", "episode_count": 24},
+                  {"season_number": 3, "air_date": "2018-07-02", "episode_count": 13},
+                  {"season_number": 4, "air_date": "2022-10-05", "episode_count": 12}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "bangumi_subject_id": "86670",
+        "observed_at": "2026-08-25T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "ヤマノススメ セカンドシーズン", "year": 2014, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      },
+      {
+        "bangumi_subject_id": "216310",
+        "observed_at": "2026-08-25T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "ヤマノススメ サードシーズン", "year": 2018, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      },
+      {
+        "bangumi_subject_id": "290980",
+        "observed_at": "2026-08-25T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "ヤマノススメ Next Summit", "year": 2022, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      }
+    ],
+    "source_shape": {
+      "regular_episode_numbers": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      "bonus_marker": "13(OVA)",
+      "bonus_subtitle": true,
+      "expected_bonus_parent": ["Season 01", "Extras"],
+      "forbidden_target_marker": "S01E13"
+    }
+  },
+  "steins_boundary": {
+    "selected_subject_id": "10380",
+    "subjects": [
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "10380",
+        "title": "命运石之门",
+        "original_title": "STEINS;GATE",
+        "air_date": "2011-04-06",
+        "episode_count": 24,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "129807",
+        "title": "命运石之门 0",
+        "original_title": "STEINS;GATE 0",
+        "air_date": "2018-04-12",
+        "episode_count": 23,
+        "platform": "TV",
+        "type": 2
+      }
+    ],
+    "relations": [
+      {"from": "10380", "to": "129807", "relation": "续集"}
+    ],
+    "observations": [
+      {
+        "bangumi_subject_id": "10380",
+        "observed_at": "2026-08-25T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "original",
+            "query": "STEINS;GATE",
+            "year": 2011,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "42509",
+                "tmdb_tv_id": "42509",
+                "match_tier": "exact",
+                "title": "命运石之门",
+                "original_title": "Steins;Gate",
+                "first_air_date": "2011-04-06",
+                "seasons": [
+                  {"season_number": 1, "air_date": "2011-04-06", "episode_count": 24}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "bangumi_subject_id": "129807",
+        "observed_at": "2026-08-25T00:00:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "STEINS;GATE 0", "year": 2018, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      }
+    ]
+  }
+}

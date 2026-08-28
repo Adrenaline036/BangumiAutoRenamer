@@ -170,3 +170,6 @@ Bangumi_Auto_Rename.onefile-build
 
 config.json
 data
+
+# Local-only collaboration records, deployment artifacts, and private review notes.
+local/

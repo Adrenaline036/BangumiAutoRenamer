@@ -1,3 +1,4 @@
+import os
 import json
 from typing import Dict, List, Optional
 
@@ -14,7 +15,13 @@ class AIClient:
 
     def __init__(self):
         self.provider = cm.get_config("ai_provider") or "openai"
-        self.enabled = bool(cm.get_config("ai_enabled"))
+        force_disabled = os.getenv('BAR_FORCE_DISABLE_AI', '').strip().casefold()
+        self.enabled = bool(cm.get_config("ai_enabled")) and force_disabled not in {
+            '1',
+            'true',
+            'yes',
+            'on',
+        }
         self.confidence_threshold = cm.get_config("ai_confidence_threshold")
 
         # 根据提供商创建相应的客户端
