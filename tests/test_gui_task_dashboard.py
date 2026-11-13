@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from src.pages.add_task_page import media_flags
-from src.main_page import BAR_CSS, is_local_gui_preview, runtime_mode_label
+from src.main_page import BAR_CSS, runtime_mode_label
+from development.preview import is_local_gui_preview
 from src.pages.config_page import BASIC_CONFIG_KEYS, ConfigPage
 from src.pages import data_table_page
 from src.pages.data_table_page import (
@@ -21,12 +22,28 @@ from src.pages.data_table_page import (
     task_counts,
     task_display_title,
     task_feedback_text,
+    task_media_label,
     task_status_text,
 )
 from src.rename.decision_state import DecisionState
 
 
-class GuiTaskDashboardTests(unittest.TestCase):
+class GuiTaskDashboardTests(unittest.IsolatedAsyncioTestCase):
+    def test_task_card_distinguishes_animation_series_and_movies(self):
+        self.assertEqual(
+            "动画剧集", task_media_label({"is_anime": True, "is_movie": False})
+        )
+        self.assertEqual(
+            "动画电影", task_media_label({"is_anime": True, "is_movie": True})
+        )
+        self.assertEqual(
+            "非动画剧集", task_media_label({"is_anime": False, "is_movie": False})
+        )
+        self.assertEqual(
+            "电影", task_media_label({"is_anime": False, "is_movie": True})
+        )
+        self.assertEqual("自动判断", task_media_label({}))
+
     def test_internal_inventory_errors_are_rendered_as_short_actions(self):
         self.assertEqual(
             "需要确认作品、保存位置和正片。",
@@ -86,22 +103,24 @@ class GuiTaskDashboardTests(unittest.TestCase):
         self.assertIn("else:", source)
 
     def test_pending_and_history_actions_share_order_and_colors(self):
-        source = inspect.getsource(data_table_page._task_card)
-        history = source.split(
-            'elif status not in ACTIVE_STATUSES:', 1
-        )[1]
-
-        self.assertLess(history.index('"处理"'), history.index('"重试"'))
-        self.assertLess(history.index('"重试"'), history.index('"删除"'))
-        self.assertIn("unelevated color=orange-8", history)
-        self.assertIn("unelevated color=green-7", history)
-        self.assertIn("unelevated color=red-7", history)
+        from nicegui import Client
+        from nicegui.page import page as nice_page
+        for status in ('need_confirm', 'failed'):
+            with self.subTest(status=status):
+                client = Client(nice_page('/card-actions'), request=None)
+                self.addCleanup(client.delete)
+                with client:
+                    data_table_page._task_card({'uuid': 'actions', 'workflow_status': status}, title_authority=None)
+                actions = [e for e in client.elements.values() if 'bar-review-action' in e.classes]
+                self.assertEqual(['处理', '重建', '删除'], [e._props.get('label') for e in actions])
+                self.assertEqual(['orange-8', 'blue-7', 'red-7'], [e._props.get('color') for e in actions])
 
     def test_joined_file_filter_keeps_equal_width_segments(self):
-        self.assertIn(".bar-equal-filter-toggle { width: 190px; }", BAR_CSS)
-        self.assertIn(
-            ".bar-equal-filter-toggle .q-btn { flex: 1 1 0 !important;",
+        # Check sizing without forbidding the requested outer-corner styling.
+        self.assertRegex(BAR_CSS, r"\.bar-equal-filter-toggle\s*\{[^}]*width:\s*190px;")
+        self.assertRegex(
             BAR_CSS,
+            r"\.bar-equal-filter-toggle \.q-btn:not\(\.q-btn--round\)\s*\{[^}]*flex:\s*1 1 0 !important;",
         )
 
     def test_config_path_picker_uses_icon_only_button(self):
@@ -152,9 +171,8 @@ class GuiTaskDashboardTests(unittest.TestCase):
             self.assertTrue(is_local_gui_preview())
 
     def test_runtime_mode_label_distinguishes_preview_and_real_execution(self):
-        self.assertEqual("界面测试 · 禁止执行", runtime_mode_label(True, False))
-        self.assertEqual("只读预演 · 不创建文件", runtime_mode_label(False, True))
-        self.assertEqual("真实执行已启用", runtime_mode_label(False, False))
+        self.assertEqual("只读预演 · 不创建文件", runtime_mode_label(True))
+        self.assertEqual("文件整理须批准后执行", runtime_mode_label(False))
 
     def test_acknowledged_recovery_has_persistent_action_hint(self):
         task = {
@@ -198,40 +216,35 @@ class GuiTaskDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard_signature(first), dashboard_signature(reordered))
         self.assertNotEqual(dashboard_signature(first), dashboard_signature(changed))
 
-    def test_refresh_dashboard_skips_unchanged_dom_rebuild(self):
-        rows = [{"uuid": "one", "workflow_status": "running"}]
-        data_table_page._dashboard_signatures["__test__"] = dashboard_signature(rows)
-        with (
-            patch.object(data_table_page, "_dashboard_client_key", return_value="__test__"),
-            patch.object(data_table_page, "load_task_rows", return_value=rows),
-            patch.object(data_table_page._dashboard_summary, "refresh") as summary,
-            patch.object(data_table_page._active_tasks, "refresh") as active,
-            patch.object(data_table_page._review_tasks, "refresh") as review,
-            patch.object(data_table_page._history_tasks, "refresh") as history,
-        ):
-            self.assertFalse(data_table_page.refresh_dashboard())
-        summary.assert_not_called()
-        active.assert_not_called()
-        review.assert_not_called()
-        history.assert_not_called()
+    async def test_refresh_dashboard_skips_unchanged_dom_rebuild(self):
+        from nicegui import Client
+        from nicegui.page import page as nice_page
+        client = Client(nice_page('/dashboard-calibration'), request=None)
+        self.addCleanup(client.delete)
+        rows = [{'uuid': 'one', 'workflow_status': 'running'}]
+        with client, patch.object(data_table_page, 'load_task_rows', return_value=rows), \
+                patch.object(data_table_page, '_read_card_decision', return_value=None):
+            await data_table_page.create_table()
+            view = data_table_page._dashboard_views[client.id]
+            before = dict(view.sections['active'].cards)
+            self.assertIs(False, await data_table_page.refresh_dashboard())
+            self.assertEqual(before, view.sections['active'].cards)
 
-    def test_refresh_dashboard_rebuilds_after_task_change(self):
-        old_rows = [{"uuid": "one", "workflow_status": "running"}]
-        new_rows = [{"uuid": "one", "workflow_status": "completed"}]
-        data_table_page._dashboard_signatures["__test__"] = dashboard_signature(old_rows)
-        with (
-            patch.object(data_table_page, "_dashboard_client_key", return_value="__test__"),
-            patch.object(data_table_page, "load_task_rows", return_value=new_rows),
-            patch.object(data_table_page._dashboard_summary, "refresh") as summary,
-            patch.object(data_table_page._active_tasks, "refresh") as active,
-            patch.object(data_table_page._review_tasks, "refresh") as review,
-            patch.object(data_table_page._history_tasks, "refresh") as history,
-        ):
-            self.assertTrue(data_table_page.refresh_dashboard())
-        summary.assert_called_once_with()
-        active.assert_called_once_with()
-        review.assert_called_once_with()
-        history.assert_called_once_with()
+    async def test_refresh_dashboard_rebuilds_after_task_change(self):
+        from nicegui import Client
+        from nicegui.page import page as nice_page
+        client = Client(nice_page('/dashboard-calibration'), request=None)
+        self.addCleanup(client.delete)
+        rows = [{'uuid': 'one', 'workflow_status': 'running'}]
+        with client, patch.object(data_table_page, 'load_task_rows', side_effect=lambda: rows), \
+                patch.object(data_table_page, '_read_card_decision', return_value=None):
+            await data_table_page.create_table()
+            view = data_table_page._dashboard_views[client.id]
+            rows[0] = dict(rows[0], workflow_status='completed')
+            self.assertIs(True, await data_table_page.refresh_dashboard())
+            self.assertNotIn('one', view.sections['active'].cards)
+            self.assertIn('one', view.sections['history'].cards)
+            self.assertEqual('1', view.counts['completed'].text)
 
     def test_config_media_paths_match_library_folder_order(self):
         self.assertEqual(
@@ -239,16 +252,13 @@ class GuiTaskDashboardTests(unittest.TestCase):
             ["anime_path", "anime_movie_path", "movie_path", "bangumi_path"],
         )
 
-    def test_config_persistence_note_is_single_sentence_at_bottom(self):
+    def test_config_has_no_persistence_note_or_bottom_separator(self):
         source = inspect.getsource(ConfigPage.__init__)
 
-        self.assertIn("配置保存在独立数据目录：{CONFIG_PATH}", source)
-        self.assertNotIn("替换镜像时保持该目录挂载不变", source)
-        self.assertNotIn("NAS 容器统一浏览 /volume1", source)
-        self.assertGreater(
-            source.index("配置保存在独立数据目录：{CONFIG_PATH}"),
-            source.index("AI功能测试按钮"),
-        )
+        self.assertNotIn("配置保存在独立数据目录", source)
+        self.assertNotIn('ui.separator().style("margin: 20px 0;")', source)
+        self.assertIn('RedButton("取消", on_click=self.close)', source)
+        self.assertIn('"保存"', source)
 
     def test_media_type_options_map_to_existing_process_flags(self):
         self.assertEqual(media_flags("auto"), (None, None))
@@ -338,7 +348,7 @@ class GuiTaskDashboardTests(unittest.TestCase):
             patch.object(data_table_page, "notify") as notify,
             patch.object(
                 data_table_page.task_queue,
-                "enqueue",
+                "enqueue_batch",
                 new=AsyncMock(),
             ) as enqueue,
             patch.object(

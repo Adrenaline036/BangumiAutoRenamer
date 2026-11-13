@@ -9,6 +9,7 @@ replaced with synthetic downstream fixtures.
 """
 
 from __future__ import annotations
+from contextlib import nullcontext
 
 import asyncio
 from contextlib import ExitStack, nullcontext
@@ -56,7 +57,10 @@ from src.rename.provider_link_decision import (
 )
 from src.rename.process import Rename
 from src.task_queue import TaskQueueManager
-from tests.projection_test_support import save_plan_fixture
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+    persist_provider_selection_attempt,
+)
 
 
 def _sha256_json(value: object) -> str:
@@ -76,8 +80,7 @@ def provider_flow_diagnostics(
     """Return a deterministic, non-mutating snapshot for flaky flow failures."""
 
     task = result.task if isinstance(result.task, Mapping) else {}
-    selection = task.get("selection_operation")
-    selection = selection if isinstance(selection, Mapping) else {}
+    selection = current_provider_selection_context(dict(task))
     candidate = selection.get("candidate")
     candidate = candidate if isinstance(candidate, Mapping) else {}
     provider_failure = task.get("provider_selection_failure")
@@ -273,6 +276,7 @@ def _candidate(subjects: dict[str, dict[str, object]], subject_id: str) -> dict:
         "poster_url": production_fixture.POSTER_URL,
         "source_url": f"https://bgm.tv/subject/{subject_id}",
         "snapshot_at": "2026-08-24T00:00:00+00:00",
+        "platform": str(item.get("platform") or ""),
     }
 
 
@@ -388,6 +392,16 @@ class _ProviderSearch:
     def get_movie_info_by_id(self, _provider_id):
         return "", None
 
+    def get_season_info(self, provider_id, season_number):
+        if int(season_number) == 0 and int(provider_id) in {
+            42509,
+            53918,
+            78102,
+            100565,
+        }:
+            return {"season_number": 0, "episodes": ()}
+        return None
+
 
 def _configured_renamer(
     root: Path,
@@ -397,6 +411,8 @@ def _configured_renamer(
     library_root: Path | None = None,
 ) -> Rename:
     renamer = object.__new__(Rename)
+    renamer.decision_state_root = root / "decisions"
+    renamer.provider_link_catalog_root = root / "provider_links"
     renamer.search = _ProviderSearch(
         fail_subject=fail_subject,
         failure_mode=failure_mode,
@@ -405,9 +421,6 @@ def _configured_renamer(
         user_agent="BangumiAutoRenamer-Phase-B-RED/0.1",
         session=production_fixture._BangumiFlatSession(),
         sleeper=lambda _seconds: None,
-    )
-    renamer.ai_processor = SimpleNamespace(
-        ai_client=SimpleNamespace(is_available=lambda: False)
     )
     renamer.R = {}
     media_root = library_root or root
@@ -433,6 +446,27 @@ def _root_config_patch(snapshot: Mapping[str, object]):
         "get_config",
         side_effect=lambda key: values.get(str(key), ""),
     )
+
+
+def _result_root_config_patch(result):
+    """Use this fixture's actual configured roots, not a retired Task field."""
+    return _root_config_patch({
+        'bangumi_path': str(result.renamer.BANGUMI_PATH),
+        'movie_path': str(result.renamer.MOVIE_PATH),
+        'anime_path': str(result.renamer.ANIME_PATH),
+        'anime_movie_path': str(result.renamer.ANIME_MOVIE_PATH),
+    })
+
+
+def _result_root_snapshot_source(result):
+    from src.rename.initial_movie_completion import RootSnapshotSource
+    from src.rename.target_routing import TargetRootSnapshot
+    return RootSnapshotSource(lambda: TargetRootSnapshot.capture({
+        'bangumi_path': result.renamer.BANGUMI_PATH,
+        'movie_path': result.renamer.MOVIE_PATH,
+        'anime_path': result.renamer.ANIME_PATH,
+        'anime_movie_path': result.renamer.ANIME_MOVIE_PATH,
+    }))
 
 
 def _make_episode_source(
@@ -481,19 +515,35 @@ def _byte_manifest(root: Path) -> tuple[tuple[str, bytes], ...]:
     return tuple(
         (path.relative_to(root).as_posix(), path.read_bytes())
         for path in sorted(item for item in root.rglob("*") if item.is_file())
+        if not (path.name == '.provider-link-catalog.lock'
+                or path.parent.name == '.locks' and path.suffix == '.lock')
     )
 
 
 class _ReviewCapture:
     mounted: list[tuple[object, dict[str, object]]] = []
 
-    def __init__(self, plan, task_data):
+    def __init__(self, plan, task_data, *, snapshot=None, loading=False):
         self.plan = plan
         self.task_data = dict(task_data)
-        type(self).mounted.append((plan, dict(task_data)))
+        self.submitted = asyncio.Event()
+        self.value = False
+        self.exit_requested = False
+        self.is_deleted = False
+        if not loading:
+            type(self).mounted.append((plan, dict(task_data)))
+
+    def open(self):
+        self.value = True
+
+    def _load_plan_view(self, plan, *, snapshot=None):
+        self.plan = plan
+        self.snapshot = snapshot
+        type(self).mounted.append((plan, dict(self.task_data)))
 
     def __await__(self):
         async def wait_once():
+            self.exit_requested = True
             return None
 
         return wait_once().__await__()
@@ -514,6 +564,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
         fail_subject: str | tuple[str, ...] | None = None,
         failure_mode: str = "transport",
         library_root: Path | None = None,
+        initialize_default_content: bool = False,
     ) -> SimpleNamespace:
         tasks = root / "tasks"
         plans = root / "plans"
@@ -554,12 +605,11 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(task_queue_module, "PLAN_PATH", plans))
             stack.enter_context(patch.object(task_queue_module, "PLAN_REVIEW_PATH", reviews))
             stack.enter_context(patch.object(task_queue_module, "RECORD_PATH", records))
+            stack.enter_context(patch.object(task_queue_module, "SERIES_CATALOG_PATH", series_catalog))
+            stack.enter_context(patch.object(task_queue_module, "WORK_CATALOG_PATH", work_catalog))
+            stack.enter_context(patch.object(task_queue_module, "RECOVERY_TRANSACTION_PATH", recovery))
             stack.enter_context(patch.object(process_module, "TASK_PATH", tasks))
             stack.enter_context(patch.object(process_module, "PLAN_PATH", plans))
-            stack.enter_context(patch.object(process_module, "DECISION_STATE_PATH", decisions))
-            stack.enter_context(
-                patch.object(process_module, "PROVIDER_LINK_CATALOG_PATH", provider_links)
-            )
             stack.enter_context(
                 patch.object(process_module, "SERIES_CATALOG_PATH", series_catalog)
             )
@@ -578,7 +628,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             )
             stack.enter_context(patch.object(review_page, "RecognitionRecoveryDialog", ui_fixture._NoopAnyDialog))
             stack.enter_context(patch.object(review_page, "notify"))
-            stack.enter_context(patch.object(add_task_page, "is_ui_test_mode", return_value=False))
+            stack.enter_context(nullcontext())
             stack.enter_context(patch.object(add_task_page, "notify"))
 
             renamer = _configured_renamer(
@@ -598,9 +648,10 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             manager = TaskQueueManager(
                 task_root=tasks,
                 decision_state_root=decisions,
+                provider_link_catalog_root=provider_links,
                 recovery_abandon_audit_root=abandon,
                 plan_root=plans,
-                test_mode=False,
+
             )
             stack.enter_context(patch("src.task_queue.Rename", return_value=renamer))
             stack.enter_context(patch.object(add_task_page, "task_queue", manager))
@@ -610,22 +661,23 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             )
             queue_join_count = 0
 
-            submit = SimpleNamespace(
-                path=str(source),
-                media_type="anime",
-                use_ai=False,
-                _submitting=False,
-                submit_button=MagicMock(),
-                close=MagicMock(),
-            )
             await manager.start()
             try:
-                await AddTaskDialog._submit(submit)
+                from tests.workflow_gui_fixture import add_source
+                submit = await add_source(source)
                 await asyncio.wait_for(manager._queue.join(), timeout=12)
                 queue_join_count += 1
                 task_files = tuple(tasks.glob("*.json"))
                 self.assertEqual(1, len(task_files), "Add Task must persist one UI task")
                 task_id = task_files[0].stem
+                initial_task = manager._read(task_id)
+                if (not PlanStore(plans).path_for(task_id).exists()
+                        and not DecisionStateStore(decisions).path_for(task_id).exists()):
+                    # Auto admission may require human identification. Follow
+                    # its real manual workspace entry, not an invented Plan.
+                    from src.pages.initial_workspace import create_initial_workspace
+                    with patch.object(review_page, 'task_queue', manager):
+                        await create_initial_workspace(task_id, initial_task, media_type='anime')
                 stack.enter_context(patch.object(review_page, "PlanReviewDialog", _ReviewCapture))
                 await review_page.plan_review_page(task_id)
                 initial_plan = PlanStore(plans).load(task_id)
@@ -639,6 +691,19 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                     task_data=json.loads(task_files[0].read_text("utf-8")),
                     close=Mock(),
                 )
+                if initialize_default_content:
+                    service = PlanReviewService(
+                        PlanStore(plans), reviews, work_catalog,
+                        task_root=tasks, decision_state_root=decisions,
+                        provider_link_catalog_root=provider_links, record_root=records,
+                    )
+                    preview = service.prepare_default_content_initialization(
+                        task_id, PlanStore.fingerprint(dialog.plan)
+                    )
+                    dialog.plan = service.commit_default_content_initialization(preview)
+                    dialog.task_decision = service.decision_state_store.load(task_id)
+                    dialog.task_data = manager._read(task_id)
+                    self.assertFalse(dialog.task_decision.confirmed_work)
                 stack.enter_context(patch.object(review_page, "task_queue", manager))
                 await PlanReviewDialog._select_provider_candidate(dialog, candidate)
                 await asyncio.wait_for(manager._queue.join(), timeout=12)
@@ -680,6 +745,9 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             )
             return SimpleNamespace(
                 root=root,
+                renamer=renamer,
+                provider_fixture_subjects=combined_subjects,
+                provider_fixture_relations=combined_relations,
                 task_id=task_id,
                 task=task,
                 tasks=tasks,
@@ -760,11 +828,20 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
         work_identity = result.plan.work_identity
         if (
             work_identity is None
-            or work_identity.primary_provider.namespace != "tmdb"
-            or work_identity.primary_provider.entity_type != "tv"
-            or work_identity.primary_provider.provider_id != expected_tmdb_id
+            or work_identity.primary_provider.namespace != "bangumi"
+            or work_identity.primary_provider.entity_type != "subject"
+            or work_identity.primary_provider.provider_id
+            != result.selected_subject_id
+            or not any(
+                identity.namespace == "tmdb"
+                and identity.entity_type == "tv"
+                and identity.provider_id == expected_tmdb_id
+                for identity in result.plan.linked_provider_identities
+            )
         ):
-            problems.append("Plan work identity does not match the resolved TMDB TV work")
+            problems.append(
+                "Plan does not keep Bangumi primary with linked TMDB TV metadata"
+            )
         if Path(str(result.plan.metadata.get("canonical_work_root") or "")) != expected_work_root:
             problems.append("Plan canonical work root does not match the resolved work")
         if not str(result.plan.metadata.get("series_key") or ""):
@@ -973,14 +1050,14 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
         )
         if len(current_history) < 2:
             problems.append("Plan history does not contain initial and provider revisions")
-        selection = result.task.get("selection_operation") or {}
+        selection = current_provider_selection_context(result.task)
         if selection.get("state") != "succeeded":
             problems.append("provider selection did not durably succeed")
         if require_accepted:
             verification = PlanVerifier().verify(result.plan)
-            if verification.status != PlanStatus.ACCEPTED or verification.issues:
+            if verification.status != PlanStatus.ACCEPTED or {i.code for i in verification.issues} != set():
                 problems.append(
-                    "unique provider resolution did not persist an accepted issue-free Plan"
+                    "unique provider resolution must leave only the explicit font-check stage"
                 )
             if result.task.get("workflow_status") != "need_confirm":
                 problems.append("unique provider resolution did not return to review")
@@ -1032,7 +1109,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, diagnostic["queue"]["join_count"])
             self.assertEqual(0, diagnostic["queue"]["unfinished_tasks_after_stop"])
             self.assertEqual("succeeded", diagnostic["selection"]["state"])
-            self.assertEqual("accepted", diagnostic["plan"]["status"])
+            self.assertEqual("invalid", diagnostic["plan"]["status"])
             self.assertEqual([], diagnostic["plan"]["issue_codes"])
             self.assertEqual(
                 task_before,
@@ -1408,345 +1485,89 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_ambiguous_projection_has_two_real_actions_and_rejects_stale_callback(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = _make_ambiguous_episode_versions(root / "source")
-            result = await self._run_real_add_select(
-                root=root / "flow",
-                source=source,
-                subjects=EIGHTY_SIX_SUBJECTS,
-                relations=EIGHTY_SIX_RELATIONS,
-                selected_subject_id="331887",
-            )
-            plan = result.plan
-            state = result.state
-            problems = self._nested_snapshot_problems(
-                result,
-                selected_subject_id="331887",
-                expected_tmdb_id="100565",
-                expected_ranges=(
-                    ("302189", "100565", 1, 1, 11),
-                    ("331887", "100565", 1, 12, 23),
-                ),
-                expected_segment=("302189", "331887"),
-                expected_observation_ids={
-                    "302189": "100565", "331887": "100565",
-                },
-                require_accepted=False,
-            )
-            frozen_provider_snapshot = plan.metadata.get("provider_link_snapshot")
-            if result.task.get("workflow_status") != "need_confirm":
-                problems.append("ambiguous projection was not kept in the review workflow")
-            dialog = object.__new__(PlanReviewDialog)
-            dialog.plan = plan
-            dialog.task_decision = state
-            dialog.task_data = dict(result.task)
-            dialog.snapshot = build_plan_review_snapshot(plan)
-            dialog.issues_container = ui_fixture._UiNode()
-            dialog.review_service = PlanReviewService(
-                PlanStore(result.plans), result.reviews, result.root / "work_catalog"
-            )
-            dialog.decision_command_service = DecisionCommandService(
-                DecisionStateStore(result.decisions), PlanStore(result.plans)
-            )
-            dialog.selected_ids = set()
-            dialog._adopt_revision = Mock()
-            ui = ui_fixture._CaptureUi()
-            notices: list[tuple[str, object]] = []
-            with (
-                patch.object(review_page, "ui", ui),
-                patch.object(review_page, "TASK_PATH", result.tasks),
-                patch.object(review_page, "PLAN_PATH", result.plans),
-                patch.object(review_page, "PLAN_REVIEW_PATH", result.reviews),
-                patch.object(review_page, "DECISION_STATE_PATH", result.decisions),
-                patch.object(utils_module, "TASK_PATH", result.tasks),
-                patch.object(
-                    review_page,
-                    "notify",
-                    side_effect=lambda message, **kwargs: notices.append(
-                        (str(message), kwargs.get("type"))
-                    ),
-                ),
-            ):
-                PlanReviewDialog._render_issues(dialog)
-                issue_codes = {
-                    issue.code for issue in PlanVerifier().verify(plan).issues
-                }
-                if PlanVerifier().verify(plan).status != PlanStatus.INVALID:
-                    problems.append("ambiguous source projection was not held for review")
-                if "source_episode_projection_decision_required" not in issue_codes:
-                    problems.append("ambiguous source projection has no blocking issue")
-                first = ui.callbacks.get("沿用文件中的集号")
-                second = ui.callbacks.get("从本段第1集重新编号")
-                if not callable(first) or not callable(second):
-                    problems.append("ambiguous projection has no two explicit review actions")
-                else:
-                    value = first()
-                    if inspect.isawaitable(value):
-                        await value
-                    current_state = DecisionStateStore(result.decisions).load(result.task_id)
-                    current_plan = PlanStore(result.plans).load(result.task_id)
-                    if current_state.revision <= state.revision:
-                        problems.append("projection action did not advance DecisionState")
-                    projection = (
-                        current_plan.to_dict().get("metadata", {}).get(
-                            "source_episode_projection"
-                        ) or {}
-                    )
-                    if projection.get("mode") != "absolute":
-                        problems.append("absolute action did not persist the chosen projection")
-                    if current_state.to_dict().get("source_episode_projection") != projection:
-                        problems.append("projection action split DecisionState from Plan")
-                    current_task = json.loads(
-                        (result.tasks / f"{result.task_id}.json").read_text("utf-8")
-                    )
-                    verification = PlanVerifier().verify(current_plan)
-                    if verification.status != PlanStatus.ACCEPTED or verification.issues:
-                        problems.append("chosen projection did not close the blocking review issue")
-                    if current_task.get("workflow_status") != "need_confirm":
-                        problems.append("chosen projection did not return the task to review")
-                    if current_plan.metadata.get("provider_link_snapshot") != frozen_provider_snapshot:
-                        problems.append("projection action changed frozen provider evidence")
-                    entries_by_source = {
-                        Path(entry.source_path): entry for entry in current_plan.entries
-                    }
-                    absolute_subtitles = tuple(
-                        entry for entry in current_plan.entries
-                        if entry.media_kind == "subtitle"
-                    )
-                    if len(absolute_subtitles) != 2:
-                        problems.append(
-                            "absolute two-version projection did not preserve two subtitles"
-                        )
-                    for subtitle_entry in absolute_subtitles:
-                        video_source = (
-                            Path(subtitle_entry.source_path)
-                            .with_suffix("").with_suffix(".mkv")
-                        )
-                        video_entry = entries_by_source.get(video_source)
-                        if (
-                            video_entry is None
-                            or subtitle_entry.subtitle is None
-                            or subtitle_entry.subtitle.associated_video_source_path
-                            != video_source
-                            or subtitle_entry.target_path.parent
-                            != video_entry.target_path.parent
-                            or subtitle_entry.target_path.name
-                            != f"{video_entry.target_path.stem}.zh-Hans.ass"
-                        ):
-                            problems.append(
-                                "absolute two-version subtitle lost its exact video owner: "
-                                f"{subtitle_entry.source_path}"
-                            )
-                    _ReviewCapture.mounted.clear()
-                    with (
-                        patch.object(review_page, "TASK_PATH", result.tasks),
-                        patch.object(review_page, "PLAN_PATH", result.plans),
-                        patch.object(review_page, "PLAN_REVIEW_PATH", result.reviews),
-                        patch.object(review_page, "DECISION_STATE_PATH", result.decisions),
-                        patch.object(utils_module, "TASK_PATH", result.tasks),
-                        patch.object(review_page, "PlanReviewDialog", _ReviewCapture),
-                        patch.object(
-                            review_page, "_dialog_mount_context", return_value=nullcontext()
-                        ),
-                    ):
-                        await review_page.plan_review_page(result.task_id)
-                    if len(_ReviewCapture.mounted) != 1:
-                        problems.append("projection action did not reopen through the real page route")
-                    elif (
-                        PlanStore(result.plans).fingerprint(_ReviewCapture.mounted[0][0])
-                        != PlanStore(result.plans).fingerprint(current_plan)
-                    ):
-                        problems.append("real page reopen mounted a stale projection Plan")
-                    reload_dialog = object.__new__(PlanReviewDialog)
-                    reload_dialog.plan = (
-                        _ReviewCapture.mounted[0][0]
-                        if len(_ReviewCapture.mounted) == 1 else current_plan
-                    )
-                    reload_dialog.task_decision = current_state
-                    reload_dialog.task_data = (
-                        _ReviewCapture.mounted[0][1]
-                        if len(_ReviewCapture.mounted) == 1 else current_task
-                    )
-                    reload_dialog.snapshot = build_plan_review_snapshot(reload_dialog.plan)
-                    reload_dialog.issues_container = ui_fixture._UiNode()
-                    reload_dialog.review_service = dialog.review_service
-                    reload_dialog.decision_command_service = dialog.decision_command_service
-                    reload_dialog.selected_ids = set()
-                    reload_dialog._adopt_revision = Mock()
-                    reload_ui = ui_fixture._CaptureUi()
-                    with patch.object(review_page, "ui", reload_ui):
-                        PlanReviewDialog._render_issues(reload_dialog)
-                    if not any(
-                        "沿用文件中的集号" in value for value in reload_ui.visible
-                    ):
-                        problems.append("reopened review did not show the persisted projection choice")
-                    frozen = {
-                        "task": (result.tasks / f"{result.task_id}.json").read_bytes(),
-                        "plan": (result.plans / f"{result.task_id}.json").read_bytes(),
-                        "decision": (result.decisions / f"{result.task_id}.json").read_bytes(),
-                    }
-                    value = second()
-                    if inspect.isawaitable(value):
-                        await value
-                    current = {
-                        "task": (result.tasks / f"{result.task_id}.json").read_bytes(),
-                        "plan": (result.plans / f"{result.task_id}.json").read_bytes(),
-                        "decision": (result.decisions / f"{result.task_id}.json").read_bytes(),
-                    }
-                    if current != frozen:
-                        problems.append("stale projection callback changed persisted authority")
-                    if not any(
-                        kind == "warning" and ("刷新" in message or "更新" in message)
-                        for message, kind in notices
-                    ):
-                        problems.append("stale projection callback gave no explicit refresh notice")
+        import shutil
+        from tests import _media_flow_helpers as font_fixture
+        from src.rename.initial_movie_completion import RootSnapshotSource
+        from src.rename.target_routing import TargetRootSnapshot
 
-            relative_source = _make_ambiguous_episode_versions(
-                root / "relative-source"
-            )
-            relative_result = await self._run_real_add_select(
-                root=root / "relative-flow",
-                source=relative_source,
-                subjects=EIGHTY_SIX_SUBJECTS,
-                relations=EIGHTY_SIX_RELATIONS,
-                selected_subject_id="331887",
-            )
-            problems.extend(self._nested_snapshot_problems(
-                relative_result,
-                selected_subject_id="331887",
-                expected_tmdb_id="100565",
-                expected_ranges=(
-                    ("302189", "100565", 1, 1, 11),
-                    ("331887", "100565", 1, 12, 23),
-                ),
-                expected_segment=("302189", "331887"),
-                expected_observation_ids={
-                    "302189": "100565", "331887": "100565",
-                },
-                require_accepted=False,
-            ))
-            relative_dialog = object.__new__(PlanReviewDialog)
-            relative_dialog.plan = relative_result.plan
-            relative_dialog.task_decision = relative_result.state
-            relative_dialog.task_data = dict(relative_result.task)
-            relative_dialog.snapshot = build_plan_review_snapshot(relative_result.plan)
-            relative_dialog.issues_container = ui_fixture._UiNode()
-            relative_dialog.review_service = PlanReviewService(
-                PlanStore(relative_result.plans),
-                relative_result.reviews,
-                relative_result.root / "work_catalog",
-            )
-            relative_dialog.decision_command_service = DecisionCommandService(
-                DecisionStateStore(relative_result.decisions),
-                PlanStore(relative_result.plans),
-            )
-            relative_dialog.selected_ids = set()
-            relative_dialog._adopt_revision = Mock()
-            relative_ui = ui_fixture._CaptureUi()
-            with (
-                patch.object(review_page, "ui", relative_ui),
-                patch.object(review_page, "TASK_PATH", relative_result.tasks),
-                patch.object(review_page, "PLAN_PATH", relative_result.plans),
-                patch.object(review_page, "PLAN_REVIEW_PATH", relative_result.reviews),
-                patch.object(
-                    review_page, "DECISION_STATE_PATH", relative_result.decisions
-                ),
-                patch.object(utils_module, "TASK_PATH", relative_result.tasks),
-                patch.object(review_page, "notify"),
-            ):
-                PlanReviewDialog._render_issues(relative_dialog)
-                relative_action = relative_ui.callbacks.get("从本段第1集重新编号")
-                if not callable(relative_action):
-                    problems.append("fresh relative projection action is not executable")
-                else:
-                    value = relative_action()
-                    if inspect.isawaitable(value):
-                        await value
-            relative_state = DecisionStateStore(relative_result.decisions).load(
-                relative_result.task_id
-            )
-            relative_plan = PlanStore(relative_result.plans).load(
-                relative_result.task_id
-            )
-            relative_task = json.loads(
-                (relative_result.tasks / f"{relative_result.task_id}.json").read_text(
-                    "utf-8"
+        for mode, label, other_label, episode in (
+            ('absolute', '沿用文件中的集号', '从本段第1集重新编号', 12),
+            ('relative', '从本段第1集重新编号', '沿用文件中的集号', 23),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = _make_ambiguous_episode_versions(root / 'source')
+                sample, _ = font_fixture.make_season(root / 'valid-container')
+                for video in source.glob('*.mkv'):
+                    shutil.copyfile(next(sample.glob('*.mkv')), video)
+                source_before = _source_manifest(source)
+                result = await self._run_real_add_select(
+                    root=root / 'flow', source=source, subjects=EIGHTY_SIX_SUBJECTS,
+                    relations=EIGHTY_SIX_RELATIONS, selected_subject_id='331887',
+                    initialize_default_content=True,
                 )
-            )
-            relative_projection = (
-                relative_plan.to_dict().get("metadata", {}).get(
-                    "source_episode_projection"
-                ) or {}
-            )
-            if relative_state.revision <= relative_result.state.revision:
-                problems.append("fresh relative action did not advance DecisionState")
-            if (
-                relative_projection.get("mode") != "relative"
-                or relative_projection.get("offset") != 11
-            ):
-                problems.append("fresh relative action did not persist the relative choice")
-            if relative_state.to_dict().get(
-                "source_episode_projection"
-            ) != relative_projection:
-                problems.append("fresh relative action split DecisionState from Plan")
-            relative_verification = PlanVerifier().verify(relative_plan)
-            if (
-                relative_verification.status != PlanStatus.ACCEPTED
-                or relative_verification.issues
-            ):
-                problems.append("fresh relative action did not produce an approvable Plan")
-            if relative_task.get("workflow_status") != "need_confirm":
-                problems.append("fresh relative action did not return the task to review")
-            relative_selection = relative_task.get("selection_operation")
-            if isinstance(relative_selection, dict) and relative_selection.get(
-                "state"
-            ) == "failed":
-                problems.append("fresh relative action left a failed selection operation")
-            relative_result.plan = relative_plan
-            relative_result.state = relative_state
-            relative_result.task = relative_task
-            problems.extend(self._entry_projection_problems(
-                relative_result,
-                season_number=1,
-                expected_targets={path: 23 for path in relative_result.source_files},
-                expected_tmdb_id="100565",
-                expected_work_root=(
-                    relative_result.root / "Anime" / "86—不存在的战区— (2021)"
-                ),
-            ))
-            entries_by_source = {
-                Path(entry.source_path): entry for entry in relative_plan.entries
-            }
-            subtitle_entries = tuple(
-                entry for entry in relative_plan.entries if entry.media_kind == "subtitle"
-            )
-            if len(subtitle_entries) != 2:
-                problems.append("two-version projection did not preserve two subtitles")
-            for subtitle_entry in subtitle_entries:
-                video_source = Path(subtitle_entry.source_path).with_suffix("").with_suffix(
-                    ".mkv"
+                self.assertIsNotNone(result.state.content_selection)
+                service = PlanReviewService(
+                    PlanStore(result.plans), result.reviews, result.root / 'work_catalog',
+                    task_root=result.tasks, decision_state_root=result.decisions,
+                    provider_link_catalog_root=result.root / 'provider_links',
+                    record_root=result.root / 'records',
                 )
-                video_entry = entries_by_source.get(video_source)
-                if (
-                    video_entry is None
-                    or subtitle_entry.subtitle is None
-                    or subtitle_entry.subtitle.associated_video_source_path != video_source
-                    or subtitle_entry.target_path.parent != video_entry.target_path.parent
-                    or subtitle_entry.target_path.name
-                    != f"{video_entry.target_path.stem}.zh-Hans.ass"
-                ):
-                    problems.append(
-                        f"two-version subtitle lost its exact video owner: {subtitle_entry.source_path}"
-                    )
-            visible = "\n".join(ui.visible)
-            for internal in (
-                "schema", "fingerprint", "series_key", "binding",
-                "subject_observations", "work_segment", "resolution", "offset",
-            ):
-                if internal in visible.casefold():
-                    problems.append(f"visible projection UI exposed internal term {internal}")
-            self.assertEqual([], problems)
+                service.root_snapshot_source = RootSnapshotSource(lambda: TargetRootSnapshot.capture({
+                    'bangumi_path': result.renamer.BANGUMI_PATH,
+                    'movie_path': result.renamer.MOVIE_PATH,
+                    'anime_path': result.renamer.ANIME_PATH,
+                    'anime_movie_path': result.renamer.ANIME_MOVIE_PATH,
+                }))
+                dialog = object.__new__(PlanReviewDialog)
+                dialog.plan, dialog.task_decision = result.plan, result.state
+                dialog.task_data = dict(result.task)
+                dialog.snapshot = build_plan_review_snapshot(result.plan)
+                dialog.issues_container = ui_fixture._UiNode()
+                dialog.review_service = service
+                dialog.selected_ids = set()
+                dialog._change_handlers = []
+                dialog._adopt_revision = lambda plan: setattr(dialog, 'plan', plan)
+                ui = ui_fixture._CaptureUi()
+                with patch.object(review_page, 'ui', ui), patch.object(review_page, 'notify'), \
+                        patch.object(review_page, 'TASK_PATH', result.tasks):
+                    PlanReviewDialog._render_issues(dialog)
+                    action, stale = ui.callbacks.get(label), ui.callbacks.get(other_label)
+                    self.assertTrue(callable(action) and callable(stale))
+                    await action()
+                    plan = service.plan_store.load(result.task_id)
+                    state = service.decision_state_store.load(result.task_id)
+                    self.assertGreater(state.revision, result.state.revision)
+                    self.assertEqual(mode, plan.metadata['source_episode_projection']['mode'])
+                    self.assertEqual(plan.to_dict()['metadata']['source_episode_projection'],
+                                     state.to_dict()['source_episode_projection'])
+                    self.assertEqual(result.plan.metadata['provider_link_snapshot'],
+                                     plan.metadata['provider_link_snapshot'])
+                    self.assertEqual(result.state.initial_source_basis, state.initial_source_basis)
+                    self.assertEqual(set(result.source_files), {e.source_path for e in plan.entries})
+                    self.assertEqual(4, len(plan.entries))
+                    self.assertEqual({(1, episode)}, {(e.season_id, e.episode_id) for e in plan.entries})
+                    videos = [e for e in plan.entries if e.media_kind == 'video']
+                    subtitles = [e for e in plan.entries if e.media_kind == 'subtitle']
+                    self.assertEqual(2, len(videos))
+                    self.assertEqual(2, len(subtitles))
+                    self.assertEqual(2, len({e.presentation_asset.version_descriptor.version_ref for e in videos}))
+                    self.assertEqual(4, len({e.target_path for e in plan.entries}))
+                    for subtitle in subtitles:
+                        owner = next(e for e in videos if e.source_path == subtitle.subtitle.associated_video_source_path)
+                        self.assertEqual((owner.season_id, owner.episode_id), (subtitle.season_id, subtitle.episode_id))
+                        self.assertEqual(f'{owner.target_path.stem}.zh-Hans.ass', subtitle.target_path.name)
+                        self.assertEqual(owner.target_path.parent, subtitle.target_path.parent)
+                    self.assertEqual(set(), {i.code for i in PlanVerifier().verify(plan).issues})
+                    self.assertEqual('invalid', result.manager._read(result.task_id)['workflow_status'])
+                    frozen = {p: p.read_bytes() for p in result.root.rglob('*.json')}
+                    stale_result = stale()
+                    if inspect.isawaitable(stale_result):
+                        await stale_result
+                    self.assertEqual(frozen, {p: p.read_bytes() for p in result.root.rglob('*.json')})
+                self.assertEqual(source_before, _source_manifest(source))
+                self.assertFalse(result.target_roots_exist)
+
 
     async def test_provider_evidence_failure_persists_reason_and_restart_does_not_loop(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1761,8 +1582,8 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 fail_subject=("steins;gate 0", "命运石之门 0"),
             )
             problems = self._real_path_problems(result)
-            failure = result.task.get("selection_operation")
-            if not isinstance(failure, dict):
+            failure = current_provider_selection_context(result.task)
+            if not failure:
                 problems.append("provider evidence failure is not durably structured")
             else:
                 if failure.get("state") != "failed":
@@ -1792,7 +1613,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 decision_state_root=result.decisions,
                 recovery_abandon_audit_root=result.root / "abandon",
                 plan_root=result.plans,
-                test_mode=False,
+
             )
             with (
                 patch.object(review_page, "TASK_PATH", result.tasks),
@@ -1818,12 +1639,18 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 problems.append("restart rewrote the persisted provider failure")
             if len(_ReviewCapture.mounted) != 1:
                 problems.append("restart did not reconstruct the persisted review state")
-            elif _ReviewCapture.mounted[0][1].get("selection_operation") != failure:
+            elif current_provider_selection_context(
+                _ReviewCapture.mounted[0][1]
+            ) != failure:
                 problems.append("refreshed review lost the persisted failure reason")
 
             failure_dialog = object.__new__(PlanReviewDialog)
+            failure_dialog.plan = PlanStore(result.plans).load(result.task_id)
+            failure_dialog.task_decision = DecisionStateStore(result.decisions).load(result.task_id)
             reloaded_failure_task = json.loads(task_path.read_text("utf-8"))
             failure_dialog.task_data = reloaded_failure_task
+            failure_dialog.review_service = PlanReviewService(PlanStore(result.plans), result.reviews,
+                task_root=result.tasks, decision_state_root=result.decisions)
             failure_dialog._show_provider_candidates = Mock()
             failure_dialog._close_review = Mock()
             failure_dialog._select_provider_candidate = Mock()
@@ -1862,7 +1689,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 failure_mode="no_match",
             )
             problems.extend(self._real_path_problems(no_match_result))
-            no_match_failure = no_match_result.task.get("selection_operation") or {}
+            no_match_failure = current_provider_selection_context(no_match_result.task)
             if "subject_candidate_evidence_missing" not in no_match_failure.get(
                 "reason_codes", ()
             ):
@@ -1871,7 +1698,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 no_match_failure.get("evidence_fingerprint") or ""
             )
             if (
-                no_match_failure.get("state") != "failed"
+                no_match_failure.get("state") != "awaiting_user"
                 or str(no_match_failure.get("selected_subject_id") or "") != "10380"
                 or str(
                     (no_match_failure.get("candidate") or {}).get("provider_id") or ""
@@ -1881,7 +1708,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 or len(no_match_evidence) != 64
                 or any(char not in "0123456789abcdef" for char in no_match_evidence)
             ):
-                problems.append("no-match failure is not bound to exact selection authority")
+                problems.append("no-match awaiting operation is not bound to exact selection authority")
             if no_match_failure.get("retry_requires_refresh") is True:
                 problems.append("no-match neighbour was mislabeled as a transport retry")
             no_match_dialog = object.__new__(PlanReviewDialog)
@@ -1893,19 +1720,24 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 PlanStore(no_match_result.plans),
                 no_match_result.reviews,
                 no_match_result.root / "work_catalog",
+                task_root=no_match_result.tasks,
+                decision_state_root=no_match_result.decisions,
+                provider_link_catalog_root=no_match_result.root / 'provider_links',
+                record_root=no_match_result.root / 'records',
+                root_snapshot_source=_result_root_snapshot_source(no_match_result),
             )
             no_match_dialog.decision_command_service = DecisionCommandService(
                 DecisionStateStore(no_match_result.decisions),
                 PlanStore(no_match_result.plans),
             )
             no_match_dialog.selected_ids = set()
+            no_match_dialog._change_handlers = []
             no_match_dialog._adopt_revision = Mock()
             no_match_dialog._show_provider_candidates = Mock()
             no_match_dialog._close_review = Mock()
             no_match_dialog._select_provider_candidate = Mock()
             no_match_ui = ui_fixture._CaptureUi()
             no_match_ui.card = no_match_ui.column
-            no_match_notices: list[tuple[str, object]] = []
             with (
                 patch.object(review_page, "ui", no_match_ui),
                 patch.object(review_page, "TASK_PATH", no_match_result.tasks),
@@ -1913,24 +1745,25 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(review_page, "PLAN_REVIEW_PATH", no_match_result.reviews),
                 patch.object(review_page, "DECISION_STATE_PATH", no_match_result.decisions),
                 patch.object(utils_module, "TASK_PATH", no_match_result.tasks),
-                _root_config_patch(no_match_result.task["draft_root_snapshot"]),
-                patch.object(
-                    review_page,
-                    "notify",
-                    side_effect=lambda message, **kwargs: no_match_notices.append(
-                        (str(message), kwargs.get("type"))
-                    ),
-                ),
+                _result_root_config_patch(no_match_result),
+                patch.object(review_page, "notify") as separate_notices,
             ):
                 PlanReviewDialog._render_selection_operation(no_match_dialog)
                 for action in (
-                    "确认与相邻作品一起整理", "分开整理",
-                    "换一个作品", "移除任务",
+                    "分开整理", "换一个作品", "移除任务",
                 ):
                     if not callable(no_match_ui.callbacks.get(action)):
                         problems.append(f"no-match neighbour action is not executable: {action}")
                 separate = no_match_ui.callbacks.get("分开整理")
                 together = no_match_ui.callbacks.get("确认与相邻作品一起整理")
+                if not callable(together):
+                    problems.append("complete Bangumi chain lost its explicit native merge command")
+                native_preview = no_match_failure.get('provider_subject_cohort_preview') or {}
+                native_request = native_preview.get('request') or {}
+                if set(native_request.get('cohort_subject_ids') or ()) != {'10380', '129807'}:
+                    problems.append("native merge command lost its complete two-subject preview")
+                if native_request.get('selected_tmdb_tv_id'):
+                    problems.append("native merge preview fabricated complete TMDB coverage")
                 if callable(separate):
                     value = separate()
                     if inspect.isawaitable(value):
@@ -1947,7 +1780,8 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                         )
                     )
                     if separated_state.revision <= no_match_result.state.revision:
-                        problems.append("separate-work action did not advance DecisionState")
+                        problems.append("separate-work action did not advance DecisionState: "
+                            + repr(separate_notices.call_args_list))
                     separated_snapshot = separated_plan.to_dict()["metadata"].get(
                         "provider_link_snapshot"
                     )
@@ -1969,12 +1803,18 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                     ):
                         problems.append("separate-work decision is not bound to the exact edge/evidence")
                     verification = PlanVerifier().verify(separated_plan)
-                    if verification.status != PlanStatus.ACCEPTED or verification.issues:
-                        problems.append("separate-work action did not produce an approvable Plan")
+                    # Identity is resolved; the independent font stage remains.
+                    if verification.status != PlanStatus.ACCEPTED or {i.code for i in verification.issues} != set():
+                        problems.append("separate-work action did not leave only the font-check stage: "
+                            + repr((verification.status.value, sorted({issue.code for issue in verification.issues}))))
+                    if not any(entry.requires_review for entry in separated_plan.entries):
+                        problems.append("separate-work Plan lost its pending human content review")
                     if separated_task.get("workflow_status") != "need_confirm":
                         problems.append("separate-work action did not return to review")
-                    separated_selection = separated_task.get("selection_operation")
-                    if not isinstance(separated_selection, dict) or (
+                    separated_selection = current_provider_selection_context(
+                        separated_task
+                    )
+                    if (
                         separated_selection.get("state") != "succeeded"
                         or separated_selection.get("result_decision_revision")
                         != separated_state.revision
@@ -1989,28 +1829,6 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                         problems.append(
                             "separate-work action did not close the exact failed selection"
                         )
-                    frozen_paths = tuple(
-                        path
-                        for path in (
-                            no_match_result.tasks / f"{no_match_result.task_id}.json",
-                            no_match_result.plans / f"{no_match_result.task_id}.json",
-                            no_match_result.decisions / f"{no_match_result.task_id}.json",
-                            no_match_result.reviews / f"{no_match_result.task_id}.json",
-                        )
-                        if path.exists()
-                    )
-                    frozen = {path: path.read_bytes() for path in frozen_paths}
-                    if callable(together):
-                        value = together()
-                        if inspect.isawaitable(value):
-                            await value
-                    if {path: path.read_bytes() for path in frozen_paths} != frozen:
-                        problems.append("stale work-boundary callback changed persisted authority")
-                    if not any(
-                        kind == "warning" and ("刷新" in message or "更新" in message)
-                        for message, kind in no_match_notices
-                    ):
-                        problems.append("stale work-boundary callback gave no refresh notice")
             if "重新获取资料" in no_match_ui.callbacks:
                 problems.append("no-match neighbour incorrectly exposes transport refresh")
 
@@ -2028,14 +1846,14 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             )
             same_failed_revision = same_result.state.revision
             problems.extend(self._real_path_problems(same_result))
-            same_failure = same_result.task.get("selection_operation") or {}
+            same_failure = current_provider_selection_context(same_result.task)
             if "subject_candidate_evidence_missing" not in same_failure.get(
                 "reason_codes", ()
             ):
                 problems.append("fresh same-work flow did not persist a missing-neighbour decision")
             same_evidence = str(same_failure.get("evidence_fingerprint") or "")
             if (
-                same_failure.get("state") != "failed"
+                same_failure.get("state") != "awaiting_user"
                 or str(same_failure.get("selected_subject_id") or "") != "41658"
                 or str(
                     (same_failure.get("candidate") or {}).get("provider_id") or ""
@@ -2044,7 +1862,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 or len(same_evidence) != 64
                 or any(char not in "0123456789abcdef" for char in same_evidence)
             ):
-                problems.append("fresh same-work failure is not bound to exact authority")
+                problems.append("fresh same-work awaiting operation is not bound to exact authority")
             same_dialog = object.__new__(PlanReviewDialog)
             same_dialog.plan = same_result.plan
             same_dialog.task_decision = same_result.state
@@ -2054,11 +1872,17 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 PlanStore(same_result.plans),
                 same_result.reviews,
                 same_result.root / "work_catalog",
+                task_root=same_result.tasks,
+                decision_state_root=same_result.decisions,
+                provider_link_catalog_root=same_result.root / 'provider_links',
+                record_root=same_result.root / 'records',
+                root_snapshot_source=_result_root_snapshot_source(same_result),
             )
             same_dialog.decision_command_service = DecisionCommandService(
                 DecisionStateStore(same_result.decisions), PlanStore(same_result.plans)
             )
             same_dialog.selected_ids = set()
+            same_dialog._change_handlers = []
             same_dialog._adopt_revision = Mock()
             same_dialog._show_provider_candidates = Mock()
             same_dialog._close_review = Mock()
@@ -2072,7 +1896,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(review_page, "PLAN_REVIEW_PATH", same_result.reviews),
                 patch.object(review_page, "DECISION_STATE_PATH", same_result.decisions),
                 patch.object(utils_module, "TASK_PATH", same_result.tasks),
-                _root_config_patch(same_result.task["draft_root_snapshot"]),
+                _result_root_config_patch(same_result),
                 patch.object(review_page, "notify"),
             ):
                 PlanReviewDialog._render_selection_operation(same_dialog)
@@ -2125,8 +1949,8 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             ))
             if same_state.revision <= same_failed_revision:
                 problems.append("fresh same-work action did not advance DecisionState")
-            same_selection = same_task.get("selection_operation")
-            if not isinstance(same_selection, dict) or (
+            same_selection = current_provider_selection_context(same_task)
+            if (
                 same_selection.get("state") != "succeeded"
                 or same_selection.get("result_decision_revision") != same_state.revision
                 or str(
@@ -2208,6 +2032,8 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             removal_dialog.review_service = PlanReviewService(
                 PlanStore(removal_result.plans), removal_result.reviews,
                 removal_result.root / "work_catalog",
+                task_root=removal_result.tasks,
+                decision_state_root=removal_result.decisions,
             )
             removal_dialog.decision_command_service = DecisionCommandService(
                 DecisionStateStore(removal_result.decisions), PlanStore(removal_result.plans)
@@ -2235,7 +2061,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 decision_state_root=removal_result.decisions,
                 recovery_abandon_audit_root=removal_result.root / "abandon",
                 plan_root=removal_result.plans,
-                test_mode=False,
+
             )
             with (
                 patch.object(review_page, "ui", removal_ui),
@@ -2271,9 +2097,6 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(
                     dashboard_page, "refresh_dashboard", return_value=True
                 ) as dashboard_refresh,
-                patch.object(
-                    dashboard_page._review_tasks, "refresh"
-                ) as review_rows_refresh,
                 patch.object(review_page, "notify"),
             ):
                 PlanReviewDialog._render_selection_operation(removal_dialog)
@@ -2288,7 +2111,7 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 problems.append("remove-task action did not remove the active task card")
             if removal_dialog._close_review.call_count != 1:
                 problems.append("remove-task action did not close the review dialog once")
-            if not dashboard_refresh.call_count and not review_rows_refresh.call_count:
+            if not dashboard_refresh.call_count:
                 problems.append("remove-task action did not refresh the mounted dashboard")
             if any(
                 str(row.get("uuid") or "") == removal_result.task_id
@@ -2304,80 +2127,68 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], problems)
 
     async def test_legacy_range_less_split_cour_requires_regeneration_without_migration(self):
-        """A consistent old approved authority may be synthetic; new output may not."""
+        """Historical JSON is readable, never re-signed by a modern writer."""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = _make_episode_source(
                 root / "source", "86 Part 2", tuple(range(12, 24))
             )
-            result = await self._run_real_add_select(
-                root=root / "flow",
-                source=source,
-                subjects=EIGHTY_SIX_SUBJECTS,
-                relations=EIGHTY_SIX_RELATIONS,
-                selected_subject_id="331887",
-            )
-            current_snapshot = result.plan.metadata.get("provider_link_snapshot")
-            self.assertIsInstance(
-                current_snapshot,
-                Mapping,
-                "the real 86 Plan must exist before the compatibility fixture is downgraded",
-            )
-            self.assertEqual("100565", str(current_snapshot.get("tmdb_tv_id") or ""))
-            self.assertEqual(1, result.plan.metadata.get("season_number"))
-            legacy_snapshot = dict(result.state.provider_link_binding or {})
-            for key in (
-                "subject_observations", "work_segment", "boundaries",
-                "derived_episode_ranges", "mapping_shape",
-                "season_count_policy_version", "resolution_fingerprint",
-            ):
-                legacy_snapshot.pop(key, None)
-            legacy_snapshot.update({
+            source_before = _source_manifest(source)
+            task_id = 'historical-range-less'
+            legacy_snapshot = {
                 "schema_version": 1,
+                "mapping_id": "legacy-86", "revision": 1,
+                "evidence_fingerprint": "a" * 64, "status": "confirmed",
                 "automation_level": "L2",
                 "evidence_path": ["legacy-range-less-split-cour"],
-            })
-            metadata = dict(result.plan.to_dict()["metadata"])
-            metadata["provider_link_snapshot"] = legacy_snapshot
-            metadata.pop("source_episode_projection", None)
+                "selected_subject_id": "331887", "tmdb_tv_id": "100565",
+                "season_assignments": [
+                    {"bangumi_subject_id": "302189", "season_number": 1},
+                    {"bangumi_subject_id": "331887", "season_number": 1},
+                ],
+            }
             legacy_plan_root = root / "legacy-plan"
             legacy_review_root = root / "legacy-review"
             legacy_decision_root = root / "legacy-decision"
             legacy_task_root = root / "legacy-task"
             legacy_task_root.mkdir(parents=True)
             decision_store = DecisionStateStore(legacy_decision_root)
-            legacy_state_changes = {
-                "revision": 0,
+            # Deliberate old-file fixture, not an accepted current projection.
+            legacy_plan_root.mkdir()
+            legacy_decision_root.mkdir()
+            source_paths = tuple(sorted(source.glob('*.mkv')))
+            raw_plan = {
+                "schema_version": 4, "task_id": task_id, "source_root": str(source),
+                "expected_sources": [str(path) for path in source_paths],
+                "entries": [{"source_path": str(path),
+                    "target_path": str(root/'legacy-target'/'Season 01'/f'86 S01E{episode:02d}.mkv'),
+                    "media_kind": "video", "season_id": 1, "episode_id": episode}
+                    for episode, path in enumerate(source_paths, start=12)],
+                "metadata": {"provider_link_snapshot": legacy_snapshot, "season_number": 1},
+            }
+            raw_state = {
+                "schema_version": 2, "task_id": task_id, "revision": 0,
+                "linked_provider_identities": [], "provider_evidence": [],
                 "provider_link_binding": legacy_snapshot,
             }
-            for field, empty_value in (
-                ("source_episode_projection", None),
-                ("source_episode_projection_decision", None),
-                ("provider_subject_boundary_decisions", {}),
-            ):
-                if hasattr(result.state, field):
-                    legacy_state_changes[field] = empty_value
-            legacy_state = decision_store.save(
-                replace(result.state, **legacy_state_changes),
-                expected_revision=-1,
-            )
             legacy_store = PlanStore(legacy_plan_root)
-            legacy = decision_store.project_plan(
-                legacy_state,
-                replace(result.plan, metadata=metadata),
-            )
+            legacy_store.path_for(task_id).write_text(json.dumps(raw_plan), encoding='utf-8')
+            decision_store.path_for(task_id).write_text(json.dumps(raw_state), encoding='utf-8')
+            legacy = legacy_store.load(task_id)
+            legacy_state = decision_store.load_readonly(task_id)
+            self.assertEqual(4, legacy.migrated_from_schema)
+            self.assertEqual(PlanStore.fingerprint_payload(raw_plan), legacy.migration_source_fingerprint)
             self.assertNotIn("source_episode_projection", legacy.metadata)
             self.assertFalse(
                 legacy_state.to_dict().get("source_episode_projection"),
                 "legacy DecisionState must not silently restore a new projection",
             )
-            legacy = save_plan_fixture(
-                legacy_store, legacy, state_store=decision_store
-            )
             fingerprint = legacy_store.fingerprint(legacy)
             review_service = PlanReviewService(
-                legacy_store, legacy_review_root, root / "legacy-work-catalog"
+                legacy_store, legacy_review_root, root / "legacy-work-catalog",
+                task_root=legacy_task_root,
+                decision_state_root=legacy_decision_root,
             )
             review_service._save(PlanReviewDecision(
                 task_id=legacy.task_id,
@@ -2385,20 +2196,15 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 approved_entry_ids=tuple(sorted(entry_id(item) for item in legacy.entries)),
                 status=ReviewStatus.APPROVED,
             ))
-            legacy_task = dict(result.task)
-            for field in (
-                "selection_operation", "completed_at", "execution_phase",
-                "execution_failure", "execution_recovery_state", "queue_position",
-            ):
-                legacy_task.pop(field, None)
-            legacy_task.update({
+            legacy_task = {
+                "uuid": task_id, "path": str(source), "is_anime": True, "is_movie": False,
                 "workflow_status": "approved",
                 "plan_status": "accepted",
                 "plan_entry_count": len(legacy.entries),
                 "error": None,
                 "execution_requested_fingerprint": None,
                 "execution_reapproval_fingerprint": None,
-            })
+            }
             task_path = legacy_task_root / f"{legacy.task_id}.json"
             task_path.write_text(
                 json.dumps(legacy_task, ensure_ascii=False, indent=2), "utf-8"
@@ -2410,6 +2216,18 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 task_path,
             )
             before = {path: path.read_bytes() for path in authority_paths}
+            # The read-only legacy Decision may be displayed, but neither old
+            # episode callback can promote it to a current content edit.
+            legacy_dialog = object.__new__(PlanReviewDialog)
+            legacy_dialog.task_decision = legacy_state
+            with patch.object(review_page, 'notify') as notices:
+                for label in ('沿用文件中的集号', '从本段第1集重新编号'):
+                    self.assertIsNone(PlanReviewDialog._apply_source_episode_projection_inline(
+                        legacy_dialog, {}, label, legacy_state.revision))
+                self.assertEqual(2, notices.call_count)
+                self.assertTrue(all('旧集号修改入口已停用' in call.args[0]
+                    and '安全结束' in call.args[0] for call in notices.call_args_list))
+            self.assertEqual(before, {path: path.read_bytes() for path in authority_paths})
             _ReviewCapture.mounted.clear()
             with (
                 patch.object(review_page, "TASK_PATH", legacy_task_root),
@@ -2418,6 +2236,9 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(review_page, "DECISION_STATE_PATH", legacy_decision_root),
                 patch.object(utils_module, "TASK_PATH", legacy_task_root),
                 patch.object(review_page, "PlanReviewDialog", _ReviewCapture),
+                # This control captures mounting only, not dialog hydration;
+                # keep its replaced constructor's state reads replaced too.
+                patch.object(review_page, "prepare_plan_review_open", build_plan_review_snapshot),
                 patch.object(review_page, "_dialog_mount_context", return_value=nullcontext()),
             ):
                 await review_page.plan_review_page(legacy.task_id)
@@ -2441,6 +2262,13 @@ class ProviderSubjectPlanWiringRedContracts(unittest.IsolatedAsyncioTestCase):
                 {issue.code for issue in verification.issues},
                 "same-season multi-subject v1 evidence must not guess an offset",
             )
+            self.assertIn('legacy_plan_read_only', {issue.code for issue in verification.issues})
+            from src.rename.plan_review import PlanReviewError
+            with self.assertRaisesRegex(PlanReviewError, '只读|重新生成'):
+                review_service.approve_entries(task_id, fingerprint, tuple(entry_id(e) for e in legacy.entries))
+            self.assertEqual(before, {path: path.read_bytes() for path in authority_paths})
+            self.assertEqual(source_before, _source_manifest(source))
+            self.assertFalse((root/'legacy-target').exists())
 
 
 class ProviderSubjectTransportAndBoundaryControls(unittest.TestCase):
@@ -2541,7 +2369,7 @@ class ProviderSubjectTransportAndBoundaryControls(unittest.TestCase):
         self.assertEqual("manual_required", resolution.review_disposition)
         self.assertIn("subject_candidate_confidence_insufficient", resolution.reason_codes)
 
-    def test_boundary_actions_bind_one_canonical_edge_and_hide_ambiguous_middle(self):
+    def test_boundary_actions_bind_canonical_chain_and_offer_native_middle_preview(self):
         subjects = tuple({
             "provider_id": subject_id,
             "title": title,
@@ -2605,6 +2433,7 @@ class ProviderSubjectTransportAndBoundaryControls(unittest.TestCase):
         self.assertEqual(2, len(forward))
 
         dialog = object.__new__(PlanReviewDialog)
+        dialog.task_decision = None
         operation = {
             "state": "failed",
             "failure_code": "relation_unresolved",
@@ -2612,37 +2441,79 @@ class ProviderSubjectTransportAndBoundaryControls(unittest.TestCase):
             "expected_decision_revision": 3,
             "evidence_fingerprint": batch["evidence_fingerprint"],
             "provider_subject_evidence": {
+                "selected_subject_id": "middle",
+                "evidence_fingerprint": batch["evidence_fingerprint"],
                 "subject_observations": batch,
+                "bangumi_subjects": subjects,
+                "bangumi_relations": relations,
                 "provider_subject_boundary_edges": [dict(item) for item in forward],
             },
         }
-        dialog.task_data = {"selection_operation": operation}
+        from tests.test_r24_phase_d_f7_f8_remediation_contract import ACTIONABLE_SNAPSHOT
+        dialog.task_data = {
+            "draft_root_snapshot": ACTIONABLE_SNAPSHOT.to_dict(),
+            "draft_root_config_fingerprint": ACTIONABLE_SNAPSHOT.fingerprint,
+        }
+        persist_provider_selection_attempt(dialog.task_data, operation)
         dialog._show_provider_candidates = Mock()
         dialog._close_review = Mock()
         dialog._remove_provider_failure_task = Mock()
-        dialog._apply_provider_subject_boundary_inline = Mock()
+        # Pure presentation control: renderer transports the frozen ReviewCommand;
+        # it does not invoke any retired GUI writer or sign a new Plan.
+        from src.pages.review_operation_view import ReviewOperationCallbacks, render_review_operation
+        from src.rename.review_operation import ReviewCommand
+        dispatch = Mock()
+        callbacks = ReviewOperationCallbacks(
+            select_provider_candidate=Mock(), dispatch_review_command=dispatch,
+            show_provider_candidates=dialog._show_provider_candidates,
+            remove_provider_failure_task=dialog._remove_provider_failure_task,
+            close_review=dialog._close_review)
         captured = ui_fixture._CaptureUi()
         captured.card = captured.column
-        with patch.object(review_page, "ui", captured):
-            PlanReviewDialog._render_selection_operation(dialog)
-        self.assertNotIn("确认与相邻作品一起整理", captured.callbacks)
-        self.assertNotIn("分开整理", captured.callbacks)
+        render_review_operation(captured, dialog.task_data, callbacks)
+        # Two neighbours in a complete linear chain are not ambiguity. The
+        # native proposal covers all three subjects without inventing TMDB seasons.
+        self.assertTrue(callable(captured.callbacks.get("确认与相邻作品一起整理")))
+        self.assertTrue(callable(captured.callbacks.get("分开整理")))
+        native, _ = resolve_provider_subject_boundary_decision(
+            operation['provider_subject_evidence'], same_work=True, boundary_edge=forward[0])
+        self.assertEqual({'left': 1, 'middle': 2, 'right': 3}, dict(native.season_assignments))
+        self.assertFalse(native.tmdb_tv_id)
         self.assertIn("换一个作品", captured.callbacks)
         self.assertIn("移除任务", captured.callbacks)
 
         single = (forward[0],)
+        operation = current_provider_selection_context(dialog.task_data)
         operation["provider_subject_evidence"]["provider_subject_boundary_edges"] = [
             dict(single[0])
         ]
+        operation["state"] = "awaiting_user"
+        persist_provider_selection_attempt(dialog.task_data, operation)
         captured = ui_fixture._CaptureUi()
         captured.card = captured.column
-        with patch.object(review_page, "ui", captured):
-            PlanReviewDialog._render_selection_operation(dialog)
-        action = captured.callbacks["确认与相邻作品一起整理"]
+        render_review_operation(captured, dialog.task_data, callbacks)
+        self.assertTrue(callable(captured.callbacks.get("确认与相邻作品一起整理")))
+        action = captured.callbacks["分开整理"]
         action()
-        dialog._apply_provider_subject_boundary_inline.assert_called_once_with(
-            True, 3, batch["evidence_fingerprint"], dict(single[0])
-        )
+        dispatch.assert_called_once()
+        command = ReviewCommand.from_mapping(dispatch.call_args.args[0])
+        self.assertEqual(3, command.expected_revision)
+        self.assertFalse(command.payload['same_work'])
+        self.assertEqual(batch['evidence_fingerprint'], command.payload['evidence_fingerprint'])
+        self.assertEqual(dict(single[0]), dict(command.payload['boundary_edge']))
+
+        # The actual old no-policy page cannot use that presentation as authority.
+        dialog.plan = SimpleNamespace(metadata={})
+        dialog._safe_end = Mock()
+        legacy_ui = ui_fixture._CaptureUi()
+        with patch.object(review_page, 'ui', legacy_ui), patch.object(review_page, 'notify'):
+            PlanReviewDialog._render_selection_operation(dialog)
+            self.assertIsNone(PlanReviewDialog._dispatch_review_command(dialog, dispatch.call_args.args[0]))
+        self.assertNotIn('分开整理', legacy_ui.callbacks)
+        self.assertNotIn('确认与相邻作品一起整理', legacy_ui.callbacks)
+        legacy_ui.callbacks['安全结束此任务']()
+        dialog._safe_end.assert_called_once_with()
+        self.assertEqual(1, dispatch.call_count)
 
         malformed_relations = (
             {"from": "middle", "to": "right", "relation": ""},
@@ -2674,6 +2545,21 @@ class ProviderSubjectTransportAndBoundaryControls(unittest.TestCase):
             selected_subject_id="middle", subject_observations=mismatched_batch,
             bangumi_subjects=subjects, bangumi_relations=relations,
         ))
+
+        # Real branch ambiguity and transport failure cannot gain native merge
+        # capability merely because ordinary linear no-match coverage can.
+        for broken in ('branch', 'transport'):
+            evidence = json.loads(json.dumps(operation['provider_subject_evidence']))
+            if broken == 'branch':
+                evidence['bangumi_relations'].append(
+                    {'from': 'left', 'to': 'right', 'relation': 'sequel'})
+            else:
+                row = next(row for row in evidence['subject_observations']['subject_observations']
+                           if row['bangumi_subject_id'] == 'middle')
+                row['queries'][0].update(outcome='transport_error', candidates=[])
+            with self.subTest(broken=broken), self.assertRaises(ValueError):
+                resolve_provider_subject_boundary_decision(evidence, same_work=True,
+                                                          boundary_edge=forward[0])
 
         two_subjects = tuple(
             subject for subject in subjects
@@ -2830,10 +2716,8 @@ class ProviderSubjectPlanCompatibilityControls(unittest.IsolatedAsyncioTestCase)
                     ),
                 ),
             )
-            rc36_fixture.SeriesCatalog(series_root).register_completed(
-                existing,
-                expected_revision=0,
-            )
+            from tests.legacy_series_fixture import write_legacy_series_catalog_fixture
+            write_legacy_series_catalog_fixture(rc36_fixture.SeriesCatalog(series_root), existing)
             before = {
                 "provider": _byte_manifest(provider_root),
                 "series": _byte_manifest(series_root),
@@ -2858,6 +2742,7 @@ class ProviderSubjectPlanCompatibilityControls(unittest.IsolatedAsyncioTestCase)
                     candidate={
                         "namespace": "bangumi", "entity_type": "subject",
                         "provider_id": "290980", "title": "向山进发 Next Summit",
+                        "platform": "TV",
                     },
                     is_anime=True,
                     is_movie=False,
@@ -2882,6 +2767,8 @@ class ProviderSubjectPlanCompatibilityControls(unittest.IsolatedAsyncioTestCase)
             )
             self.assertEqual("L0", plan.metadata["provider_link_snapshot"]["automation_level"])
             self.assertEqual(4, plan.metadata["season_number"])
+            from tests.test_rc54_integration_regressions import assert_bound_videos
+            assert_bound_videos(self, plan, state, canonical_root, 4)
             self.assertEqual("need_confirm", task["workflow_status"])
             self.assertEqual(
                 (),
@@ -2902,12 +2789,14 @@ class ProviderSubjectPlanCompatibilityControls(unittest.IsolatedAsyncioTestCase)
             )
             dialog.close.assert_not_called()
 
-    async def test_ordinary_tv_control_persists_no_segmented_provider_state(self):
+    async def test_direct_tmdb_animation_tv_control_has_current_registration(self):
         case = __import__(
             "tests.test_rc36_production_wiring_red_contract",
             fromlist=["ProductionWiringRedContracts"],
-        ).Rc36RealEntrypointE2E(methodName="test_ordinary_tv_uses_same_add_select_worker_entrypoint")
-        await case.test_ordinary_tv_uses_same_add_select_worker_entrypoint()
+        ).Rc36RealEntrypointE2E(
+            methodName="test_manual_tmdb_tv_freezes_primary_identity_for_animation_tv"
+        )
+        await case.test_manual_tmdb_tv_freezes_primary_identity_for_animation_tv()
 
     async def test_ordinary_movie_control_persists_no_segmented_provider_state(self):
         case = __import__(

@@ -51,6 +51,10 @@ class TitleAuthorityConflict(CanonicalNamingError):
     """Provider identity/evidence has more than one authoritative outcome."""
 
 
+class TitleEvidencePending(TitleAuthorityConflict):
+    """作品身份尚可选择，但标题资料不足以冻结命名决定。"""
+
+
 def _canonical_json(value: Mapping[str, object]) -> bytes:
     return json.dumps(
         value,
@@ -201,6 +205,7 @@ def resolve_title_authority(
     selection: Mapping[str, object],
     mapped_candidates: Iterable[Mapping[str, object]] = (),
     primary_provider_identity: Optional[Mapping[str, object]] = None,
+    primary_identity_evidence: Iterable[Mapping[str, object]] = (),
 ) -> CanonicalNamingDecision:
     """Resolve one display title from the explicit selection path and identity."""
 
@@ -210,18 +215,35 @@ def resolve_title_authority(
         if primary_provider_identity is not None else selected_identity
     )
     candidates = tuple(dict(item) for item in mapped_candidates)
-    if candidates:
-        identities = {_identity_key(item) for item in candidates}
+    identity_evidence = tuple(
+        dict(item) for item in primary_identity_evidence
+    )
+    if candidates or identity_evidence:
+        identities = {
+            _identity_key(item) for item in (*candidates, *identity_evidence)
+        }
         primary_key = _identity_key(primary_identity)
-        if primary_provider_identity is None and len(identities) > 1:
+        if (
+            primary_provider_identity is None
+            and not identity_evidence
+            and len(identities) > 1
+        ):
             raise TitleAuthorityConflict("作品映射存在多个不同条目，不能自动决定标题")
         matched = tuple(
-            item for item in candidates if _identity_key(item) == primary_key
+            item
+            for item in (*candidates, *identity_evidence)
+            if _identity_key(item) == primary_key
         )
         if primary_provider_identity is not None:
             if not matched:
                 raise TitleAuthorityConflict("标题证据与最终作品身份不一致")
-            candidates = matched
+            # ``primary_identity_evidence`` proves the selected work identity
+            # without turning that row into title metadata.  A Bangumi cohort
+            # may deliberately take its stable title from the earliest
+            # subject while the clicked subject remains the primary work
+            # authority and TMDB rows remain optional naming metadata.
+            if not identity_evidence:
+                candidates = matched
     elif (
         primary_provider_identity is not None
         and _identity_key(selected_identity) != _identity_key(primary_identity)
@@ -272,18 +294,11 @@ def resolve_title_authority(
             display_title = selected_localized
             title_source = "bangumi:name_cn"
         else:
-            raise TitleAuthorityConflict("作品缺少可确认的中文标题")
+            raise TitleEvidencePending("作品缺少可确认的中文标题")
     elif namespace == "tmdb":
         if _identity_key(selected_identity) != _identity_key(primary_identity):
             raise TitleAuthorityConflict("所选 TMDB 条目与最终作品身份不一致")
         if (
-            selected_localized
-            and selected_original
-            and not _same_title(selected_localized, selected_original)
-        ):
-            display_title = selected_localized
-            title_source = "tmdb:zh-CN"
-        elif (
             selected_localized
             and not selected_original
             and is_frozen_work_projection
@@ -293,11 +308,18 @@ def resolve_title_authority(
             # completion remains stable without inventing tmdb:zh-CN proof.
             display_title = selected_localized
             title_source = _FROZEN_WORK_PROJECTION
+        elif selected_localized or selected_original:
+            display_title = selected_localized or selected_original
+            title_source = (
+                "tmdb:original"
+                if selected_original and _same_title(display_title, selected_original)
+                else "tmdb:zh-CN"
+            )
         else:
-            raise TitleAuthorityConflict("TMDB 条目缺少可确认的中文标题")
+            raise TitleEvidencePending("TMDB 条目缺少可用标题")
     else:
         if not selected_localized and not selected_original:
-            raise TitleAuthorityConflict("所选作品缺少可用标题")
+            raise TitleEvidencePending("所选作品缺少可用标题")
         display_title = selected_localized or selected_original
         title_source = f"{namespace}:selected"
 
@@ -449,6 +471,19 @@ def resolve_fresh_collision_root(
 ) -> Path:
     """Disambiguate a fresh root without granting an unregistered path authority."""
 
+    candidate = fresh_collision_candidate(generated_root=generated_root, decision=decision,
+                                          registered_roots=registered_roots)
+    if candidate != Path(generated_root) and candidate.exists():
+        raise CanonicalNamingError("确定性同名目录仍发生冲突，请人工核对作品登记")
+    return candidate
+
+
+def fresh_collision_candidate(
+    *, generated_root: Path, decision: CanonicalNamingDecision | Mapping[str, object],
+    registered_roots: Iterable[Path] = (),
+) -> Path:
+    """Pure naming candidate; a changed root additionally needs an absence probe."""
+
     resolved = (
         decision
         if isinstance(decision, CanonicalNamingDecision)
@@ -474,7 +509,7 @@ def resolve_fresh_collision_root(
         raise CanonicalNamingError("同名目录无法生成稳定的消歧名称")
     candidate = generated_root.with_name(f"{base}{suffix}")
     candidate_key = windows_collision_key(candidate.name)
-    if candidate.exists() or any(
+    if any(
         windows_collision_key(path.name) == candidate_key for path in registered
     ):
         # This includes the frozen 12-hex truncation collision case.  Never

@@ -173,3 +173,21 @@ data
 
 # Local-only collaboration records, deployment artifacts, and private review notes.
 local/
+
+# 本机协作、编辑器与恢复资料不进入公开候选。
+/AGENTS.md
+/.agents/
+/.vscode/
+/.pdm-python
+/SOURCE_RECOVERY_MANIFEST.json
+/.playwright-cli/
+/data-*/
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.tar
+*.tar.gz
+*.7z
+*.rar

@@ -111,6 +111,7 @@ def build_default_presentation_contracts(
     group_kind: str,
     display_name: str,
     provider_identity: ProviderIdentity,
+    local_roles: Optional[Mapping[Path, str]] = None,
 ) -> Tuple[Tuple[PresentationGroup, ...], Mapping[Path, PresentationAssetPlanContract]]:
     """Add the R2 structural-default descriptor to a single-version mapping.
 
@@ -131,14 +132,26 @@ def build_default_presentation_contracts(
     )
     assets = {}
     content_count = 0
+    typed_roles = {
+        Path(source): str(role)
+        for source, role in (local_roles or {}).items()
+    }
     for source, target in mapping.items():
         source_path = Path(source)
         if source_path.suffix.casefold() in SUBTITLE_SUFFIXES:
             continue
         entry = PlanEntry.from_paths(source_path, Path(target))
         if entry.media_kind == "video":
-            is_content = group_kind == "movie_continuous" or (
-                entry.season_id is not None and entry.episode_id is not None
+            local_role = typed_roles.get(source_path)
+            is_typed_tv_extra = (
+                group_kind == "tv_episodes"
+                and local_role is not None
+                and local_role != "main_episode"
+            )
+            is_content = not is_typed_tv_extra and (
+                group_kind == "movie_continuous" or (
+                    entry.season_id is not None and entry.episode_id is not None
+                )
             )
             if is_content:
                 season_id = entry.season_id if group_kind == "tv_episodes" else None
@@ -155,7 +168,7 @@ def build_default_presentation_contracts(
             else:
                 contract = PresentationAssetPlanContract(
                     presentation_group=group.group_id,
-                    asset_role=AssetRole("extra", "other"),
+                    asset_role=AssetRole("extra", local_role or "other"),
                     segment=None,
                     version_descriptor=None,
                 )
@@ -175,15 +188,7 @@ def build_default_presentation_contracts(
 
 
 def associate_resolved_extra_subtitles(plan):
-    """Project resolved subtitles of extra videos as associated resources.
-
-    A subtitle attached to a TV OVA/bonus video must stay beside that video,
-    but it is not a subtitle track of a primary content version.  The strict
-    subtitle verifier intentionally accepts only primary content-version
-    tracks, so production plans must use the same associated-resource model as
-    the inventory completion path instead of presenting a false "choose movie
-    primary" repair to TV users.
-    """
+    """Keep extra-video subtitles beside the video with typed association."""
 
     assets_by_source = {
         entry.source_path: entry.presentation_asset
@@ -210,20 +215,14 @@ def associate_resolved_extra_subtitles(plan):
         ):
             entries.append(replace(
                 entry,
-                media_kind="associated",
+                media_kind="subtitle",
                 role="extra_subtitle",
                 requires_review=False,
-                evidence=entry.evidence + (
+                evidence=tuple(dict.fromkeys(entry.evidence + (
                     "字幕与特别篇视频同名，作为特别篇配套资源",
-                ),
-                subtitle=None,
-                presentation_asset=PresentationAssetPlanContract(
-                    video_asset.presentation_group,
-                    AssetRole("associated"),
-                    None,
-                    None,
-                    video_asset.owner_version_ref,
-                ),
+                ))),
+                subtitle=subtitle,
+                presentation_asset=None,
             ))
             changed = True
             continue

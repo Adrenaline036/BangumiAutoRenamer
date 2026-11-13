@@ -1,0 +1,146 @@
+{
+  "schema_version": "r24-fullset-provider-authority-incidents/v1",
+  "incidents": {
+    "provider_capability": {
+      "cases": [
+        {
+          "name": "tv_bangumi_tv_subject",
+          "group_kind": "tv_episodes",
+          "task_media_kind": "tv",
+          "candidate": {
+            "namespace": "bangumi",
+            "entity_type": "subject",
+            "provider_id": "100001",
+            "platform": "TV"
+          },
+          "actionable": true
+        },
+        {
+          "name": "tv_tmdb_tv_without_subject_authority",
+          "group_kind": "tv_episodes",
+          "task_media_kind": "tv",
+          "candidate": {
+            "namespace": "tmdb",
+            "entity_type": "tv",
+            "provider_id": "200001"
+          },
+          "actionable": false
+        },
+        {
+          "name": "movie_tmdb_movie",
+          "group_kind": "movie_continuous",
+          "task_media_kind": "movie",
+          "candidate": {
+            "namespace": "tmdb",
+            "entity_type": "movie",
+            "provider_id": "300001"
+          },
+          "actionable": true
+        },
+        {
+          "name": "movie_bangumi_movie_without_movie_projector",
+          "group_kind": "movie_continuous",
+          "task_media_kind": "movie",
+          "candidate": {
+            "namespace": "bangumi",
+            "entity_type": "subject",
+            "provider_id": "400001",
+            "platform": "Movie"
+          },
+          "actionable": true
+        },
+        {
+          "name": "mixed_candidate_cannot_cross_group",
+          "group_kind": "movie_continuous",
+          "task_media_kind": "mixed",
+          "candidate": {
+            "namespace": "bangumi",
+            "entity_type": "subject",
+            "provider_id": "500001",
+            "platform": "TV"
+          },
+          "actionable": false
+        }
+      ],
+      "expected_groups": {
+        "tv_bangumi_tv_subject": "tv_episodes",
+        "tv_tmdb_tv_without_subject_authority": "tv_episodes",
+        "movie_tmdb_movie": "movie_continuous",
+        "movie_bangumi_movie_without_movie_projector": "movie_continuous",
+        "mixed_candidate_cannot_cross_group": "tv_episodes"
+      }
+    },
+    "same_work_ranges": {
+      "selected_subject_id": "subject-a",
+      "tmdb_tv_id": "900001",
+      "season_assignments": {
+        "subject-a": 1,
+        "subject-b": 1,
+        "subject-c": 2
+      },
+      "derived_episode_ranges": [
+        {
+          "bangumi_subject_id": "subject-a",
+          "tmdb_tv_id": "900001",
+          "season_number": 1,
+          "episode_start": 1,
+          "episode_end": 12
+        },
+        {
+          "bangumi_subject_id": "subject-b",
+          "tmdb_tv_id": "900001",
+          "season_number": 1,
+          "episode_start": 13,
+          "episode_end": 24
+        },
+        {
+          "bangumi_subject_id": "subject-c",
+          "tmdb_tv_id": "900001",
+          "season_number": 2,
+          "episode_start": 1,
+          "episode_end": 12
+        }
+      ],
+      "episode_numbers": [
+        1,
+        13,
+        25
+      ],
+      "expected_overflows": [
+        25
+      ]
+    },
+    "exceptional_without_provider_candidates": {
+      "issue_code": "provider_special_eligibility_unavailable",
+      "required_actions": [
+        "保留为附加内容",
+        "作为独立作品整理"
+      ]
+    },
+    "reselection": {
+      "required_transaction": "commit_provider_reselection_pending",
+      "forbidden_task_only_writer": "mutate_task_at"
+    },
+    "subtitle": {
+      "issue_code": "subtitle_association_unresolved",
+      "expected_regular_sources": 1
+    },
+    "planning_intent": {
+      "planning_root_name": "planning_state",
+      "formal_catalog_root_name": "work_catalog",
+      "contract_fields": [
+        "store_root",
+        "catalog_root"
+      ]
+    }
+  },
+  "obligations": [
+    "OBL1 provider actionability is one shared capability decision",
+    "OBL2 provider reselection atomically supersedes stale authority",
+    "OBL3 same-work ranges include only decision-owned same-season subjects",
+    "OBL4 movie and episodic candidates cannot cross presentation groups",
+    "OBL5 every exceptional video has safe manual exits without candidates",
+    "OBL6 unresolved subtitles reach the structured subtitle review issue",
+    "OBL7 planning intent stays outside the formal WorkCatalog effect root"
+  ]
+}

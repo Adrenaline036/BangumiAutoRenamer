@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "ratchet_id": "r24-verification-refactor-quality-ratchet-v1",
+  "fixed_head": "06283a6e13143d82ecd5596ef87330fde5a51416",
+  "branch_coverage_minimum_percent": 90,
+  "white_box_debt": {
+    "scan_root": "tests",
+    "patterns": {
+      "object_new": "object\\.__new__",
+      "private_render": "\\._render_[A-Za-z0-9_]+",
+      "patch_object": "patch\\.object\\("
+    },
+    "preclaim_counts": {
+      "object_new": 63,
+      "private_render": 65,
+      "patch_object": 459,
+      "combined_unique_lines": 587
+    },
+    "closure_ceilings": {
+      "object_new": 62,
+      "private_render": 62,
+      "patch_object": 458,
+      "combined_unique_lines": 582
+    }
+  },
+  "line_count_ceilings": {
+    "src/pages/plan_review_page.py": 5894,
+    "src/pages/review_operation_view.py": 376,
+    "tests/test_r24_phase_a_review_operation_red_contract.py": 400,
+    "tests/test_r24_verification_refactor_contract.py": 650
+  },
+  "critical_branch_obligations": [
+    "presentation.none",
+    "presentation.pending",
+    "presentation.resolved",
+    "presentation.actionable",
+    "presentation.blocked",
+    "presentation.refresh_present",
+    "presentation.refresh_absent",
+    "presentation.known_commands",
+    "presentation.unknown_command_ignored",
+    "presentation.preview_assignments",
+    "presentation.preview_outside",
+    "presentation.preview_target",
+    "presentation.boundary_present",
+    "presentation.boundary_absent",
+    "renderer.pending",
+    "renderer.resolved",
+    "renderer.actionable",
+    "renderer.stable_selectors",
+    "dispatcher.valid",
+    "dispatcher.duplicate",
+    "dispatcher.tamper",
+    "dispatcher.command_membership",
+    "dispatcher.revision_drift"
+  ],
+  "external_tools": {
+    "coverage": "not_installed_not_run",
+    "pytest_cov": "not_installed_not_run",
+    "mypy": "not_installed_not_run",
+    "pyright": "not_installed_not_run",
+    "ruff": "not_installed_not_run"
+  }
+}

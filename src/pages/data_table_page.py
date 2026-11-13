@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+from src.component.icons import outlined_icon
+from ..queue_runtime import ui_disk_call
+from ..queue_runtime import disk_call
+
+from src.component.dialog_frame import dialog_card
+
 from functools import partial
+import asyncio
 import json
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Mapping
 
-from nicegui import context, ui
+from nicegui import context, ui, run
 from nicegui.events import GenericEventArguments
 
 from ..element.red import notify
+from ..rename.replacement_completion import has_completed_media
 from ..logger import logger
 from ..rename.plan_review import PlanReviewService
 from ..rename.plan_store import PlanStore, PlanStoreError
+from ..rename.review_operation import (
+    build_review_operation,
+    provider_selection_awaits_user,
+)
 from ..rename.decision_state import (
     DecisionState,
     DecisionStateError,
@@ -26,38 +38,46 @@ from ..rename.execution_recovery import (
     load_execution_recovery,
     reconcile_catalog_update,
     requires_execution_reapproval,
+    requires_execution_replan,
+    safe_approved_execution_retry,
 )
 from ..rename.work_catalog import WorkCatalog
+from ..rename.series_catalog import SeriesCatalog
+from ..rename.provider_link_catalog import ProviderLinkCatalog
 from ..task_queue import ACTIVE_STATUSES, task_queue
 from ..utils.path import (
     DECISION_STATE_PATH,
     PLAN_PATH,
     PLAN_REVIEW_PATH,
+    RECOVERY_TRANSACTION_PATH,
     RECORD_PATH,
     RECOVERY_ABANDON_AUDIT_PATH,
     TASK_PATH,
     WORK_CATALOG_PATH,
+    SERIES_CATALOG_PATH,
+    PROVIDER_LINK_CATALOG_PATH,
 )
-from ..utils.utils import get_task, safe_task_path
+from ..utils.utils import get_task, safe_task_path, read_task_file
 from .plan_review_page import plan_review_page
 from .ui_terms import RENAME_PLAN_TERM, localize_plan_term
 
 
 STATUS_TEXT = {
     "queued": "排队中",
-    "running": "执行中",
+    "running": "处理中",
     "analyzing": "分析中",
     "plan_ready": "整理计划就绪",
     "need_confirm": "待处理",
     "approved": "已批准 · 未执行",
     "invalid": "计划无效",
-    "executing": "落盘中",
+    "executing": "文件整理中",
     "partial_failed": "部分失败",
     "completed": "已完成",
     "catalog_update_pending": "硬链接完成 · 作品登记待恢复",
     "failed": "失败",
     "cancelled": "已取消",
     "interrupted": "已中断",
+    "rolled_back": "已回滚",
 }
 
 STATUS_COLOR = {
@@ -74,15 +94,15 @@ STATUS_COLOR = {
     "partial_failed": "red-7",
     "cancelled": "grey-7",
     "interrupted": "deep-orange-8",
-}
-
-ROLE_LABELS = {
-    True: "动画",
-    False: "非动画",
-    None: "自动判断",
+    "rolled_back": "blue-grey-7",
 }
 
 _dashboard_signatures: Dict[str, tuple[str, ...]] = {}
+_dashboard_reads: dict[str, asyncio.Task] = {}
+_dashboard_views = {}
+_dashboard_rows = {}
+_deleting_tasks = set()
+_UNREAD = object()
 
 
 def _dashboard_client_key() -> str:
@@ -101,6 +121,35 @@ def task_status_text(task_data: Dict[str, Any]) -> str:
     return STATUS_TEXT.get(str(status), "状态未知")
 
 
+def can_offer_asset_rollback(task, decision):
+    operation=getattr(decision,'asset_operation',None)
+    if operation is None: return False
+    value=operation.to_dict()
+    from src.rename.replacement_completion import uses_completion_policy
+    if uses_completion_policy(value) or task.get('asset_rollback_phase') not in {'rollback_prepared', 'incomplete'}:
+        return False
+    return (value.get('policy') in {'asset-operation-v2','asset-operation-v3'} and value.get('mode')=='replace'
+            and not task.get('preview_only')
+            and task.get('workflow_status') in {
+                'completed','partial_failed','failed','catalog_update_pending','interrupted','rolled_back'}
+            and (task.get('execution_status') in {'completed','failed','rolled_back','catalog_update_pending'}
+                 or bool(task.get('asset_rollback_phase'))))
+
+
+def task_media_label(task_data: Mapping[str, Any]) -> str:
+    """Render the frozen library domain and presentation as one card label."""
+
+    is_anime = task_data.get("is_anime")
+    is_movie = task_data.get("is_movie")
+    labels = {
+        (True, False): "动画剧集",
+        (True, True): "动画电影",
+        (False, False): "非动画剧集",
+        (False, True): "电影",
+    }
+    return labels.get((is_anime, is_movie), "自动判断")
+
+
 def task_feedback_text(task_data: Mapping[str, Any]) -> str:
     """Turn internal failure details into one short operator instruction."""
 
@@ -108,14 +157,28 @@ def task_feedback_text(task_data: Mapping[str, Any]) -> str:
         return "已核查，需重新审核。"
     if _is_reapproved_execution_ready(task_data):
         return "已批准，尚未执行。"
+    if requires_execution_replan(task_data):
+        return "目标或作品登记已变化，原计划不能重新执行。请重新生成整理计划并重新批准。"
     if _is_safe_approved_retry(task_data):
         return "执行准备未完成，文件尚未处理。请稍后重新执行。"
     if _requires_execution_check(task_data):
         return "执行结果需要核查，请先确认目标文件。"
-    operation = task_data.get("selection_operation")
-    if isinstance(operation, Mapping) and operation.get("state") in {
-        "failed", "interrupted",
+    if provider_selection_awaits_user(task_data):
+        return "作品关系仍需确认，请打开任务继续或安全移除。"
+    operation, _unused = build_review_operation(task_data)
+    if operation.context.get("lifecycle") in {
+        "failed", "interrupted", "legacy_stale",
     }:
+        from ..rename.provider_recovery import transport_failure_text, can_refresh_selection
+        reason = transport_failure_text(operation.context)
+        if operation.context.get("failure_code") == "internal_busy" and reason:
+            return reason
+        if can_refresh_selection(operation.context):
+            if operation.context.get('failure_code') == 'selection_failed':
+                return '本次处理未完成，所选作品已保留，请打开原任务重新读取资料。'
+            return (reason or '作品资料暂时无法读取。') + '所选作品已保留，请打开原任务重新读取资料。'
+        if reason:
+            return reason
         return "这次选择未生效，请打开任务重试或换一个作品。"
     reason = str(task_data.get("movie_inventory_reason") or "")
     error = str(task_data.get("error") or "")
@@ -144,16 +207,12 @@ def _is_reapproved_execution_ready(task_data: Mapping[str, Any]) -> bool:
 
 
 def _is_safe_approved_retry(task_data: Mapping[str, Any]) -> bool:
-    return bool(
-        task_data.get("workflow_status") == "failed"
-        and task_data.get("queue_operation") == "execute_approved"
-        and task_data.get("execution_phase") == "failed_before_media"
-        and not task_data.get("execution_requires_manual_check")
-        and str(task_data.get("execution_requested_fingerprint") or "")
-    )
+    return safe_approved_execution_retry(task_data)
 
 
 def _requires_execution_check(task_data: Mapping[str, Any]) -> bool:
+    if requires_execution_replan(task_data):
+        return False
     if requires_execution_reapproval(task_data):
         return False
     if task_data.get("execution_requires_manual_check"):
@@ -208,20 +267,18 @@ def task_display_title(
     )
 
 
-def load_task_rows(task_root: Path = TASK_PATH) -> List[Dict[str, Any]]:
+def load_task_rows(task_root: Path = TASK_PATH, *, _paths=None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if not task_root.exists():
         return rows
-    for path in sorted(
-        task_root.glob("*.json"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    ):
+    timed_paths = []
+    for path in (task_root.glob("*.json") if _paths is None else _paths):
         try:
-            data = get_task(path.stem) if task_root == TASK_PATH else _read(path)
-        except Exception as exc:
-            logger.error(f"[任务工作台] 无法读取 {path.name}: {exc}")
+            timed_paths.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
             continue
+    for _, path in sorted(timed_paths, key=lambda item: item[0], reverse=True):
+        data = get_task(path.stem) if task_root == TASK_PATH else read_task_file(path)
         if not data:
             continue
         data = dict(data)
@@ -237,7 +294,6 @@ def load_task_rows(task_root: Path = TASK_PATH) -> List[Dict[str, Any]]:
         data.setdefault("season_id", None)
         data.setdefault("is_anime", None)
         data.setdefault("is_movie", None)
-        data.setdefault("use_ai", False)
         data.setdefault("workflow_status", "failed" if data.get("error") else "completed")
         history = data.get("operation_history")
         if not isinstance(history, list):
@@ -261,7 +317,8 @@ def dashboard_signature(rows: Iterable[Dict[str, Any]]) -> tuple[str, ...]:
     """Return a stable snapshot key so unchanged timers do not rebuild the UI."""
     return tuple(
         sorted(
-            json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+            json.dumps(row if '_display' in row else _card_projection(row),
+                       ensure_ascii=False, sort_keys=True, default=str)
             for row in rows
         )
     )
@@ -271,11 +328,11 @@ def task_counts(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
     counts = {"queued": 0, "running": 0, "review": 0, "completed": 0}
     for row in rows:
         status = row.get("workflow_status")
-        if status == "queued":
-            counts["queued"] += 1
-        elif status in {"running", "analyzing", "executing"}:
+        if status in {"running", "analyzing", "executing"}:
             counts["running"] += 1
-        elif status in {"need_confirm", "approved", "invalid"}:
+        elif row.get('_selection_wait') or status == "queued":
+            counts["queued"] += 1
+        elif row.get('_selection_review') or status in {"need_confirm", "approved", "invalid"}:
             counts["review"] += 1
         elif status == "completed":
             counts["completed"] += 1
@@ -319,194 +376,290 @@ def _read(path: Path) -> dict:
         return json.load(file)
 
 
-def create_table() -> None:
-    _dashboard_signatures[_dashboard_client_key()] = dashboard_signature(
-        load_task_rows()
-    )
-    with ui.column().classes("bar-workspace w-full"):
-        _dashboard_summary()
-        with ui.tabs(on_change=_refresh_inactive_sections).classes(
-            "bar-tabs w-full"
-        ) as tabs:
-            active_tab = ui.tab("active", label="执行队列", icon="playlist_play")
-            review_tab = ui.tab("review", label="待处理", icon="rule")
-            history_tab = ui.tab("history", label="任务历史", icon="history")
-
-        with ui.tab_panels(tabs, value=active_tab).classes(
-            "bar-tab-panels w-full"
-        ):
-            with ui.tab_panel(active_tab).classes("p-0 pt-4"):
-                _active_tasks()
-            with ui.tab_panel(review_tab).classes("p-0 pt-4"):
-                _review_tasks()
-            with ui.tab_panel(history_tab).classes("p-0 pt-4"):
-                _history_tasks()
+def create_table():
+    from .dashboard_view import DashboardView
+    client = context.client
+    key = client.id
+    _dashboard_views[key] = DashboardView(render_card=_task_card, refresh=refresh_dashboard)
+    def cleanup():
+        _dashboard_views.pop(key, None)
+        _dashboard_rows.pop(key, None)
+        _dashboard_signatures.pop(key, None)
+    client.on_disconnect(cleanup)
+    return refresh_dashboard(force=True)
 
 
-@ui.refreshable
-def _dashboard_summary() -> None:
-    rows = load_task_rows()
-    counts = task_counts(rows)
-    with ui.row().classes("w-full items-end justify-between gap-4"):
-        with ui.column().classes("gap-1"):
-            ui.label("任务工作台").classes("bar-page-title")
-            ui.label(
-                "排队、执行、待处理和历史结果分区展示；每 4 秒检查，变化时更新。"
-            ).classes("bar-muted")
-        ui.badge(f"共 {len(rows)} 个任务", color="grey-7").props("outline")
-    with ui.row().classes("bar-stat-grid w-full"):
-        _stat_card("排队中", counts["queued"], "schedule", "amber")
-        _stat_card("执行中", counts["running"], "autorenew", "blue")
-        _stat_card("待处理", counts["review"], "fact_check", "red")
-        _stat_card("已完成", counts["completed"], "task_alt", "green")
+def _display_task_rows(observed=None):
+    return load_task_rows() if observed is None else observed
 
 
-@ui.refreshable
-def _active_tasks() -> None:
-    rows = sort_active_tasks([
-        row for row in load_task_rows()
-        if row["workflow_status"] in ACTIVE_STATUSES
-    ])
-    _task_section(
-        rows,
-        empty_title="当前没有排队或执行中的任务",
-        empty_hint="点击右上角“添加任务”后，任务会立刻出现在这里。",
-    )
+def _card_projection(task, decision=None):
+    # 这些字段仅用于显示；按钮仅绑定任务 ID，操作入口重新读取并校验权威。
+    operation, _ = build_review_operation(task)
+    selection_finished = (operation.context.get('kind') == 'provider_selection'
+        and operation.context.get('lifecycle') in {'failed', 'awaiting_user', 'awaiting_season', 'interrupted'})
+    row = {key: task.get(key) for key in (
+        'uuid', 'workflow_status', 'preview_only', 'queue_operation', 'path',
+        'queue_position', 'created_at', 'is_anime', 'is_movie', 'plan_entry_count',
+        'plan_rebase_message', 'plan_fingerprint')}
+    row['_selection_finished'] = selection_finished
+    row['_selection_request_id'] = operation.context.get('request_id')
+    if selection_finished:
+        row['workflow_status'] = 'need_confirm'
+        row['queue_position'] = None
+    row['_display'] = dict(
+        title=task_display_title(task, decision_state=decision),
+        reapproval=requires_execution_reapproval(task),
+        retry=_is_safe_approved_retry(task), check=_requires_execution_check(task),
+        replan=requires_execution_replan(task), rollback_restart=_needs_rollback_restart(task),
+        rollback=can_offer_asset_rollback(task, decision),
+        registration=catalog_registration_action_needed(task, decision),
+        recovery_hint=execution_recovery_action_hint(task),
+        reapproved=_is_reapproved_execution_ready(task),
+        feedback=task_feedback_text(task) if task.get('error') else '')
+    return row
 
 
-@ui.refreshable
-def _review_tasks() -> None:
-    rows = [
-        row for row in load_task_rows()
-        if row["workflow_status"] in {"need_confirm", "approved", "invalid"}
-    ]
-    _task_section(
-        rows,
-        empty_title="没有等待处理的整理任务",
-        empty_hint="识别存在不确定项时会在这里暂停，不会直接落盘。",
-    )
+_card_cache = {}
+from threading import RLock
+_card_cache_lock = RLock()
 
 
-@ui.refreshable
-def _history_tasks() -> None:
-    rows = [
-        row for row in load_task_rows()
-        if row["workflow_status"] not in ACTIVE_STATUSES
-        and row["workflow_status"] not in {"need_confirm", "approved", "invalid"}
-    ]
-    _task_section(
-        rows,
-        empty_title="还没有历史任务",
-        empty_hint="已完成、失败或中断的任务会保留在这里。",
-    )
+def _display_file_stamp(path):
+    try:
+        stat = path.stat()
+        return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+    except FileNotFoundError:
+        return None
 
 
-def refresh_dashboard(*, force: bool = False) -> bool:
-    """Refresh only after task data changes, preserving hover and animations."""
-    client_key = _dashboard_client_key()
-    signature = dashboard_signature(load_task_rows())
-    if not force and signature == _dashboard_signatures.get(client_key):
+def _cached_dashboard_rows():
+    # 只缓存卡片投影；批准、执行和冲突校验不读取此缓存。
+    from copy import deepcopy
+    with _card_cache_lock:
+        rows, live = [], set()
+        for path in TASK_PATH.glob('*.json'):
+            decision_path = DECISION_STATE_PATH / path.name
+            key = (str(path.absolute()), str(decision_path.absolute()))
+            live.add(key)
+            stamp = (_display_file_stamp(path), _display_file_stamp(decision_path))
+            cached = _card_cache.get(key)
+            if cached is not None and cached[0] == stamp:
+                row = deepcopy(cached[1])
+            else:
+                tasks = load_task_rows(TASK_PATH, _paths=[path])
+                if not tasks:
+                    _card_cache.pop(key, None)
+                    continue
+                row = _card_projection(tasks[0], _read_card_decision(path.stem))
+                after = (_display_file_stamp(path), _display_file_stamp(decision_path))
+                if after == stamp:
+                    _card_cache[key] = (stamp, deepcopy(row))
+                else:
+                    _card_cache.pop(key, None)
+            if stamp[0] is not None:
+                rows.append((stamp[0][0], row))
+        for key in set(_card_cache) - live:
+            _card_cache.pop(key, None)
+        return [row for _, row in sorted(rows, key=lambda pair: pair[0], reverse=True)]
+
+
+def _prepare_dashboard(previous, *, force=False):
+    rows = _cached_dashboard_rows()
+    for index, row in enumerate(rows):
+        row['_order'] = index
+    signature = dashboard_signature(rows)
+    if not force and signature == previous:
+        return None
+    return rows, signature, {}
+
+
+def _render_dashboard(client_key, snapshot):
+    if snapshot is None:
         return False
+    rows, signature, _ = snapshot
+    _dashboard_rows[client_key] = rows
+    from .provider_selection_work import overlay_rows
+    rows = overlay_rows(task_queue, rows)
+    from .execution_wait import overlay_rows as execution_rows
+    rows = execution_rows(task_queue, rows)
+    rows.sort(key=lambda row: not row.get('_execution_review', False))
+    signature = dashboard_signature(rows)
+    view = _dashboard_views.get(client_key)
+    if view is None:
+        return False
+    review_statuses = {'need_confirm', 'approved', 'invalid'}
+    view.publish({
+        'active': sort_active_tasks([r for r in rows if r.get('_selection_wait') or r['workflow_status'] in ACTIVE_STATUSES]),
+        'review': [r for r in rows if not r.get('_selection_wait') and (r.get('_selection_review') or r['workflow_status'] in review_statuses)],
+        'history': [r for r in rows if not r.get('_selection_wait') and not r.get('_selection_review') and r['workflow_status'] not in ACTIVE_STATUSES | review_statuses],
+    }, task_counts(rows))
     _dashboard_signatures[client_key] = signature
-    _dashboard_summary.refresh()
-    _active_tasks.refresh()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
     return True
 
 
-def _refresh_inactive_sections(_: GenericEventArguments) -> None:
-    """Load review/history when the user changes workspace tabs."""
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+def show_task_queue(client):
+    view = _dashboard_views.get(getattr(client, 'id', None))
+    if view is not None:
+        view.show_queue()
 
 
-def _stat_card(label: str, value: int, icon: str, tone: str) -> None:
-    with ui.card().classes(f"bar-stat-card bar-tone-{tone}"):
-        with ui.row().classes("items-center justify-between w-full"):
-            ui.icon(icon).classes("bar-stat-icon")
-            ui.label(str(value)).classes("bar-stat-value")
-        ui.label(label).classes("bar-stat-label")
-
-
-def _task_section(
-    rows: List[Dict[str, Any]], *, empty_title: str, empty_hint: str
-) -> None:
-    if not rows:
-        with ui.column().classes("bar-empty-state w-full items-center"):
-            ui.icon("inbox", size="42px").classes("bar-muted")
-            ui.label(empty_title).classes("text-lg font-medium")
-            ui.label(empty_hint).classes("bar-muted text-center")
+def project_selection_change(manager, task=None, *, removed=None):
+    """复用已经显示的行，单任务变化不等待整页磁盘刷新。"""
+    if manager is not task_queue:
         return
-    with ui.column().classes("w-full gap-3"):
-        for row in rows:
-            _task_card(row)
+    from nicegui import Client
+    for key, rows in tuple(_dashboard_rows.items()):
+        client = Client.instances.get(key)
+        if client is None:
+            continue
+        current = [r for r in rows if r['uuid'] != removed]
+        if task:
+            row = _card_projection(task)
+            old = next((r for r in current if r['uuid'] == task['uuid']), None)
+            if old is not None and old.get('plan_fingerprint') == row.get('plan_fingerprint'):
+                row['_display']['title'] = old['_display']['title']
+            current = [row if r['uuid'] == task['uuid'] else r for r in current]
+        with client:
+            _render_dashboard(key, (current, (), {}))
 
 
-def _task_card(task: Dict[str, Any]) -> None:
-    task_id = str(task["uuid"])
-    status = str(task.get("workflow_status"))
-    reapproval_required = requires_execution_reapproval(task)
-    safe_approved_retry = _is_safe_approved_retry(task)
-    execution_check_required = _requires_execution_check(task)
+def refresh_dashboard(*, force: bool = False):
+    """显式刷新与定时刷新共用后台读取；返回任务供需要完成结果的回调等待。"""
+    client = context.client
+    async def update():
+        with client:
+            return await refresh_dashboard_background(force=force)
+    return asyncio.create_task(update())
+
+
+async def refresh_dashboard_background(*, force: bool = False) -> bool:
+    """并发请求共享一次后台观察；观察期间再变化时补读。"""
+    from ..utils.task_changes import revision
+    client = context.client
+    key = client.id
+    pending = _dashboard_reads.get(key)
+    if pending is not None:
+        if not force:
+            return None
+        result = await asyncio.shield(pending)
+        return await refresh_dashboard_background(force=True) if result is False else result
+    async def read():
+        previous = _dashboard_signatures.get(key)
+        view = _dashboard_views.get(key)
+        failed, published = False, False
+        if view is not None:
+            view.reading()
+        try:
+            for _ in range(2):
+                observed = revision()
+                snapshot = await ui_disk_call(_prepare_dashboard, previous, force=force or bool(task_queue._provider_reads))
+                if client.id not in client.instances or _dashboard_signatures.get(key) != previous:
+                    return None
+                published = _render_dashboard(key, snapshot) or published
+                previous = _dashboard_signatures.get(key)
+                if revision() == observed:
+                    return published
+                await asyncio.sleep(0)
+            return published
+        except (OSError, ValueError) as exc:
+            failed = True
+            logger.error(f"[任务工作台] 刷新失败：{type(exc).__name__}")
+            if client.id in client.instances:
+                notify('任务列表暂时无法读取，已保留上次显示，请稍后重试。', type='warning')
+            return True if published else None
+        finally:
+            if view is not None and client.id in client.instances:
+                view.finished(failed=failed)
+            _dashboard_reads.pop(key, None)
+    _dashboard_reads[key] = asyncio.create_task(read())
+    return await asyncio.shield(_dashboard_reads[key])
+
+
+def _read_card_decision(task_id):
     try:
-        title_authority = DecisionStateStore(DECISION_STATE_PATH).load_optional(
-            task_id
-        )
+        return DecisionStateStore(DECISION_STATE_PATH).load_optional(task_id)
     except DecisionStateError as exc:
         logger.error(f"[任务工作台] 无法读取标题权威 {task_id}：{exc}")
-        title_authority = None
-    with ui.card().classes("bar-task-card w-full"):
+        return None
+
+
+def _task_card(task: Dict[str, Any], *, title_authority=_UNREAD) -> None:
+    task_id = str(task["uuid"])
+    status = str(task.get("workflow_status"))
+    if '_display' not in task:
+        if title_authority is _UNREAD:
+            title_authority = _read_card_decision(task_id)
+        task = _card_projection(task, title_authority)
+    display = task['_display']
+    status = str(task.get('workflow_status'))
+    active = bool(task.get('_selection_wait') or status in ACTIVE_STATUSES)
+    reapproval_required = display['reapproval']
+    safe_approved_retry = display['retry']
+    execution_check_required = display['check']
+    with ui.card().classes("bar-task-card w-full" + (" bar-task-card-active" if active else "")):
         with ui.row().classes("bar-task-header w-full items-start"):
             with ui.column().classes("bar-task-content gap-1 min-w-0"):
                 with ui.row().classes("bar-task-topline w-full items-center gap-2 flex-wrap"):
-                    ui.badge(
-                        STATUS_TEXT.get(status, status),
-                        color=STATUS_COLOR.get(status, "grey-7"),
-                    )
+                    if task.get('_approval_wait'):
+                        ui.badge('正在批准', color='blue-7')
+                    elif task.get('_selection_wait'):
+                        ui.badge(task['_selection_stage'], color='blue-7' if status in {'running', 'analyzing', 'executing'} else 'amber-7')
+                    elif status in ACTIVE_STATUSES:
+                        _task_activity(task)
+                    else:
+                        ui.badge(
+                            STATUS_TEXT.get(status, status),
+                            color=STATUS_COLOR.get(status, "grey-7"),
+                        )
                     if task.get("preview_only"):
-                        ui.badge("测试任务 · 不执行", color="orange-7").props(
+                        ui.badge("预览记录 · 不执行", color="orange-7").props(
                             "outline"
                         )
-                    recovery_hint = execution_recovery_action_hint(task)
+                    recovery_hint = display['recovery_hint']
                     if recovery_hint:
                         ui.badge("已核查 · 需重新审核", color="orange-8").props(
                             "outline"
                         )
-                    ui.label(
-                        "电影"
-                        if task.get("is_movie") is True
-                        else ROLE_LABELS.get(task.get("is_anime"), "自动判断")
-                    ).classes("bar-meta-chip")
-                    if task.get("use_ai"):
-                        ui.label("AI").classes("bar-meta-chip")
-                    if task.get("queue_operation") == "execute_approved":
+                    ui.label(task_media_label(task)).classes("bar-meta-chip")
+                    if status not in ACTIVE_STATUSES and task.get("queue_operation") == "execute_approved":
                         ui.label(f"执行已批准的{RENAME_PLAN_TERM}").classes(
                             "bar-meta-chip"
                         )
-                    if status in ACTIVE_STATUSES:
-                        _task_progress(task)
-                if status not in ACTIVE_STATUSES:
+                if not active:
                     ui.label(
-                        task_display_title(task, decision_state=title_authority)
+                        display['title']
                     ).classes(
                         "bar-task-title"
                     )
                 _path_tree_button(str(task.get("path") or ""))
 
             with ui.row().classes("bar-task-actions gap-2 justify-end"):
-                if reapproval_required:
+                if task.get('_selection_wait'):
+                    cancel = _cancel_execution_wait if task.get('_execution_wait') else _cancel_selection_wait
+                    button = ui.button('取消等待', icon='o_stop_circle', on_click=partial(cancel, task_id)).classes('bar-review-action').props('outline color=grey-8')
+                    button.set_enabled(bool(task.get('_selection_cancel')))
+                elif display['rollback_restart']:
+                    ui.button('重新生成计划', icon='o_refresh', on_click=partial(_restart_after_rollback, task_id)).classes(
+                        'bar-review-action').props('unelevated color=blue-7')
+                    ui.button('安全结束', icon='o_archive', on_click=partial(_confirm_safe_end, task_id)).classes(
+                        'bar-review-action').props('outline color=grey-8')
+                elif reapproval_required:
                     ui.button(
                         "重新审核",
-                        icon="rate_review",
+                        icon='o_rate_review',
                         on_click=partial(_open_execution_reapproval, task_id),
                     ).classes("bar-review-action").props(
                         "unelevated color=orange-8"
                     )
+                elif display['replan']:
+                    ui.button("重新生成整理计划", icon='o_refresh',
+                        on_click=partial(_replan_failed_execution, task_id)
+                    ).classes("bar-review-action").props("unelevated color=orange-8")
                 elif safe_approved_retry:
                     ui.button(
                         "重新执行",
-                        icon="refresh",
+                        icon='o_refresh',
                         on_click=partial(_retry_approved_execution, task_id),
                     ).classes("bar-review-action").props(
                         "unelevated color=green-7"
@@ -514,7 +667,7 @@ def _task_card(task: Dict[str, Any]) -> None:
                 elif execution_check_required:
                     ui.button(
                         "核查",
-                        icon="fact_check",
+                        icon='o_fact_check',
                         on_click=partial(_open_execution_recovery, task_id),
                     ).classes("bar-review-action").props(
                         "unelevated color=deep-orange-8"
@@ -522,64 +675,72 @@ def _task_card(task: Dict[str, Any]) -> None:
                 elif status == "queued":
                     ui.button(
                         "删除",
-                        icon="delete",
-                        on_click=partial(_delete_task, task_id),
-                    ).classes("bar-review-action bar-queue-delete").props(
+                        icon='o_delete',
+                        on_click=lambda event, task_id=task_id: _delete_task(task_id, event.sender),
+                    ).classes("bar-review-action").props(
                         'unelevated color=red-7 aria-label="删除排队任务"'
                     ).tooltip("删除排队任务")
                 elif status in {"need_confirm", "approved", "invalid"}:
                     ui.button(
-                        "处理", icon="construction", on_click=partial(_open_review, task_id)
+                        "处理", icon='o_construction', on_click=partial(_open_review, task_id)
                     ).classes("bar-review-action").props("unelevated color=orange-8")
                     ui.button(
-                        "重试",
-                        icon="refresh",
+                        "重建",
+                        icon='o_refresh',
                         on_click=partial(_retry_task, task_id),
-                    ).classes("bar-review-action").props("unelevated color=green-7")
+                    ).classes("bar-review-action").props("unelevated color=blue-7").tooltip(
+                        "按当前状态重新识别或核查资产；不是直接重新执行整理")
                     ui.button(
                         "删除",
-                        icon="delete",
-                        on_click=partial(_delete_task, task_id),
+                        icon='o_delete',
+                        on_click=lambda event, task_id=task_id: _delete_task(task_id, event.sender),
                     ).classes("bar-review-action").props("unelevated color=red-7")
                 elif status not in ACTIVE_STATUSES:
-                    registration_action_needed = catalog_registration_action_needed(
-                        task, title_authority
-                    )
+                    registration_action_needed = display['registration']
                     if registration_action_needed:
                         ui.button(
                             "处理",
-                            icon="folder_off",
+                            icon='o_folder_off',
                             on_click=partial(_open_review, task_id),
                         ).classes("bar-review-action").props(
                             'unelevated color=orange-8 aria-label="处理失效的作品登记"'
                         ).tooltip("选择原目录已移动或原目录已删除")
                     else:
                         ui.button(
-                            "处理", icon="construction", on_click=partial(_open_review, task_id)
+                            "处理", icon='o_construction', on_click=partial(_open_review, task_id)
                         ).classes("bar-review-action").props(
                             'unelevated color=orange-8 aria-label="处理整理任务"'
                         ).tooltip("查看问题、修改设置或重新识别")
+                    if status == 'completed':
+                        ui.button('核查并补齐', icon='o_restore', on_click=partial(_rebuild_task, task_id)).classes(
+                            'bar-review-action').props('unelevated color=blue-7 aria-label="核查并补齐"').tooltip('核对缺失目标，生成新的待批准计划')
+                    else:
+                        ui.button(
+                            "重建", icon='o_refresh', on_click=partial(_retry_task, task_id)
+                        ).classes("bar-review-action").props(
+                            'unelevated color=blue-7 aria-label="重建"'
+                        ).tooltip("按当前状态重新识别或核查资产；不是直接重新执行整理")
                     ui.button(
-                        "重试", icon="refresh", on_click=partial(_retry_task, task_id)
-                    ).classes("bar-review-action").props(
-                        'unelevated color=green-7 aria-label="重新入队"'
-                    ).tooltip("重新入队")
-                    ui.button(
-                        "删除", icon="delete", on_click=partial(_delete_task, task_id)
+                        "删除", icon='o_delete', on_click=lambda event, task_id=task_id: _delete_task(task_id, event.sender)
                     ).classes("bar-review-action").props(
                         'unelevated color=red-7 aria-label="删除任务记录"'
                     ).tooltip("删除任务记录")
 
-        if task.get("error"):
+                if display['rollback']:
+                    ui.button('回滚',icon='o_undo',on_click=partial(_rollback_asset_task,task_id)).classes(
+                        'bar-review-action').props('unelevated color=blue-7 aria-label="回滚换源"').tooltip(
+                            '核查本次换源的媒体和登记，确认后回滚')
+
+        if not active and display['feedback']:
             feedback_classes = (
                 "bar-task-feedback bar-recovery-ready"
-                if _is_reapproved_execution_ready(task)
+                if display['reapproved']
                 else "bar-task-feedback bar-error-text"
             )
-            ui.label(task_feedback_text(task)).classes(
+            ui.label(display['feedback']).classes(
                 feedback_classes
             )
-        if task.get("plan_rebase_message"):
+        if not active and task.get("plan_rebase_message"):
             ui.label(localize_plan_term(task["plan_rebase_message"])).classes(
                 "bar-task-feedback text-blue-8"
             )
@@ -591,34 +752,33 @@ def _task_card(task: Dict[str, Any]) -> None:
             ui.label(localize_plan_term(recovery_hint)).classes(
                 "bar-task-feedback bar-recovery-ready"
             )
-        if task.get("plan_entry_count") is not None:
+        if not active and task.get("plan_entry_count") is not None:
             ui.label(
                 f"{RENAME_PLAN_TERM} {task['plan_entry_count']} 项"
             ).classes("bar-task-footnote bar-help")
 
 
-def _task_progress(task: Dict[str, Any]) -> None:
+def _task_activity(task: Dict[str, Any]) -> None:
     status = task.get("workflow_status")
     if status == "queued":
         position = task.get("queue_position")
-        text = f"队列 {position}" if position else "等待调度"
-        with ui.row(wrap=False).classes("bar-inline-progress items-center gap-3"):
-            ui.label(text).classes("bar-queue-text")
-            ui.linear_progress(value=0, show_value=False).props(
-                "color=amber-7 track-color=amber-2"
-            ).classes("bar-progress grow")
+        text = f"排队中 · 第{position}位" if position else "排队中"
+        ui.badge(text, color="amber-7")
     elif status in {"running", "analyzing", "executing"}:
+        with ui.row(wrap=False).classes("bar-task-activity items-center gap-2").props("role=status"):
+            ui.badge("处理中", color="blue-7")
+    if status in ACTIVE_STATUSES:
         with ui.row(wrap=False).classes("bar-inline-progress items-center gap-3"):
-            ui.label("处理中").classes("bar-running-text")
             ui.linear_progress(value=0, show_value=False).props(
-                "indeterminate color=blue-7 track-color=blue-2"
+                "color=amber-7 track-color=amber-2" if status == 'queued'
+                else "indeterminate color=blue-7 track-color=blue-2"
             ).classes("bar-progress grow")
 
 
 def _path_tree_button(raw_path: str) -> None:
     """Show only the leaf in the card and reveal a folder tree on click."""
     parts = path_tree_parts(raw_path)
-    with ui.button(display_folder_name(raw_path), icon="folder_open").classes(
+    with ui.button(display_folder_name(raw_path), icon='o_folder_open').classes(
         "bar-path-trigger"
     ).props("flat no-caps dense"):
         with ui.menu().classes("bar-path-menu"):
@@ -628,28 +788,48 @@ def _path_tree_button(raw_path: str) -> None:
                     with ui.row(wrap=False).classes("items-center gap-2 bar-path-level").style(
                         f"padding-left:{depth * 14}px"
                     ):
-                        ui.icon("folder" if depth < len(parts) - 1 else "folder_open", size="17px")
+                        ui.icon(outlined_icon("folder" if depth < len(parts) - 1 else "folder_open"), size="17px")
                         ui.label(part).classes("bar-path-tree-label")
 
 
+def _needs_rollback_restart(task) -> bool:
+    # Display hint only. The command independently checks the complete journal.
+    return task.get('asset_rollback_phase') == 'rolled_back' and task.get('execution_status') == 'rolled_back'
+
+
 async def _open_review(task_id: str) -> None:
-    data = get_task(task_id)
+    data = await disk_call(get_task, task_id)
+    if _needs_rollback_restart(data):
+        await _restart_after_rollback(task_id)
+        return
     if requires_execution_reapproval(data):
         notify("该任务需要重新审核，请使用“重新审核”", type="warning")
         return
     if data.get("execution_requires_manual_check"):
         notify("请先打开“核查”并确认历史记录与目标目录", type="warning")
         return
+    from ..rename.recognition_queue_admission import restore_title_confirmation
+    try:
+        await ui_disk_call(restore_title_confirmation, task_queue, task_id, expected_task=data)
+    except (ValueError, RuntimeError, OSError) as exc:
+        notify(str(exc), type='warning')
+        return
     await plan_review_page(task_id)
-    _dashboard_summary.refresh()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    refresh_dashboard(force=True)
+
+
+async def _rebuild_task(task_id: str) -> None:
+    from .completed_rebuild_view import open_rebuild_dialog
+    await open_rebuild_dialog(task_id, manager=task_queue, after_change=refresh_dashboard)
 
 
 async def _retry_task(task_id: str) -> None:
-    data = get_task(task_id)
+    data = await disk_call(get_task, task_id)
     if not data:
         notify("任务记录不存在", type="negative")
+        return
+    if _needs_rollback_restart(data):
+        await _restart_after_rollback(task_id)
         return
     if requires_execution_reapproval(data):
         notify("该任务需要重新审核，不能直接重试", type="warning")
@@ -657,15 +837,33 @@ async def _retry_task(task_id: str) -> None:
     if data.get("execution_requires_manual_check"):
         notify("请先打开“核查”并确认历史记录与目标目录", type="warning")
         return
-    await task_queue.retry_current(task_id, source="retry")
-    notify(f"任务 {task_id[:8]} 已重新加入队列", type="positive")
-    refresh_dashboard()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    if provider_selection_awaits_user(data):
+        notify("作品关系仍需确认，请打开任务继续或安全移除", type="warning")
+        return
+    try:
+        await task_queue.retry_current(task_id, source="retry")
+    except Exception as exc:
+        notify(localize_plan_term(exc), type="negative")
+        return
+    refreshed = (await disk_call(get_task, task_id)) or {}
+    notify('已核查并保留现有文件' if refreshed.get('workflow_status') == 'completed'
+           else '已生成待批准修复计划' if refreshed.get('workflow_status') == 'need_confirm'
+           else f"任务 {task_id[:8]} 已重新加入队列", type="positive")
+    refresh_dashboard(force=True)
+
+
+async def _cancel_execution_wait(task_id):
+    from .execution_wait import cancel
+    try:
+        result = await cancel(task_queue, task_id)
+        notify('已取消等待，原批准计划保留。' if result else '任务已入队或开始执行，请查看当前状态。',
+               type='positive' if result else 'warning')
+    except (OSError, ValueError, RuntimeError) as exc:
+        notify(str(exc), type='negative')
 
 
 async def _retry_approved_execution(task_id: str) -> None:
-    data = get_task(task_id)
+    data = await disk_call(get_task, task_id)
     if not data:
         notify("任务记录不存在", type="negative")
         return
@@ -674,61 +872,132 @@ async def _retry_approved_execution(task_id: str) -> None:
         refresh_dashboard()
         return
     fingerprint = str(data.get("execution_requested_fingerprint") or "")
-    await task_queue.enqueue_approved(task_id, fingerprint)
-    notify("已重新加入执行队列", type="positive")
-    refresh_dashboard()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    from .queue_confirmation import open_queue_confirmation
+    def completed():
+        notify("已重新加入执行队列", type="positive")
+        refresh_dashboard()
+        refresh_dashboard(force=True)
+        refresh_dashboard(force=True)
+    open_queue_confirmation(lambda: task_queue.enqueue_approved(task_id, fingerprint),
+        completed, title='重新执行原批准计划', background=(task_queue, task_id, fingerprint))
 
 
-async def _delete_task(task_id: str) -> None:
-    task_data = get_task(task_id)
+async def _replan_failed_execution(task_id: str) -> None:
+    data = await disk_call(get_task, task_id)
+    if not data or not requires_execution_replan(data):
+        notify("当前状态不能安全重规划，请先核查", type="warning")
+        return
+    try:
+        await task_queue.replan_failed_execution(
+            task_id, str(data.get("execution_requested_fingerprint") or ""))
+    except Exception as exc:
+        notify(localize_plan_term(exc), type="negative")
+        return
+    notify("已撤销旧批准，正在重新生成整理计划", type="positive")
+    refresh_dashboard(force=True)
+
+
+async def _restart_after_rollback(task_id: str) -> None:
+    from .asset_recovery_view import open_rolled_back_restart
+    await open_rolled_back_restart(task_queue, task_id, refresh_dashboard)
+
+
+async def _confirm_safe_end(task_id: str, *, on_success=None) -> None:
+    with ui.dialog() as dialog, dialog_card().classes('bar-dialog max-w-xl'):
+        ui.label('安全结束此任务').classes('bar-dialog-title')
+        ui.label('结束后移除任务卡并撤销当前批准。源文件、现有媒体、作品登记及计划/执行/回滚审计均保留；继续整理需要新建任务。').classes('bar-help')
+        confirmed = ui.checkbox('我确认结束任务，不删除媒体与历史证据')
+        busy = False
+
+        async def finish():
+            nonlocal busy
+            if not confirmed.value or busy:
+                return
+            busy = True
+            button.disable()
+            button.props('loading')
+            try:
+                if await _submit_safe_end(task_id):
+                    dialog.close()
+                    if on_success is not None:
+                        on_success()
+            finally:
+                busy = False
+                button.enable()
+                button.props(remove='loading')
+
+        with ui.row().classes('bar-modal-footer'):
+            ui.button('取消', on_click=dialog.close, icon='o_close').props('flat')
+            button = ui.button('确认安全结束', on_click=finish, icon='o_delete').props('unelevated color=blue-7')
+    dialog.open()
+
+
+async def _delete_task(task_id: str, button=None) -> bool:
+    if task_id in _deleting_tasks:
+        return False
+    _deleting_tasks.add(task_id)
+    if button is not None:
+        button.disable()
+        button.set_text('正在删除')
+        button.props('loading')
+    try:
+        if _needs_rollback_restart(await disk_call(get_task, task_id)):
+            await _confirm_safe_end(task_id)
+            return False
+        return await _submit_safe_end(task_id)
+    finally:
+        _deleting_tasks.discard(task_id)
+        if button is not None and not button.is_deleted:
+            button.enable()
+            button.set_text('删除')
+            button.props(remove='loading')
+
+
+async def _submit_safe_end(task_id: str) -> bool:
+    from ..rename.plan_execution import PlanExecutionError
+    task_data = await disk_call(get_task, task_id)
     if requires_execution_reapproval(task_data):
         notify("该任务需要重新审核，不能直接删除", type="warning")
-        return
+        return False
     if task_data.get("execution_requires_manual_check"):
         notify("核查完成前不能直接删除任务和历史记录", type="warning")
-        return
-    if task_data.get("workflow_status") == "queued":
-        if not task_queue.cancel_queued(task_id):
-            notify("任务已开始执行，不能再从排队列表删除", type="warning")
-            refresh_dashboard()
-            return
+        return False
     try:
-        task_queue.abandon_and_remove(
+        await task_queue.abandon_and_remove(
             task_id,
             record_root=RECORD_PATH,
             plan_root=PLAN_PATH,
             review_root=PLAN_REVIEW_PATH,
         )
-    except (PlanExecutionError, ValueError) as exc:
+    except (PlanExecutionError, ValueError, OSError, RuntimeError) as exc:
         notify(localize_plan_term(exc), type="negative")
-        return
-    notify(f"已删除任务记录 {task_id[:8]}", type="positive")
-    refresh_dashboard()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+        return False
+    project_selection_change(task_queue, removed=task_id)
+    notify(f"已安全结束任务 {task_id[:8]}；媒体与历史证据保留", type="positive")
+    refresh_dashboard(force=True)
+    return True
 
 
 async def _open_execution_reapproval(task_id: str) -> None:
-    task_data = get_task(task_id)
+    task_data = await disk_call(get_task, task_id)
     if not requires_execution_reapproval(task_data):
         notify("任务状态已变化，请刷新后再处理", type="warning")
         refresh_dashboard()
         return
     await plan_review_page(task_id)
-    _dashboard_summary.refresh()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    refresh_dashboard(force=True)
 
 
 async def _open_execution_recovery(task_id: str) -> None:
-    task_data = get_task(task_id)
+    from .asset_recovery_view import open_asset_recovery
+    if await open_asset_recovery(task_queue, task_id, refresh_dashboard):
+        return
+    task_data = await disk_call(get_task, task_id)
     if not task_data:
         notify("任务记录不存在", type="negative")
         return
-    snapshot = load_execution_recovery(task_id, RECORD_PATH)
-    with ui.dialog() as dialog, ui.card().classes("bar-dialog max-w-2xl"):
+    snapshot = await disk_call(load_execution_recovery, task_id, RECORD_PATH)
+    with ui.dialog() as dialog, dialog_card().classes("bar-dialog max-w-2xl"):
         ui.label("执行结果人工核查").classes("bar-dialog-title")
         if task_data.get("execution_phase") == "media_boundary_entered":
             ui.label(
@@ -760,17 +1029,17 @@ async def _open_execution_recovery(task_id: str) -> None:
                 "请在文件系统中核对目标文件是否存在，并与历史记录逐项比对。"
                 "只有完成核查后才点击下方确认。"
             ).classes("bar-muted")
-        with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("关闭", on_click=dialog.close).props("flat")
+        with ui.row().classes("w-full justify-end gap-2").classes('bar-modal-footer'):
+            ui.button("关闭", on_click=dialog.close, icon='o_close').props("flat")
             if task_data.get("execution_status") == "catalog_update_pending":
                 ui.button(
                     "恢复作品登记",
-                    icon="sync",
+                    icon='o_sync',
                     on_click=partial(_reconcile_catalog_update, dialog, task_id),
                 ).props("unelevated color=blue-8")
                 ui.button(
                     "放弃恢复",
-                    icon="remove_circle_outline",
+                    icon='o_remove_circle_outline',
                     on_click=partial(
                         _confirm_abandon_catalog_update,
                         dialog,
@@ -781,7 +1050,7 @@ async def _open_execution_recovery(task_id: str) -> None:
             else:
                 ui.button(
                     "我已完成核查",
-                    icon="verified_user",
+                    icon='o_verified_user',
                     on_click=partial(_acknowledge_execution_recovery, dialog, task_id),
                 ).props("unelevated color=deep-orange-8")
     dialog.open()
@@ -796,28 +1065,27 @@ def _acknowledge_execution_recovery(dialog: ui.dialog, task_id: str) -> None:
         return
     dialog.submit(True)
     notify("已核查，需重新审核", type="positive")
-    refresh_dashboard()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    refresh_dashboard(force=True)
 
 
-def _reconcile_catalog_update(dialog: ui.dialog, task_id: str) -> None:
+
+
+async def _rollback_asset_task(task_id: str) -> None:
+    from .asset_recovery_view import open_asset_rollback
+    await open_asset_rollback(task_queue,task_id,refresh_dashboard)
+
+
+async def _reconcile_catalog_update(dialog: ui.dialog, task_id: str) -> None:
     try:
-        reconcile_catalog_update(
-            task_id,
-            task_root=TASK_PATH,
-            record_root=RECORD_PATH,
-            plan_store=PlanStore(PLAN_PATH),
-            work_catalog=WorkCatalog(WORK_CATALOG_PATH),
-        )
-    except ExecutionRecoveryError as exc:
+        await task_queue.reconcile_catalog_update(task_id)
+    except (ExecutionRecoveryError, RuntimeError, ValueError) as exc:
         notify(localize_plan_term(exc), type="negative")
         return
+    if getattr(dialog, 'is_deleted', False):
+        return
     dialog.submit(True)
-    notify("作品登记已从历史记录恢复，任务现已完成", type="positive")
-    refresh_dashboard()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    notify("作品登记已恢复；任务完成情况请查看卡片", type="positive")
+    refresh_dashboard(force=True)
 
 
 def _confirm_abandon_catalog_update(
@@ -825,17 +1093,17 @@ def _confirm_abandon_catalog_update(
     task_id: str,
     fingerprint: str,
 ) -> None:
-    with ui.dialog() as confirm, ui.card().classes("bar-dialog max-w-md"):
+    with ui.dialog() as confirm, dialog_card().classes("bar-dialog max-w-md"):
         ui.label("放弃恢复？").classes("bar-dialog-title")
         ui.label(
             "只会从任务列表移除此任务。不会修改媒体文件或作品登记，"
             "操作记录仍会保留。"
         ).classes("bar-help")
-        with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("返回", on_click=confirm.close).props("flat")
+        with ui.row().classes("w-full justify-end gap-2").classes('bar-modal-footer'):
+            ui.button("返回", on_click=confirm.close, icon='o_arrow_back').props("flat")
             ui.button(
                 "移除任务",
-                icon="delete_outline",
+                icon='o_delete_outline',
                 on_click=partial(
                     _abandon_catalog_update,
                     confirm,
@@ -847,35 +1115,26 @@ def _confirm_abandon_catalog_update(
     confirm.open()
 
 
-def _abandon_catalog_update(
+async def _abandon_catalog_update(
     confirm: ui.dialog,
     recovery_dialog: ui.dialog,
     task_id: str,
     fingerprint: str,
 ) -> None:
     try:
-        abandon_catalog_update_recovery(
-            task_id,
-            task_root=TASK_PATH,
-            record_root=RECORD_PATH,
-            plan_store=PlanStore(PLAN_PATH),
-            review_root=PLAN_REVIEW_PATH,
-            decision_state_root=DECISION_STATE_PATH,
-            audit_root=RECOVERY_ABANDON_AUDIT_PATH,
-            expected_plan_fingerprint=fingerprint,
-        )
-    except ExecutionRecoveryError as exc:
+        await task_queue.abandon_catalog_update(task_id, fingerprint)
+    except (ExecutionRecoveryError, RuntimeError, ValueError) as exc:
         notify(localize_plan_term(exc), type="negative")
         return
-    confirm.submit(True)
-    recovery_dialog.submit(True)
+    if not getattr(confirm, 'is_deleted', False):
+        confirm.submit(True)
+    if not getattr(recovery_dialog, 'is_deleted', False):
+        recovery_dialog.submit(True)
     notify(
         "任务已移除；媒体文件和作品登记未修改，操作记录已保留。",
         type="positive",
     )
-    refresh_dashboard()
-    _review_tasks.refresh()
-    _history_tasks.refresh()
+    refresh_dashboard(force=True)
 
 
 # Compatibility wrappers retained for older event-slot callers and tests.
@@ -893,3 +1152,14 @@ async def handle_retry(ev: GenericEventArguments) -> None:
 
 async def handle_delete(ev: GenericEventArguments, is_notify: bool = True) -> None:
     await _delete_task(ev.args["row"]["uuid"])
+
+
+async def _cancel_selection_wait(task_id):
+    from .provider_selection_work import cancel
+    try:
+        result = await cancel(task_queue, task_id)
+        notify('已取消等待，原任务已保留。' if result else '任务已开始或已经结束，不能取消等待。',
+               type='positive' if result else 'warning')
+    except (ValueError, RuntimeError, OSError) as exc:
+        notify(str(exc), type='negative')
+    await refresh_dashboard_background(force=True)

@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "evidence_contract": {
+    "exercised_boundary": "Rename._resolve_bangumi_provider_selection",
+    "evidence_scope": "resolver_seam_only",
+    "does_not_claim": [
+      "NiceGUI or AddTask runtime reachability",
+      "task queue production wiring",
+      "target-root routing correctness"
+    ],
+    "green_required_wiring": "Rename._process must route Bangumi selection through the unique canonical successor-authority reader before provider discovery"
+  },
+  "target_routing_contract": {
+    "producer_series_canonical_root_role": "non_authoritative_test_sentinel",
+    "canonical_authority_forbidden_fields": [
+      "canonical_root",
+      "resolved_target_root",
+      "target_root",
+      "source_path"
+    ],
+    "green_requirement": "changing the producer task canonical_root must not change the consumed work identity, subject-to-season assignment, or frozen provider snapshot; the successor task resolves its own target from its current routing snapshot"
+  },
+  "provenance": {
+    "source": "R8 S1 to S2 user-observed incident, sanitized semantic replay",
+    "observed_shape": "S1 completed a four-subject same-work confirmation; after the durable restart boundary S2 asked for the same cohort confirmation again",
+    "evidence_class": "incident-derived semantic fixture",
+    "privacy_removed": [
+      "local absolute paths",
+      "task UUIDs",
+      "credentials and provider headers",
+      "raw DOM and private collector output",
+      "complete media manifest"
+    ]
+  },
+  "operator_observation": {
+    "source_count": 4,
+    "explicit_animation_selection_count": 4,
+    "task_card_count": 4,
+    "misoperation": false,
+    "s1_outcome": "completed",
+    "s2_outcome": "repeat_cohort_confirmation",
+    "s2_public_message": "没有找到可靠的季度关系"
+  },
+  "cohort": {
+    "selected_subject_id_s1": "41658",
+    "selected_subject_id_s2": "86670",
+    "tmdb_tv_id": "53918",
+    "subjects": [
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "41658",
+        "title": "向山进发",
+        "original_title": "ヤマノススメ",
+        "air_date": "2013-01-02",
+        "episode_count": 13,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "86670",
+        "title": "向山进发 第二季",
+        "original_title": "ヤマノススメ セカンドシーズン",
+        "air_date": "2014-07-09",
+        "episode_count": 24,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "216310",
+        "title": "向山进发 第三季",
+        "original_title": "ヤマノススメ サードシーズン",
+        "air_date": "2018-07-02",
+        "episode_count": 13,
+        "platform": "TV",
+        "type": 2
+      },
+      {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "290980",
+        "title": "向山进发 Next Summit",
+        "original_title": "ヤマノススメ Next Summit",
+        "air_date": "2022-10-04",
+        "episode_count": 12,
+        "platform": "TV",
+        "type": 2
+      }
+    ],
+    "relations": [
+      {"from": "41658", "to": "86670", "relation": "续集"},
+      {"from": "86670", "to": "216310", "relation": "续集"},
+      {"from": "216310", "to": "290980", "relation": "续集"}
+    ],
+    "observations": [
+      {
+        "bangumi_subject_id": "41658",
+        "observed_at": "2026-08-31T08:43:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "original",
+            "query": "ヤマノススメ",
+            "year": 2013,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "53918",
+                "tmdb_tv_id": "53918",
+                "match_tier": "exact",
+                "title": "向山进发",
+                "original_title": "ヤマノススメ",
+                "first_air_date": "2013-01-03",
+                "seasons": [
+                  {"season_number": 1, "air_date": "2013-01-03", "episode_count": 12},
+                  {"season_number": 2, "air_date": "2014-07-09", "episode_count": 24},
+                  {"season_number": 3, "air_date": "2018-07-02", "episode_count": 13},
+                  {"season_number": 4, "air_date": "2022-10-05", "episode_count": 12}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "bangumi_subject_id": "86670",
+        "observed_at": "2026-08-31T08:43:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "ヤマノススメ セカンドシーズン", "year": 2014, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      },
+      {
+        "bangumi_subject_id": "216310",
+        "observed_at": "2026-08-31T08:43:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "ヤマノススメ サードシーズン", "year": 2018, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      },
+      {
+        "bangumi_subject_id": "290980",
+        "observed_at": "2026-08-31T08:43:00+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {"locale": "original", "query": "ヤマノススメ Next Summit", "year": 2022, "outcome": "no_match", "truncated": false, "candidates": []}
+        ]
+      }
+    ]
+  },
+  "durable_sequence": [
+    {
+      "step": "s1_confirmed",
+      "task_alias": "incident-s1",
+      "decision_revision": 1,
+      "confirmed_work": {"namespace": "tmdb", "entity_type": "tv", "provider_id": "53918"},
+      "season_binding": 1,
+      "season_assignments": {"41658": 1, "86670": 2, "216310": 3, "290980": 4},
+      "boundary_count": 3,
+      "cohort_decision_count": 1
+    },
+    {
+      "step": "restart_boundary",
+      "operation": "new DecisionStateStore instance reads persisted bytes"
+    },
+    {
+      "step": "s2_before_resolution",
+      "task_alias": "incident-s2",
+      "decision_revision": 0,
+      "confirmed_work": null,
+      "season_binding": null
+    },
+    {
+      "step": "current_product_outcome",
+      "task_alias": "incident-s2",
+      "review_operation": "confirm_cohort",
+      "accepted_cross_task_authority": false
+    }
+  ],
+  "negative_controls": [
+    "unconfirmed producer decision",
+    "unsupported producer schema or policy",
+    "fingerprint mismatch",
+    "selected subject outside the confirmed cohort",
+    "ambiguous competing cohort authorities",
+    "unrelated ordinary work"
+  ]
+}

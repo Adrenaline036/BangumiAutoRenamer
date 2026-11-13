@@ -2,55 +2,26 @@
 
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from .rename_plan import CollisionResolution
+from .media_file_identity import MEDIA_IDENTITY, MediaFileIdentity, media_identity
+from .small_file_identity import SMALL_CONTENT, SmallFileFingerprint, small_fingerprint
 
 
 class AssetCollisionError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class FileFingerprint:
-    size: int
-    sha256: str
-    device: int
-    inode: int
+def requires_manual_collision(path):
+    from .utils import VIDEO_SUFFIX
+    from .content_associations import AUDIO_SUFFIXES
+    return Path(path).suffix.casefold() in set(VIDEO_SUFFIX) | AUDIO_SUFFIXES | {'.tak', '.ape'}
 
 
-def fingerprint_file(path: Path) -> FileFingerprint:
-    """Hash one stable regular file and reject changes during the read."""
 
-    path = Path(path)
-    if path.is_symlink() or not path.is_file():
-        raise AssetCollisionError(f"碰撞证据不是普通文件：{path}")
-    before = path.stat()
-    digest = hashlib.sha256()
-    try:
-        with open(path, "rb") as file:
-            while chunk := file.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as exc:
-        raise AssetCollisionError(f"无法读取碰撞文件：{path}: {exc}") from exc
-    after = path.stat()
-    identity_before = (
-        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
-    )
-    identity_after = (
-        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
-    )
-    if identity_before != identity_after:
-        raise AssetCollisionError(f"文件在计算散列期间发生变化：{path}")
-    return FileFingerprint(
-        size=after.st_size,
-        sha256=digest.hexdigest(),
-        device=after.st_dev,
-        inode=after.st_ino,
-    )
+
 
 
 def build_reuse_resolution(
@@ -63,50 +34,79 @@ def build_reuse_resolution(
     if target.is_symlink() or not target.is_file():
         return None
     try:
-        source_stat = source.stat()
-        target_stat = target.stat()
-    except OSError as exc:
-        raise AssetCollisionError(f"无法读取同名资产状态：{exc}") from exc
-    if source_stat.st_size != target_stat.st_size:
+        source_id, target_id = media_identity(source), media_identity(target)
+        if source.absolute() == target.absolute() or source_id.size != target_id.size:
+            return None
+        if requires_manual_collision(source):
+            identity = reuse_resolution_for_observations(source_id, target_id)
+            return identity if identity is not None and target.stat().st_nlink >= 2 else None
+        return reuse_resolution_for_observations(small_fingerprint(source), small_fingerprint(target))
+    except (OSError, ValueError) as exc:
+        raise AssetCollisionError(str(exc)) from exc
+
+
+def identity_reuse_resolution(source, target):
+    if type(source) is not MediaFileIdentity or type(target) is not MediaFileIdentity:
+        raise AssetCollisionError('媒体复用缺少文件系统证据')
+    if source != target:
         return None
-    source_evidence = fingerprint_file(source)
-    target_evidence = fingerprint_file(target)
-    if source_evidence.sha256 != target_evidence.sha256:
+    return CollisionResolution('reuse_existing', source.size, target.size,
+                               target.device, target.inode, MEDIA_IDENTITY)
+
+
+def reuse_resolution_for_observations(source, target):
+    """冻结证据的类型决定复用合同，小文件始终保留内容摘要。"""
+    if type(source) is SmallFileFingerprint and type(target) is SmallFileFingerprint:
+        return reuse_resolution_from_evidence(source, target)
+    if type(source) is MediaFileIdentity and type(target) is MediaFileIdentity:
+        return identity_reuse_resolution(source, target)
+    raise AssetCollisionError('复用两端缺少一致的类型化文件证据')
+
+
+def reuse_resolution_from_evidence(source_evidence: SmallFileFingerprint, target_evidence: SmallFileFingerprint):
+    """The shared pure reuse decision for two fully observed regular files."""
+    if type(source_evidence) is not SmallFileFingerprint or type(target_evidence) is not SmallFileFingerprint:
+        raise AssetCollisionError('复用决定缺少完整文件证据')
+    if (source_evidence.size != target_evidence.size
+            or source_evidence.xxh3_128 != target_evidence.xxh3_128):
         return None
     return CollisionResolution(
         action="reuse_existing",
         source_size=source_evidence.size,
-        source_sha256=source_evidence.sha256,
         target_size=target_evidence.size,
-        target_sha256=target_evidence.sha256,
         target_device=target_evidence.device,
         target_inode=target_evidence.inode,
+        evidence_kind=SMALL_CONTENT,
+        source_xxh3_128=source_evidence.xxh3_128,
+        target_xxh3_128=target_evidence.xxh3_128,
     )
 
 
-def validate_reuse_resolution(
-    source: Path, target: Path, resolution: CollisionResolution
-) -> tuple[FileFingerprint, FileFingerprint]:
-    """Revalidate the exact approved bytes immediately before execution."""
 
-    if resolution.action != "reuse_existing":
-        raise AssetCollisionError("不支持的目标碰撞处置")
-    source_evidence = fingerprint_file(source)
-    target_evidence = fingerprint_file(target)
-    if (
-        source_evidence.size != resolution.source_size
-        or source_evidence.sha256 != resolution.source_sha256
-        or target_evidence.size != resolution.target_size
-        or target_evidence.sha256 != resolution.target_sha256
-        or source_evidence.sha256 != target_evidence.sha256
-    ):
-        raise AssetCollisionError("源文件或既有目标已变化，请重新生成整理计划")
-    if (
-        resolution.target_device is not None
-        and target_evidence.device != resolution.target_device
-    ) or (
-        resolution.target_inode is not None
-        and target_evidence.inode != resolution.target_inode
-    ):
-        raise AssetCollisionError("既有目标实体已被替换，请重新生成整理计划")
-    return source_evidence, target_evidence
+def validate_reuse_resolution(source, target, resolution, *, source_identity=None):
+    # 执行消费批准来源身份；显式观察入口可以现场采集。
+    try:
+        if (resolution.action != 'reuse_existing' or
+                CollisionResolution.from_dict(resolution.to_dict()) != resolution):
+            raise ValueError('目标复用证据不完整')
+        source_id = media_identity(source) if source_identity is None else source_identity
+        expected = MediaFileIdentity(resolution.target_size, resolution.target_device, resolution.target_inode)
+        from .media_file_identity import verify_link_target
+        verify_link_target(target, expected, hardlink=resolution.evidence_kind == MEDIA_IDENTITY)
+        if source_id.size != resolution.source_size or Path(source).absolute() == Path(target).absolute():
+            raise ValueError('来源与批准复用决定不一致')
+        if resolution.evidence_kind == MEDIA_IDENTITY:
+            if source_id != expected:
+                raise ValueError('既有目标已被替换或不再属于批准来源')
+            return source_id, expected
+        if resolution.evidence_kind != SMALL_CONTENT or requires_manual_collision(source):
+            raise ValueError('目标复用证据与文件类型不符')
+        original = (small_fingerprint(source) if source_identity is None else
+                    SmallFileFingerprint(source_id.size, resolution.source_xxh3_128, source_id.device, source_id.inode))
+        current = small_fingerprint(target)
+        if (original.xxh3_128 != resolution.source_xxh3_128 or
+                current.xxh3_128 != resolution.target_xxh3_128 or original.xxh3_128 != current.xxh3_128):
+            raise ValueError('来源或既有目标内容与批准决定不一致')
+        return original, current
+    except (ValueError, OSError) as exc:
+        raise AssetCollisionError(str(exc)) from exc

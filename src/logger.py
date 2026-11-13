@@ -1,8 +1,11 @@
 import os
 import logging
+import asyncio
+import atexit
 from logging.handlers import TimedRotatingFileHandler
 
 import structlog
+from .log_dispatch import LogDispatch
 
 from .utils.path import log_path
 
@@ -35,7 +38,7 @@ console_formatter = structlog.stdlib.ProcessorFormatter(
         structlog.processors.StackInfoRenderer(),
         structlog.dev.set_exc_info,
         structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
-        structlog.dev.ConsoleRenderer(),
+        structlog.dev.ConsoleRenderer(exception_formatter=structlog.dev.plain_traceback),
     ]
 )
 console_handler = logging.StreamHandler()
@@ -51,11 +54,23 @@ log_level = getattr(logging, log_level_str.upper(), logging.INFO)
 console_handler.setLevel(log_level)
 file_handler.setLevel(log_level)
 
+producer_handler = LogDispatch([file_handler, console_handler])
 logging.basicConfig(
     level=log_level,
     # format="%(message)s",
-    handlers=[file_handler, console_handler],
+    handlers=[producer_handler],
 )
+
+atexit.register(producer_handler.drain)
+
+
+async def stop_logging():
+    def finish():
+        result = producer_handler.drain()
+        if not result['stopped']:
+            print('日志输出关闭超时，未完成条数：', result['pending'])
+        return result
+    return await asyncio.to_thread(finish)
 
 structlog.configure(
     processors=[
@@ -71,18 +86,10 @@ structlog.configure(
 logger: structlog.stdlib.BoundLogger = structlog.get_logger()
 logging.getLogger('niceGUI').propagate = False
 
-# AI 库日志
-logging.getLogger('openai').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 
-logging.getLogger('google.generativeai').setLevel(logging.WARNING)
-logging.getLogger('google.api_core').setLevel(logging.WARNING)
-logging.getLogger('google.auth').setLevel(logging.WARNING)
 logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
-# 抑制 gRPC 和 Google C++ 底层库的日志
-os.environ['GRPC_VERBOSITY'] = 'ERROR'
-os.environ['GLOG_minloglevel'] = '2'
 
 def update_log_level_from_config() -> None:
     """

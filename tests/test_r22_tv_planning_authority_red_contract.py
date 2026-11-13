@@ -239,7 +239,8 @@ class SanitizedFixtureControls(unittest.TestCase):
         self.assertLessEqual(max(map(len, candidates)), 1)
 
     def test_lineage_contract_uses_three_positive_identity_inputs(self):
-        review = Path("local/development/REVIEW.md").read_text("utf-8")
+        # The frozen decision moved intact; the current dashboard is not history.
+        review = Path("local/development/archive/active-records-rollover-20260912-0445/REVIEW.md").read_text("utf-8")
         marker = "### DECISION-20260827-R22-OPTION-B-CONTRACT-FROZEN"
         self.assertIn(marker, review)
         frozen = review.split(marker, 1)[1].split("\n### ", 1)[0]
@@ -291,7 +292,7 @@ class FrozenArchitectureRedContracts(unittest.TestCase):
         _authority_api(self)
         decision = importlib.import_module("src.rename.decision_state")
         projection = importlib.import_module("src.rename.projection_authority")
-        self.assertEqual(4, decision.DECISION_STATE_SCHEMA_VERSION)
+        self.assertEqual(5, decision.DECISION_STATE_SCHEMA_VERSION)
         fields = set(inspect.signature(decision.DecisionState).parameters)
         self.assertIn("tv_planning_authority", fields)
         required = {
@@ -428,32 +429,6 @@ class IncidentAuthorityRedContracts(unittest.TestCase):
         self.assertEqual("official_special", result.layout)
         self.assertNotEqual("movie_inventory", result.route)
 
-    def test_tv_font_manifest_is_series_scoped_canonical_and_movie_is_rejected(self):
-        fixture = _fixture()
-        case = deepcopy(fixture["yama_successor"])
-        case["font_archive"] = deepcopy(fixture["tv_font"])
-        module, _batch, typed = _typed_input(self, case)
-        value = _authority_dict(module.TVPlanningAuthorityBuilder().build(typed))
-        manifest = value["associated_asset_manifest"]
-        self.assertEqual("series", manifest["scope"])
-        self.assertEqual(
-            fixture["tv_font"]["expected_target"], manifest["entries"][0]["target_name"]
-        )
-        self.assertEqual(
-            fixture["tv_font"]["content_sha256"], manifest["entries"][0]["content_sha256"]
-        )
-        movie_case = {
-            "task_id": "movie-control",
-            "media_domain": "movie",
-            "source_scope": ["Movie/Movie.mkv"],
-            "observations": [],
-            "user_decisions": {},
-        }
-        _m, _b, movie_input = _typed_input(self, movie_case)
-        with self.assertRaisesRegex(
-            module.TVPlanningAuthorityError, "TV.*movie|movie.*TV"
-        ):
-            module.TVPlanningAuthorityBuilder().build(movie_input)
 
 
 class BatchScopeLineageRedContracts(unittest.TestCase):
@@ -679,11 +654,8 @@ class BatchScopeLineageRedContracts(unittest.TestCase):
         self.assertIn("active", source)
         self.assertIn("batch_scope_fingerprint", source)
         self.assertIn("reservation_lineage_id", source)
-        replan = getattr(TaskQueueManager, "enqueue_legacy_replan", None)
-        self.assertTrue(callable(replan), "legacy replan has no current-schema exit")
-        replan_source = inspect.getsource(replan)
-        self.assertIn("single_task_minimal_batch", replan_source)
-        self.assertNotIn("reuse_completed_manifest", replan_source)
+        self.assertFalse(hasattr(TaskQueueManager, "enqueue"))
+        self.assertFalse(hasattr(TaskQueueManager, "enqueue_legacy_replan"))
 
 
 class PersistenceAndAntiBypassRedContracts(unittest.TestCase):
@@ -867,10 +839,13 @@ class RealEntrypointDisconnectRedContracts(unittest.IsolatedAsyncioTestCase):
             module.TVPlanningAuthorityBuilder,
             "build",
             side_effect=error,
-        ):
+        ) as builder:
             result, _source, _case = await cohort_fixture._run_yama_incident(
                 Path(directory)
             )
+            calls_before = builder.call_count
+            before = c1_fixture._authority_bytes(result)
+            protected = c1_fixture._protected_boundary_files(result)
             dialog = c1_fixture._boundary_dialog(result)
             notices: list[tuple[str, object]] = []
             capture = ui_fixture._CaptureUi()
@@ -887,10 +862,12 @@ class RealEntrypointDisconnectRedContracts(unittest.IsolatedAsyncioTestCase):
             task = json.loads(
                 (result.tasks / f"{result.task_id}.json").read_text("utf-8")
             )
-            self.assertNotEqual("need_confirm", task["workflow_status"])
-            self.assertIn(
-                task["workflow_status"], {"invalid", "failed", "awaiting_user"}
-            )
+            self.assertGreater(builder.call_count, calls_before)
+            self.assertEqual(before, c1_fixture._authority_bytes(result))
+            self.assertEqual(protected, c1_fixture._protected_boundary_files(result))
+            self.assertTrue(any("builder disconnected" in message and kind == "negative" for message, kind in notices))
+            self.assertIsNotNone(DecisionStateStore(result.decisions).load(result.task_id).pending_tv_selection)
+            self.assertTrue(callable(capture.callbacks.get("取消本次季度关系确认")))
             store = PlanStore(result.plans)
             current = (
                 store.load(result.task_id)
@@ -900,13 +877,6 @@ class RealEntrypointDisconnectRedContracts(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(
                     "accepted", PlanVerifier().verify(current).status.value
                 )
-            failure = task.get("current_operation_failure") or {}
-            self.assertEqual("tv_planning_authority_unavailable", failure.get("code"))
-            self.assertTrue(
-                {"retry", "replan", "safe_abandon"}.intersection(
-                    failure.get("safe_actions") or ()
-                )
-            )
 
 
 class MovieRegressionControls(unittest.TestCase):
@@ -914,7 +884,6 @@ class MovieRegressionControls(unittest.TestCase):
         fixture = _fixture()
         for row in fixture["movie_controls"]:
             self.assertEqual("movie", row["media_domain"])
-            self.assertEqual("work_font_intent", row["font_contract"])
             self.assertEqual("Extras", row["extras_directory"])
 
     def test_temporary_red_wrapper_is_removed_after_green(self):

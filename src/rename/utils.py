@@ -2,32 +2,20 @@ from pathlib import Path
 import unicodedata
 
 
-IGNORE_DIR = ['cd', 'scan']
-IGNORE_SUFFIX = ['.rar', '.zip', '.7z', '.webp', '.jpg', '.png']
-IGNORED_ASSET_DIRECTORY_NAMES = frozenset({
+AUXILIARY_DIRECTORY_NAMES = frozenset({
     'cd', 'cds', 'scan', 'scans', 'bonus cds', 'bd scans',
 })
 
 
-def is_ignored_asset_directory(path: Path | str) -> bool:
+def is_auxiliary_directory(path: Path | str) -> bool:
     """Match only explicit auxiliary directory names, never filename substrings."""
 
     name = unicodedata.normalize('NFKC', Path(path).name).casefold().strip()
-    return name in IGNORED_ASSET_DIRECTORY_NAMES
+    return name in AUXILIARY_DIRECTORY_NAMES
 
 
-def is_font_archive(path: Path | str) -> bool:
-    """Accept only a .7z whose final stem token is the bracketed ``[Fonts]``."""
 
-    candidate = Path(path)
-    if candidate.suffix.casefold() != '.7z':
-        return False
-    stem = unicodedata.normalize('NFKC', candidate.stem).casefold().rstrip()
-    token = '[fonts]'
-    if not stem.endswith(token):
-        return False
-    prefix = stem[:-len(token)]
-    return not prefix or not prefix[-1].isalnum()
+
 EXTRA_TAG = [
     'NCOP',
     'NCED',
@@ -78,6 +66,25 @@ VIDEO_SUFFIX = [
 ]
 
 JELLYFIN_EXTRAS_DIR = 'Extras'
+
+
+def canonical_extras_target(scope_root: Path, relative: Path | str, *, category: str | None = None) -> Path:
+    """One path projector for supplementary assets; never flatten source groups."""
+    from .canonical_naming import canonicalize_media_leaf
+    relative = Path(relative)
+    if relative.anchor or relative.drive or not relative.parts or any(p in {'.', '..'} for p in relative.parts):
+        raise ValueError('附加内容路径必须是安全的相对路径')
+    parts = list(relative.parts)
+    while parts and parts[0].casefold() in {'extra', 'extras'}:
+        parts.pop(0)
+    if not parts:
+        raise ValueError('附加内容缺少文件名')
+    root = Path(scope_root) / JELLYFIN_EXTRAS_DIR
+    if category is not None:
+        if Path(category).name != category or category in {'.', '..'}:
+            raise ValueError('附加内容分类无效')
+        root /= canonicalize_media_leaf(category)
+    return root.joinpath(*(canonicalize_media_leaf(p) for p in parts))
 
 
 def jellyfin_season_dir(season: int) -> str:

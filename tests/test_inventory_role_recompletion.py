@@ -1,3 +1,9 @@
+"""Component completion/role tests with real temporary source admission.
+
+The supplied work is a movie identity; choosing TV presentation must not turn
+it into a series identity. These drafts are not production-entry evidence.
+"""
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +13,7 @@ from src.rename.movie_assets import inventory_movie_assets
 from src.rename.plan_review import PlanReviewService, entry_id
 from src.rename.plan_store import PlanStore
 from tests.test_isolated_sample_acceptance import routing_snapshot_for
-from tests.projection_test_support import save_plan_fixture
+from tests.projection_test_support import save_plan_fixture, task_source_scope_fixture
 
 
 class InventoryRoleRecompletionTests(unittest.TestCase):
@@ -31,6 +37,25 @@ class InventoryRoleRecompletionTests(unittest.TestCase):
         }
         return build_inventory_review_draft(task, dry_run=False)
 
+    def test_component_observation_uses_real_admission_and_preserves_task_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = PlanStore(root / "plans")
+            draft = self._draft(root)
+            observation = task_source_scope_fixture(store, draft)
+            self.assertEqual(3, len(observation.to_dict()["source_identities"]))
+            self.assertNotIn("font_contribution", draft.metadata)
+            task_path = root / "task" / f"{draft.task_id}.json"
+            task = json.loads(task_path.read_text("utf-8"))
+            original_scope = task.pop("task_source_scope")
+            task["fixture_sentinel"] = "caller-owned-field"
+            task_path.write_text(json.dumps(task), encoding="utf-8")
+            repeated = task_source_scope_fixture(store, draft)
+            restored = json.loads(task_path.read_text("utf-8"))
+            self.assertEqual(observation.to_dict(), repeated.to_dict())
+            self.assertEqual(original_scope, restored["task_source_scope"])
+            self.assertEqual("caller-owned-field", restored["fixture_sentinel"])
+
     def test_recompletion_uses_origin_group_and_accumulates_roles(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -38,6 +63,9 @@ class InventoryRoleRecompletionTests(unittest.TestCase):
             service = PlanReviewService(store, root / "reviews", root / "catalog")
             draft = self._draft(root)
             draft = save_plan_fixture(store, draft)
+            task = json.loads((root / "task" / f"{draft.task_id}.json").read_text("utf-8"))
+            self.assertEqual(draft.task_id, task["task_source_scope"]["task_id"])
+            self.assertEqual(3, len(task["task_source_scope"]["source_identities"]))
             # Deliberately complete a TV plan from the movie placeholder group:
             # this is the lineage transition that previously raised an error.
             completed = service.complete_inventory_draft(
@@ -51,6 +79,8 @@ class InventoryRoleRecompletionTests(unittest.TestCase):
                 work_domain="animation",
             )
             self.assertEqual("tv-episodes", completed.presentation_groups[0].group_id)
+            self.assertEqual("movie", completed.work_identity.primary_provider.entity_type)
+            self.assertEqual("work", completed.metadata["catalog_binding_snapshot"]["backend"])
             first = next(entry for entry in completed.entries
                          if entry.source_path.name == "Collaboration Movie.mkv")
             second = next(entry for entry in completed.entries

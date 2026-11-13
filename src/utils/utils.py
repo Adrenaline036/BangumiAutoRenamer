@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from .path import TASK_PATH, RECORD_PATH
-from ..rename.file_lock import FileLockBusyError, advisory_file_lock
+from ..rename.file_lock import FileLockBusyError
+from ..rename.review_operation import normalize_task_review_authority
 
 
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -50,27 +51,30 @@ def get_record(uuid: str) -> Optional[dict]:
         return None
 
 
-def custom_sort(key):
-    if key == 'is_anime':
-        return (0, key)
-    elif key == 'is_movie':
-        return (1, key)
-    else:
-        return (2, key)
+def read_task_file(path: Path):
+    """只把真实缺失当作空记录；原子替换造成的共享冲突短暂重读。"""
+    for attempt in range(3):
+        try:
+            with path.open('r', encoding='utf-8') as stream:
+                data = json.load(stream)
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(.005)
+        else:
+            if not isinstance(data, dict):
+                raise ValueError('任务记录不是有效对象')
+            return data
 
 
 def get_task(uuid: str) -> dict:
-    path = safe_task_path(TASK_PATH, uuid)
-    if path.exists():
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            if 'is_movie' not in data:
-                data['is_movie'] = None
-            sorted_keys = sorted(data.keys(), key=custom_sort)
-            sorted_dict = {key: data[key] for key in sorted_keys}
-            return sorted_dict
-    else:
+    data = read_task_file(safe_task_path(TASK_PATH, uuid))
+    if data is None:
         return {}
+    data.setdefault('is_movie', None)
+    return dict(sorted(data.items(), key=lambda row: ({'is_anime': 0, 'is_movie': 1}.get(row[0], 2), row[0])))
 
 
 def write_task(task_id: str, data: dict) -> None:
@@ -87,20 +91,17 @@ def mutate_task(
 
 
 def read_task_at(root: Path, task_id: str) -> dict:
-    path = safe_task_path(Path(root), task_id)
-    if not path.exists():
-        return {}
-    try:
-        value = json.loads(path.read_text("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
+    from ..rename.recognition_reset import require_ready
+    require_ready(Path(root).parent, task_id)
+    return read_task_file(safe_task_path(Path(root), task_id)) or {}
 
 
 def task_record_snapshot_at(
     root: Path, task_id: str
 ) -> tuple[Optional[bytes], dict, str]:
     """Return exact bytes, parsed payload and a CAS fingerprint under the lock."""
+    from ..rename.recognition_reset import require_ready
+    require_ready(Path(root).parent, task_id)
 
     root = Path(root)
     with task_record_lock(root, task_id):
@@ -145,6 +146,43 @@ def task_record_serialized_sha256(data: dict) -> str:
     return hashlib.sha256(_serialize_task_record(data)).hexdigest()
 
 
+class TaskAcceptanceUncertain(RuntimeError):
+    """The sink may own the job: retain its published Task, never blind retry."""
+
+
+def publish_task_and_accept_at(root: Path, task_id: str, *, previous: bytes,
+                               data: dict, accept: Callable[[], None],
+                               before_publish: Callable[[], None]) -> None:
+    """Hold the real record lock across exact CAS, publication and acceptance.
+
+    All other authorities must already be locked by the caller. A failed
+    atomic replacement or sink can restore only this call's exact postimage;
+    an external replacement/removal is never overwritten or resurrected.
+    """
+    root = Path(root)
+    with task_record_lock(root, task_id):
+        path = safe_task_path(root, task_id)
+        current = path.read_bytes() if path.exists() else None
+        if current != previous:
+            raise RuntimeError('任务记录已变化，请刷新后重试')
+        postimage = _serialize_task_record(data)
+        before_publish()
+        try:
+            _atomic_replace_task_bytes(path, postimage)
+            accept()
+        except TaskAcceptanceUncertain:
+            if path.exists() and path.read_bytes() == postimage:
+                _atomic_replace_task_bytes(path, _serialize_task_record({**data,
+                    'queue_admission_uncertain': True, 'workflow_status': 'need_confirm',
+                    'error': '入队结果不确定，已隔离作业并暂停自动重试'}))
+            raise
+        except BaseException:
+            current = path.read_bytes() if path.exists() else None
+            if current == postimage:
+                _atomic_replace_task_bytes(path, previous)
+            raise
+
+
 def restore_task_record_at_if_sha256(
     root: Path,
     task_id: str,
@@ -165,17 +203,25 @@ def restore_task_record_at_if_sha256(
             raise RuntimeError("任务记录已变化，拒绝覆盖式事务恢复")
         if previous is None:
             path.unlink(missing_ok=True)
+            from .task_changes import mark_changed
+            mark_changed()
         else:
             _atomic_replace_task_bytes(path, previous)
 
 
-@contextmanager
-def task_record_lock(root: Path, task_id: str) -> Iterator[None]:
+def task_record_resource(root: Path, task_id: str):
+    from ..rename.file_lock import LockResource
     root = Path(root)
     lock_path = root / f".{safe_task_path(root, task_id).name}.lock"
+    return LockResource(None, lock_path, f'task_record:{task_id}')
+
+
+@contextmanager
+def task_record_lock(root: Path, task_id: str) -> Iterator[None]:
+    from ..rename.file_lock import resource_guard
     try:
-        with advisory_file_lock(
-            lock_path,
+        with resource_guard(
+            task_record_resource(root, task_id),
             owner={"kind": "task_record", "task_id": task_id},
         ):
             yield
@@ -189,9 +235,7 @@ def write_task_at(root: Path, task_id: str, data: dict) -> None:
     root = Path(root)
     with task_record_lock(root, task_id):
         previous = read_task_at(root, task_id)
-        payload = dict(data)
-        if "selection_operation" not in payload and "selection_operation" in previous:
-            payload["selection_operation"] = previous["selection_operation"]
+        payload = normalize_task_review_authority(data, previous)
         _atomic_write_task_at(root, task_id, payload)
 
 
@@ -239,11 +283,26 @@ def restore_task_record_at(
         path = safe_task_path(root, task_id)
         if previous is None:
             path.unlink(missing_ok=True)
+            from .task_changes import mark_changed
+            mark_changed()
             return
         _atomic_replace_task_bytes(path, previous)
 
 
+def restore_task_record_if_unchanged_at(root: Path, task_id: str,
+                                      expected: dict, previous: bytes) -> bool:
+    """Undo only this admission, retaining exact bytes and any later writer."""
+    root = Path(root)
+    with task_record_lock(root, task_id):
+        if read_task_at(root, task_id) != expected:
+            return False
+        _atomic_replace_task_bytes(safe_task_path(root, task_id), previous)
+        return True
+
+
 def _atomic_write_task_at(root: Path, task_id: str, data: dict) -> None:
+    from ..rename.recognition_reset import require_ready
+    require_ready(Path(root).parent, task_id)
     if data.get("uuid") != task_id:
         raise ValueError("任务记录 UUID 与目标文件名不一致")
     path = safe_task_path(Path(root), task_id)
@@ -268,6 +327,8 @@ def _atomic_replace_task_bytes(path: Path, serialized: bytes) -> None:
             f.flush()
             os.fsync(f.fileno())
         _replace_task_with_retry(temporary, path)
+        from .task_changes import mark_changed
+        mark_changed()
     finally:
         temporary.unlink(missing_ok=True)
 

@@ -18,6 +18,7 @@ from typing import Iterable, Mapping, Optional, Tuple
 
 from .decision_state import DecisionStateStore
 from .plan_store import PlanStore, PlanStoreError
+from .source_partition import SourcePartitionError, SourcePartitionStore
 from .projection_authority import (
     RecognitionDecisionInput,
     TaskTerminalMutation,
@@ -50,26 +51,14 @@ from .rename_plan import (
 from ..utils.path import WORK_CATALOG_PATH
 from .work_catalog import WorkCatalog, WorkCatalogError
 from .work_intent import (
-    WorkIntentError,
-    WorkIntentStore,
     derive_work_intent_key,
-    make_content_key,
-    WORK_FONT_CONDITIONAL_ACTION,
 )
-from .utils import EXTRA_TAG, JELLYFIN_EXTRAS_DIR, is_font_archive
-from .episode_inference import (
-    EpisodeInferenceError,
-    build_episode_hints,
-    build_secondary_sequence_hints,
-    build_semantic_context,
-    normalize_target_stem,
-)
+from .utils import EXTRA_TAG, canonical_extras_target, jellyfin_season_dir
 from .media_classifier import (
     LocalRole,
     MediaClassification,
     MediaPreclassification,
     PreclassificationKind,
-    classify_media,
     preclassify_media,
 )
 from .subtitle_labels import DimensionResolution
@@ -86,12 +75,8 @@ from .presentation import (
     provider_identity_from_metadata,
 )
 from .rename_plan import build_default_version_descriptor
-from .asset_collision import AssetCollisionError, build_reuse_resolution, fingerprint_file
-from .font_archive_contract import (
-    FontArchiveContractError,
-    canonical_font_archive_target,
-    is_supported_font_archive,
-)
+from .asset_collision import AssetCollisionError, build_reuse_resolution
+
 from .canonical_naming import (
     CanonicalNamingError,
     build_canonical_work_root,
@@ -105,7 +90,7 @@ from .series_catalog import SeriesCatalog, SeriesCatalogError
 
 REVIEW_SCHEMA_VERSION = 1
 _SEASON_SOURCES = frozenset({
-    "unset", "inferred_path", "provider", "explicit_user",
+    "unset", "inferred_path", "provider", "provider_crosswalk", "explicit_user",
     "legacy_placeholder", "legacy_explicit",
 })
 
@@ -118,6 +103,27 @@ class ReviewStatus(str, Enum):
 
 class PlanReviewError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ApprovalTaskContext:
+    """The exact visible task/Decision state captured before queueing approval."""
+    decision_revision: int
+    decision_fingerprint: str
+    workflow_status: Optional[str]
+    recovery_disposition: Optional[str]
+
+    def validate(self, task, state, fingerprint):
+        from .execution_recovery import requires_execution_reapproval
+        if (not task or state is None or state.revision != self.decision_revision
+                or DecisionStateStore.fingerprint(state) != self.decision_fingerprint
+                or task.get('workflow_status') != self.workflow_status
+                or task.get('execution_recovery_disposition') != self.recovery_disposition
+                or self.workflow_status in {'queued', 'executing', 'completed', 'retired'}
+                or (self.recovery_disposition == 'reapproval_required' and (
+                    not requires_execution_reapproval(task)
+                    or task.get('execution_requested_fingerprint') != fingerprint))):
+            raise PlanReviewError('任务状态或整理版本已变化，请刷新后重新审核')
 
 
 def _season_decision_from_metadata(
@@ -287,6 +293,97 @@ def entry_id(entry: PlanEntry) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
 
+
+
+def provider_special_entry_closure(plan: RenamePlan, selected_entry_id: str) -> tuple[tuple[int, PlanEntry], ...]:
+    """Compatibility entrypoint delegating to the canonical typed bundle."""
+    from . import special_decision_projection
+    try:
+        return special_decision_projection.video_bundle_closure(plan, selected_entry_id)
+    except special_decision_projection.SpecialDecisionProjectionError as exc:
+        raise PlanReviewError(str(exc)) from exc
+
+
+def apply_subtitle_rule_entries(plan, rule, *, associated_video_source_path=None):
+    """One pure rule application for public edits and canonical verification."""
+    parsed_scope, outcome, reason = rule.scope, rule.outcome, rule.reason
+    impacted = [index for index, entry in enumerate(plan.entries)
+        if entry.subtitle is not None and (
+            entry_id(entry) == rule.selected_entry_id if parsed_scope == SubtitleOverrideScope.FILE
+            else _subtitle_matcher(entry.subtitle) == rule.matcher)]
+    if not impacted or (parsed_scope == SubtitleOverrideScope.FILE and len(impacted) != 1):
+        raise PlanReviewError('字幕规则没有唯一选中来源或匹配材料')
+    entries = list(plan.entries)
+    for index in impacted:
+        current = entries[index]
+        current_contract = current.subtitle
+        assert current_contract is not None
+        selected_video = (
+            associated_video_source_path or current_contract.associated_video_source_path
+            if parsed_scope == SubtitleOverrideScope.FILE
+            else current_contract.associated_video_source_path
+        )
+        if selected_video is None:
+            raise PlanReviewError("未关联字幕必须先选择一个视频源文件")
+        associated_source = Path(selected_video)
+        videos = [
+            entry for entry in plan.entries
+            if entry.media_kind == "video"
+            and os.path.normpath(str(entry.source_path)).casefold()
+            == os.path.normpath(str(associated_source)).casefold()
+        ]
+        if len(videos) != 1:
+            raise PlanReviewError("字幕关联的视频条目不存在或不唯一")
+
+        titles = _titles_for_contract(
+            outcome.track_title_tokens,
+            current_contract.unknown_tokens,
+            outcome.unknown_dispositions,
+        )
+        revised_contract = replace(
+            current_contract,
+            associated_video_source_path=associated_source,
+            primary_language=outcome.primary_language,
+            script=outcome.script,
+            region_hint=outcome.region_hint,
+            additional_languages=outcome.additional_languages,
+            track_title_tokens=titles,
+            flags=outcome.flags,
+            unknown_dispositions=_dispositions_for_contract(
+                current_contract.unknown_tokens, outcome.unknown_dispositions
+            ),
+            association_state=DimensionResolution.RESOLVED,
+            parse_state=DimensionResolution.RESOLVED,
+            decision_source=f"manual_{parsed_scope.value}",
+            manual_reason=str(reason).strip(),
+            reason_codes=current_contract.reason_codes + ("SUBTITLE_MANUAL_RULE",),
+            applied_rule_id=rule.rule_id,
+            applied_rule_fingerprint=rule.rule_fingerprint,
+            applied_rule_scope=rule.scope.value,
+            applied_rule_engine_version=rule.engine_version,
+            inherited_edit_fingerprint='',
+        )
+        try:
+            target = format_subtitle_target_fields(
+                target_video=videos[0].target_path,
+                source_subtitle=current.source_path,
+                primary_language=revised_contract.primary_language or "",
+                script=revised_contract.script,
+                track_title_tokens=revised_contract.track_title_tokens,
+                flags=revised_contract.flags,
+            )
+        except ValueError as exc:
+            raise PlanReviewError(f"字幕目标无法格式化：{exc}") from exc
+        entries[index] = replace(
+            current,
+            target_path=target,
+            subtitle=revised_contract,
+            requires_review=True,
+            evidence=current.evidence + (str(reason).strip(),),
+        )
+    return tuple(entries)
+
+
 class PlanReviewService:
     def __init__(
         self,
@@ -295,8 +392,12 @@ class PlanReviewService:
         catalog_root: Path = WORK_CATALOG_PATH,
         decision_state_root: Optional[Path] = None,
         task_root: Optional[Path] = None,
+        provider_link_catalog_root: Optional[Path] = None,
+        record_root: Optional[Path] = None,
+        root_snapshot_source=None,
     ):
         self.plan_store = plan_store
+        self.root_snapshot_source = root_snapshot_source
         self.review_root = Path(review_root)
         self._path_helper = PlanStore(self.review_root)
         self.work_catalog = WorkCatalog(catalog_root)
@@ -304,9 +405,121 @@ class PlanReviewService:
             decision_state_root or (plan_store.root.parent / "decision_state")
         )
         self.task_root = Path(task_root or (plan_store.root.parent / "task"))
+        self.record_root = Path(record_root or plan_store.root.parent / 'record')
         self.series_catalog = SeriesCatalog(
             Path(catalog_root).parent / "series_catalog"
         )
+        from .provider_link_catalog import ProviderLinkCatalog
+        self.provider_link_catalog = ProviderLinkCatalog(
+            provider_link_catalog_root or Path(catalog_root).parent / "provider_link_catalog")
+        from .completed_rebuild import CompletedRebuildService
+        self.rebuild_service = CompletedRebuildService.from_execution_context(
+            plan_store=self.plan_store, task_root=self.task_root,
+            decision_root=self.decision_state_store.root, record_root=self.record_root,
+            catalog_root=self.work_catalog.root, series_catalog_root=self.series_catalog.root,
+            provider_link_catalog_root=self.provider_link_catalog.root)
+        self.work_catalog.rebuild_context = self.rebuild_service.work_context()
+
+    def prepare_initial_movie_completion(self, task_id, expected_fingerprint, *, groups, excluded_sources=(),
+                                         reason, replace_version_ref=None):
+        from .initial_movie_completion import prepare
+        return prepare(self, task_id, expected_fingerprint, groups=groups, excluded_sources=excluded_sources,
+            reason=reason, replace_version_ref=replace_version_ref)
+
+    def commit_initial_movie_completion(self, intent):
+        from .initial_movie_completion import commit
+        return commit(self, intent)
+
+    def prepare_movie_work_correction(self, task_id, expected_fingerprint, *, expected_revision, candidate):
+        from .movie_work_correction import prepare
+        return prepare(self, task_id, expected_fingerprint, expected_revision=expected_revision, candidate=candidate)
+
+    def prepare_content_audio_association(self, task_id, expected_fingerprint, *, source_path, video_source_path, reason):
+        from .content_correction import prepare_audio
+        return prepare_audio(self, task_id, expected_fingerprint, source_path=source_path,
+                             video_source_path=video_source_path, reason=reason)
+
+    def commit_content_audio_association(self, intent):
+        from .content_correction import commit
+        return commit(self, intent)
+
+    def prepare_tv_boundary_completion(self, task_id, expected_fingerprint, *, review_command):
+        from .tv_boundary_completion import prepare
+        return prepare(self, task_id, expected_fingerprint, review_command=review_command)
+
+    def commit_tv_boundary_completion(self, intent):
+        from .tv_boundary_completion import commit
+        return commit(self, intent)
+
+    def cancel_tv_boundary_completion(self, task_id, expected_fingerprint, *, request_id):
+        from .pending_tv_selection import cancel
+        return cancel(self, task_id, expected_fingerprint, request_id=request_id)
+
+    def observe_work_correction(self, task_id, expected_fingerprint, *, expected_revision, candidate):
+        from .work_correction import observe
+        return observe(self, task_id, expected_fingerprint, expected_revision=expected_revision, candidate=candidate)
+
+    def prepare_work_correction(self, observation, *, season_number, reason):
+        from .work_correction import prepare
+        return prepare(self, observation, season_number=season_number, reason=reason)
+
+    def commit_work_correction(self, intent):
+        from .work_correction import commit
+        return commit(self, intent)
+
+    def revise_tv_content(self, task_id, expected_fingerprint, *, expected_revision, mode, edit, affiliation_choice=None):
+        from .initial_tv_completion import prepare, commit
+        from .tv_completion_observations import FrozenTVResolution, TVSeasonObservation
+        from .content_associations import encode
+        from .series_registration import _plain
+        from .rename_plan import WorkIdentity, ProviderIdentity
+        from .projection_authority import RecognitionDecisionInput
+        from .content_choice import _load
+        current, state = _load(self, task_id, expected_fingerprint)
+        if type(expected_revision) is not int or state.revision != expected_revision or mode not in {'role', 'episode', 'special', 'special_refresh', 'season', 'content', 'affiliation', 'range', 'versions'}:
+            raise PlanReviewError('TV确认页面已变化，请刷新后重新选择')
+        if 'tv_completion_resolution' not in current.metadata:
+            raise PlanReviewError('旧TV计划尚无完整冻结观察，请重新生成')
+        raw = current.metadata['tv_completion_resolution']
+        resolution = FrozenTVResolution(encode(_plain(raw))).resolution() if raw is not None else None
+        recognition = RecognitionDecisionInput(task_id, WorkIdentity.from_dict(state.confirmed_work),
+            tuple(ProviderIdentity.from_dict(row) for row in state.linked_provider_identities),
+            (state.season_binding or {}).get('season_number'), (state.season_binding or {}).get('decision_source') or 'provider_crosswalk',
+            'tv_episodes', DecisionStateStore.fingerprint(state))
+        special = _plain(current.metadata.get('tv_completion_special'))
+        if mode == 'special_refresh':
+            if edit and set(edit) != {'counterpart_url'}:
+                raise PlanReviewError('获取特别篇资料只能确认另一侧作品链接')
+            from .provider_special_evidence import special_provider_ids, ProviderSpecialObservation, validate_special_identity
+            from .special_crosswalk import observe
+            primary = current.work_identity.primary_provider
+            provider = primary.to_dict()
+            known = [p.to_dict() for p in current.linked_provider_identities
+                     if (p.namespace, p.entity_type) in {('bangumi', 'subject'), ('tmdb', 'tv')} and p.status == 'confirmed']
+            known.extend(dict(namespace='tmdb', entity_type='tv', provider_id=i)
+                         for i in special_provider_ids(current, resolution))
+            if edit:
+                from .provider_search import parse_provider_item_url
+                from .special_catalog import identity
+                url = edit['counterpart_url']
+                if not isinstance(url, str) or not url.strip():
+                    raise PlanReviewError('请填写另一侧作品的公开条目链接')
+                namespace, entity_type, provider_id = parse_provider_item_url(url)
+                linked = identity(dict(namespace=namespace, entity_type=entity_type, provider_id=provider_id))
+                if namespace == provider['namespace']:
+                    raise PlanReviewError('请填写另一侧数据库的作品链接；当前作品保持不变')
+                known.append(linked)
+            previous = _plain(current.metadata.get('provider_special_observation'))
+            if previous is not None:
+                validate_special_identity(current, ProviderSpecialObservation.from_mapping(previous), resolution)
+            observed = observe(provider, current.metadata.get('season_number'), providers=known, previous=previous, discover_counterpart=True)
+            special = observed.to_dict()
+            edit = {}
+        intent = prepare(self, recognition, resolution=resolution,
+            seasons=TVSeasonObservation.from_mapping(_plain(current.metadata.get('tv_completion_seasons'))),
+            special=special, mode=mode, edit=edit, affiliation_choice=affiliation_choice)
+        _, projected = commit(self, intent, task_terminal=self._revision_task_terminal(task_id))
+        return self._record_revision(projected)
 
     def load(self, task_id: str) -> PlanReviewDecision:
         path = self._path_helper.path_for(task_id)
@@ -343,13 +556,102 @@ class PlanReviewService:
         task_id: str,
         expected_fingerprint: str,
         selected_entry_ids: Iterable[str],
+        *, task_context: Optional[ApprovalTaskContext] = None,
+    ) -> PlanReviewDecision:
+        from .file_lock import task_operation_lock, FileLockBusyError
+        from .projection_authority import ProjectionAuthorityError
+        try:
+            with task_operation_lock(self.task_root, task_id,
+                    operation='plan_approval', fingerprint=expected_fingerprint):
+                return self._approve_entries_with_operation_lock(
+                    task_id, expected_fingerprint, selected_entry_ids, task_context=task_context)
+        except FileLockBusyError as exc:
+            raise PlanReviewError('任务正在执行、批准或安全结束，请稍后重试') from exc
+        except ProjectionAuthorityError as exc:
+            raise PlanReviewError('当前计划缺少有效核对凭据或凭据已失效，只读查看，不能批准。请安全结束此任务后重新添加来源；源文件不会删除。') from exc
+
+    def _approve_entries_with_operation_lock(self, task_id, expected_fingerprint, selected_entry_ids, *, task_context=None):
+        partition_store = SourcePartitionStore(
+            self.plan_store.root.parent / "source_partition",
+            allowed_roots=(self.plan_store.root.parent,),
+        )
+        try:
+            with partition_store.task_lock(task_id):
+                if partition_store.pending_for_task(task_id):
+                    raise PlanReviewError(
+                        "source partition尚未完成，当前Plan不能批准"
+                    )
+                from .projection_authority import ProjectionCommitService
+                projection = ProjectionCommitService(self.decision_state_store, self.plan_store,
+                                                     task_root=self.task_root)
+                with projection._transaction_lock(task_id):
+                    return self._approve_entries_without_partition_guard(
+                        task_id, expected_fingerprint, selected_entry_ids, task_context=task_context)
+        except SourcePartitionError as exc:
+            raise PlanReviewError(str(exc)) from exc
+
+    def _approve_entries_without_partition_guard(
+        self,
+        task_id: str,
+        expected_fingerprint: str,
+        selected_entry_ids: Iterable[str],
+        *, task_context: Optional[ApprovalTaskContext] = None,
     ) -> PlanReviewDecision:
         plan = self._current_plan(task_id, expected_fingerprint)
+        from ..utils.utils import task_record_snapshot_at, replace_task_record_at_if_sha256
+        _raw, task, task_sha = task_record_snapshot_at(self.task_root, task_id)
+        if task_context is not None and type(task_context) is not ApprovalTaskContext:
+            raise PlanReviewError('批准缺少有效的任务上下文')
+        from .recovery_transaction import require_no_pending_detach
+        require_no_pending_detach(plan_store=self.plan_store, task_root=self.task_root,
+            decision_root=self.decision_state_store.root, task_id=task_id)
+        from .selection_gate import validate_selection_for_plan, require_not_retired
+        from ..utils.utils import read_task_at
+        try:
+            require_not_retired(task_id, self.plan_store.root, task_root=self.task_root,
+                                plan_fingerprint=expected_fingerprint)
+            validate_selection_for_plan(read_task_at(self.task_root, task_id))
+        except ValueError as exc:
+            raise PlanReviewError(str(exc)) from exc
+        from . import content_selection
+        content_state = self.decision_state_store.load_optional(task_id)
+        if task_context is not None:
+            task_context.validate(task, content_state, expected_fingerprint)
+        choice = content_selection.validate_plan_content(plan, content_state)
+        if choice is not None:
+            if content_state is None:
+                raise PlanReviewError('内容选择缺少当前Decision权威')
+            from .content_choice import validate_scope
+            validate_scope(self, plan, choice)
+            content_selection.validate_omission_manifest(choice, movie_selection=content_state.movie_version_selection)
         verification = PlanVerifier().verify(plan)
         if verification.issues:
             codes = ", ".join(issue.code for issue in verification.issues)
             raise PlanReviewError(f"Plan 结构无效，不能批准：{codes}")
+        try:
+            self.asset_actions().validate(plan, self.decision_state_store.load(task_id))
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise PlanReviewError(str(exc)) from exc
         valid_ids = {entry_id(entry) for entry in plan.entries}
+        if plan.metadata.get('completed_rebuild_observation') is not None:
+            from .completed_rebuild import CompletedRebuildService
+            try:
+                CompletedRebuildService.from_execution_context(plan_store=self.plan_store,
+                    task_root=self.task_root, decision_root=self.decision_state_store.root,
+                    record_root=self.record_root, catalog_root=self.work_catalog.root,
+                    series_catalog_root=self.series_catalog.root,
+                    provider_link_catalog_root=self.provider_link_catalog.root).validate_plan(plan)
+            except (ValueError, RuntimeError, OSError) as exc:
+                raise PlanReviewError(str(exc)) from exc
+        from . import series_registration
+        if series_registration.is_series_plan(plan):
+            try:
+                series_registration.validate_plan_series_registration(plan, self.decision_state_store.load(plan.task_id))
+                series_registration.validate_current_catalog(plan, self.series_catalog, self.provider_link_catalog)
+                series_registration.validate_current_task_set(self.plan_store, self.decision_state_store, self.task_root,
+                    expected_plan=plan, record_root=self.record_root, series_catalog=self.series_catalog, provider_catalog=self.provider_link_catalog)
+            except (ValueError, OSError, RuntimeError) as exc:
+                raise PlanReviewError(str(exc)) from exc
         requested = set(selected_entry_ids)
         unknown = requested - valid_ids
         if unknown:
@@ -367,7 +669,29 @@ class PlanReviewService:
             approved_entry_ids=tuple(sorted(approved)),
             status=status,
         )
+        # Projection writers use the same lock. Still re-read at the write
+        # boundary, so an external record edit cannot bless a stale decision.
+        self._current_plan(task_id, expected_fingerprint)
+        latest_state = self.decision_state_store.load_optional(task_id)
+        if (latest_state != content_state or (content_state is not None and (
+                plan.metadata.get('decision_state_fingerprint') != DecisionStateStore.fingerprint(content_state)
+                or plan.metadata.get('decision_state_revision') != content_state.revision))):
+            raise PlanReviewError('批准期间作品决定已变化，请重新打开计划')
+        _raw, latest_task, latest_sha = task_record_snapshot_at(self.task_root, task_id)
+        if latest_sha != task_sha:
+            raise PlanReviewError('批准期间任务状态已变化，请重新打开计划')
         self._save(updated)
+        if task_context is not None and status == ReviewStatus.APPROVED:
+            task_context.validate(latest_task, latest_state, expected_fingerprint)
+            latest_task['workflow_status'] = 'approved'
+            if task_context.recovery_disposition == 'reapproval_required':
+                latest_task.update(execution_reapproval_fingerprint=expected_fingerprint,
+                    execution_recovery_disposition=None, execution_requires_manual_check=False)
+            try:
+                replace_task_record_at_if_sha256(self.task_root, task_id,
+                    expected_sha256=task_sha, data=latest_task)
+            except (ValueError, RuntimeError, OSError) as exc:
+                raise PlanReviewError('批准记录已保存，但任务状态已变化；请重新打开核对，不会自动执行。') from exc
         return updated
 
     def override_target(
@@ -584,6 +908,7 @@ class PlanReviewService:
         ) != (identity.namespace, identity.entity_type, identity.provider_id):
             authority_linked.append(old_primary)
         assert revised.work_identity is not None
+        revised, binding_transform = self._prepare_manual_presentation_binding(revised)
         return self._persist_recognition_revision(
             revised,
             RecognitionDecisionInput(
@@ -591,7 +916,44 @@ class PlanReviewService:
                 work_identity=revised.work_identity,
                 linked_provider_identities=tuple(dict.fromkeys(authority_linked)),
             ),
+            state_transform=binding_transform,
         )
+
+    def _prepare_manual_presentation_binding(self, revised, *, preserve_binding=False):
+        """Explicit manual layout producer using the receipted inventory root.
+
+        This does not resolve a season or rename media. Mixed presentations keep
+        their explicitly chosen inventory work directory and one work binding.
+        """
+        if preserve_binding:
+            current=self.decision_state_store.load(revised.task_id)
+            if (current.confirmed_work == (revised.work_identity.to_dict() if revised.work_identity else {})
+                    and (current.catalog_link_intent is not None or current.series_binding is not None)):
+                return revised,None
+        has_tv=any(g.kind=='tv_episodes' for g in revised.presentation_groups)
+        if not has_tv:
+            if revised.work_identity is not None and revised.work_identity.status=='confirmed':
+                key=derive_work_intent_key(primary_provider=revised.work_identity.primary_provider,
+                    group_kind='movie_continuous')
+                revised=replace(revised,metadata={**revised.metadata,'proposed_work_key':key})
+                return revised,lambda state:replace(state,
+                    tv_planning_authority=None,series_binding=None,season_binding=None,
+                    layout_mode='movie_versions',catalog_link_intent={'work_key':key,'catalog_revision':0})
+            return revised, None
+        work=revised.work_identity
+        if work is None or work.status!='confirmed':
+            return revised, None
+        root=Path(str(revised.metadata.get('canonical_work_root') or ''))
+        policy=revised.execution_policy
+        if policy is None or not root.is_absolute() or not root.is_relative_to(policy.target_root) or '..' in root.parts:
+            raise PlanReviewError('人工呈现缺少已确认的绝对作品目录')
+        key=derive_work_intent_key(primary_provider=work.primary_provider,group_kind='tv_episodes')
+        revised=replace(revised,metadata={**revised.metadata,'canonical_work_root':str(root),'proposed_work_key':key})
+        def transform(state):
+            return replace(state,
+                catalog_link_intent=(None if state.series_binding is not None else
+                    {'work_key':key,'catalog_revision':0}))
+        return revised,transform
 
     def revise_presentation_group_kind(
         self,
@@ -646,7 +1008,77 @@ class PlanReviewService:
             revision_action=f"revise_presentation_group_kind:{group_id}:{kind}",
             revision_reason=reason,
         )
-        return self._persist_revision(revised)
+        revised, transform=self._prepare_manual_presentation_binding(revised)
+        return self._persist_manual_presentation_revision(revised, transform)
+
+    def _persist_manual_presentation_revision(self, revised, transform=None):
+        """Manual asset decisions advance their frozen operation in one transaction."""
+        self._require_legacy_content_task(revised.task_id)
+        if transform is None:
+            revised, transform = self._prepare_manual_presentation_binding(revised, preserve_binding=True)
+        if transform is None:
+            return self._persist_revision(revised)
+        task_id = revised.task_id
+        state=self.decision_state_store.load(task_id)
+        candidate=transform(state)
+        from .decision_state import DecisionCommandService
+        _, projected=DecisionCommandService(self.decision_state_store,self.plan_store).update(
+            task_id,expected_revision=state.revision,
+            changes={'catalog_link_intent':candidate.catalog_link_intent,
+                'tv_planning_authority':candidate.tv_planning_authority,'series_binding':candidate.series_binding,
+                'season_binding':candidate.season_binding,'layout_mode':candidate.layout_mode},
+            planner=lambda _:revised,task_terminal=self._revision_task_terminal(task_id))
+        return self._record_revision(projected)
+
+    @staticmethod
+    def movie_selection_for_completion(plan):
+        from .movie_version_selection import from_plan
+        return from_plan(plan) if plan.metadata.get('movie_version_selection') is not None else None
+
+
+
+
+    def prepare_default_content_initialization(self, task_id, expected_fingerprint):
+        from .default_content import prepare
+        return prepare(self, task_id, expected_fingerprint)
+
+    def commit_default_content_initialization(self, preview):
+        from .default_content import commit
+        return commit(self, preview)
+
+    def prepare_content_change(self, task_id, expected_fingerprint, *, selected_entry_ids, action, reason):
+        from .content_choice import prepare_change
+        return prepare_change(self, task_id, expected_fingerprint,
+            selected_entry_ids=selected_entry_ids, action=action, reason=reason)
+
+    def commit_content_change(self, preview):
+        from .content_choice import commit
+        return commit(self, preview)
+
+    def revise_movie_versions(self, task_id, expected_fingerprint, *, groups, excluded_sources=(),
+                              replace_version_ref=None, preferred_source=None):
+        """One Decision transaction changes complete groups, labels and exclusion."""
+        return self.commit_movie_version_change(self.prepare_movie_version_change(
+            task_id, expected_fingerprint, groups=groups, excluded_sources=excluded_sources,
+            replace_version_ref=replace_version_ref, preferred_source=preferred_source))
+
+    def prepare_movie_version_change(self, task_id, expected_fingerprint, **kwargs):
+        from .movie_content import prepare
+        return prepare(self, task_id, expected_fingerprint, **kwargs)
+
+    def commit_movie_version_change(self, intent):
+        from .movie_content import commit
+        return commit(self, intent)
+
+    def _validate_movie_labels(self, plan):
+        from .movie_version_selection import from_plan, validate_catalog_labels
+        selection = from_plan(plan)
+        value = selection.to_dict()
+        key = value['work_key']
+        if not self.work_catalog._path(key).exists():
+            return
+        rows = self.work_catalog.load(key)['versions']
+        validate_catalog_labels(selection, rows)
 
     def complete_inventory_draft(
         self,
@@ -660,6 +1092,8 @@ class PlanReviewService:
         root_snapshot: Mapping[str, object],
         primary_video_source: Optional[Path] = None,
         primary_video_sources: Optional[Iterable[Path]] = None,
+        movie_version_groups=None,
+        excluded_movie_sources=(),
         confirmed_segment_sources: Optional[Iterable[Path]] = None,
         work_domain: Optional[str] = None,
         role_decisions: Optional[Mapping[Path, str]] = None,
@@ -668,6 +1102,7 @@ class PlanReviewService:
         series_key: Optional[str] = None,
         season_binding_id: Optional[str] = None,
         series_catalog_revision: int = 0,
+        series_registration_authority=None,
         persist_revision: bool = True,
         _source_plan: Optional[RenamePlan] = None,
         _revision_parent_fingerprint: Optional[str] = None,
@@ -682,6 +1117,13 @@ class PlanReviewService:
         """
 
         plan = _source_plan or self._current_plan(task_id, expected_fingerprint)
+        from .content_selection import require_legacy_writer
+        existing_content_state = self.decision_state_store.load_optional(task_id)
+        if existing_content_state is not None and existing_content_state.content_selection is not None:
+            raise PlanReviewError('新内容计划不能通过旧库存整体完成入口覆盖；请使用统一内容选择')
+        require_legacy_writer(plan)
+        if plan.metadata.get('work_affiliation') is not None or plan.metadata.get('pending_work_affiliation') is not None:
+            raise PlanReviewError('作品归属计划必须使用完整内容确认入口，不能退回旧库存完成')
         if plan.task_id != task_id:
             raise PlanReviewError("用途确认的来源计划不属于当前任务")
         if plan.metadata.get("mapping_source") != "inventory_review_draft":
@@ -749,6 +1191,30 @@ class PlanReviewService:
         except CanonicalNamingError as exc:
             raise PlanReviewError(str(exc)) from exc
         work = replace(work, title=naming_decision.display_title)
+        from . import series_registration
+        registration = series_registration_authority
+        if group_kind == "tv_episodes" and (series_key or work.primary_provider.entity_type == 'tv'):
+            if registration is None:
+                if work.primary_provider.namespace == 'tmdb' and work.primary_provider.entity_type == 'tv':
+                    manual = series_registration.manual_tv_binding(work, self.series_catalog, generated_work_root)
+                    registration = series_registration.SeriesRegistrationAuthority.from_mapping(manual['registration_authority'])
+                    series_key, series_catalog_revision = manual['series_key'], manual['catalog_revision']
+                else:
+                    current_state = self.decision_state_store.load(task_id)
+                    registration = series_registration.SeriesRegistrationAuthority.from_mapping(
+                        (current_state.series_binding or {}).get('registration_authority'))
+                    series_key = series_key or (current_state.series_binding or {}).get('series_key')
+                    series_catalog_revision = int((current_state.series_binding or {}).get('catalog_revision', 0))
+            if not isinstance(registration, series_registration.SeriesRegistrationAuthority):
+                raise PlanReviewError('剧集整理必须使用类型化系列登记权威')
+            registration = series_registration.SeriesRegistrationAuthority.from_mapping(registration.to_dict())
+            if registration.policy_version == series_registration.AFFILIATION_POLICY:
+                raise PlanReviewError('新版作品归属必须使用完整剧集确认入口')
+            provider = work.primary_provider
+            if (registration.series_key != series_key or provider.namespace != registration.namespace
+                or provider.provider_id not in dict(registration.season_membership)
+                or registration.namespace == 'bangumi' and dict(registration.season_membership)[provider.provider_id] != season_number):
+                raise PlanReviewError('当前作品季度与系列登记权威不一致')
         catalog_match = None
         series_match = None
         try:
@@ -757,13 +1223,16 @@ class PlanReviewService:
                 isinstance(requested_key, str)
                 and plan.metadata.get("catalog_link_decision") == "explicit_user"
             ):
-                catalog_match = self.work_catalog.get_match(requested_key)
+                raise PlanReviewError('旧字符串归属不能确认已有作品，请重新生成并使用完整作品归属预览')
             else:
                 catalog_match = self.work_catalog.find_exact(
                     work.primary_provider, group_kind=group_kind
                 )
             if catalog_match is not None and catalog_match.group_kind != group_kind:
                 raise PlanReviewError("既有作品登记的观看形式与当前整理方式不一致")
+            if catalog_match is not None:
+                from . import work_catalog
+                work_catalog.require_matching_work_domain(catalog_match.domain, work.domain)
         except WorkCatalogError as exc:
             raise PlanReviewError(str(exc)) from exc
         try:
@@ -772,7 +1241,7 @@ class PlanReviewService:
                     primary_provider=work.primary_provider,
                     group_kind=group_kind,
                 )
-                if group_kind == "movie_continuous"
+                if not series_key
                 else plan.metadata.get("proposed_work_key")
             )
         except (TypeError, ValueError) as exc:
@@ -782,17 +1251,10 @@ class PlanReviewService:
             if series_path.exists():
                 try:
                     series_match = self.series_catalog.load(str(series_key))
-                    provider_match = self.series_catalog.find_by_provider(
-                        work.primary_provider.to_dict()
-                    )
                 except SeriesCatalogError as exc:
                     raise PlanReviewError(str(exc)) from exc
-                if provider_match is None or (
-                    provider_match.series_key != series_match.series_key
-                ):
-                    raise PlanReviewError(
-                        "SeriesCatalog 与当前作品资料身份不一致，请重新匹配"
-                    )
+                series_registration.validate_series_catalog_snapshot(registration, self.series_catalog,
+                    int(series_catalog_revision), str(series_match.canonical_root), library_domain=work.domain)
                 if series_match.revision != int(series_catalog_revision):
                     raise PlanReviewError(
                         "SeriesCatalog 已变化，请刷新后重新生成整理计划"
@@ -803,6 +1265,8 @@ class PlanReviewService:
                 raise PlanReviewError(
                     "SeriesCatalog 登记已丢失，请先修复作品登记"
                 )
+            elif registration.materialized_mapping:
+                raise PlanReviewError('系列登记证据对应的作品已丢失，请重新生成')
         if series_match is not None:
             work_root = series_match.canonical_root
         elif catalog_match is not None:
@@ -857,14 +1321,6 @@ class PlanReviewService:
         # role pre-classifier has selected main candidates (TV), or for the
         # explicit movie-segment proof below.  It must never decide a role.
         episode_hints = {}
-        if group_kind == "movie_continuous":
-            try:
-                episode_hints = build_episode_hints(
-                    (entry.source_path for entry in videos), work.title
-                )
-            except EpisodeInferenceError as exc:
-                raise PlanReviewError(str(exc)) from exc
-
         selected_group = replace(
             group,
             group_id=default_presentation_group_id(group_kind),
@@ -928,264 +1384,48 @@ class PlanReviewService:
                 resolved_season_source = "inferred_path"
             else:
                 raise PlanReviewError("请先确认归入第几季；历史 Season 00 占位不能自动沿用")
-            preclassifications = {
-                entry.source_path: self._preclassify_inventory_video(
-                    item_path=entry.source_path,
-                    candidate_name=entry.source_path.name,
-                    season_id=default_season_id,
-                    extra_context_name=build_semantic_context(
-                        entry.source_path.name, work.title
-                    ),
-                    forced_role=supplied_roles.get(entry.source_path),
+            from . import tv_video_projection
+            mapped = tv_video_projection.project_tv_videos(
+                tv_video_projection.TVVideoInput(
+                    videos=videos, source_root=plan.source_root, work_title=work.title,
+                    group_id=selected_group.group_id, work_root=work_root,
+                    season_id=default_season_id, roles=tuple(supplied_roles.items()),
                 )
-                for entry in videos
-            }
-            main_candidates = tuple(
-                source
-                for source, preclassification in preclassifications.items()
-                if preclassification.kind == PreclassificationKind.MAIN_CANDIDATE
             )
-            secondary_sequence_hints = build_secondary_sequence_hints(
-                main_candidates, work.title
-            )
-            try:
-                episode_hints = build_episode_hints(main_candidates, work.title)
-            except EpisodeInferenceError as exc:
-                # A genuine main-to-main collision is handled as an unresolved
-                # current-plan mapping below, rather than letting an old draft
-                # escape the target root or preventing the user from repairing it.
-                episode_hints = {}
-                episode_assignment_conflicts = [
-                    str(source) for source in main_candidates
-                ]
-            for entry in videos:
-                preclassification = preclassifications[entry.source_path]
-                if preclassification.kind != PreclassificationKind.MAIN_CANDIDATE:
-                    classification = preclassification.classification
-                elif episode_assignment_conflicts:
-                    classification = MediaClassification(
-                        LocalRole.UNKNOWN, default_season_id, "unknown", None,
-                        "Low", "正片候选存在集号冲突，等待人工确认用途",
-                    )
-                else:
-                    classification = classify_media(
-                        item_path=entry.source_path,
-                        candidate_name=entry.source_path.name,
-                        season_id=default_season_id,
-                        extra_context_name=build_semantic_context(
-                            entry.source_path.name, work.title
-                        ),
-                        episode_hint=episode_hints.get(entry.source_path),
-                        secondary_bonus_episode=secondary_sequence_hints.get(
-                            entry.source_path
-                        ),
-                    )
-                season_id = classification.season_scope
-                normalized_stem = normalize_target_stem(
-                    entry.source_path.stem, work.title
-                ) or entry.source_path.stem
-                suffix = entry.source_path.suffix.lower()
-                if classification.local_role == LocalRole.MAIN_EPISODE:
-                    episode = classification.episode_number
-                    if episode is None:
-                        unresolved_videos.append(entry.source_path.name)
-                        continue
-                    target = (
-                        work_root
-                        / f"Season {season_id:02d}"
-                        / f"{folder_name} S{season_id:02d}E{episode:02d}{suffix}"
-                    )
-                    video_targets[entry.source_path] = target
-                    content_video_targets[entry.source_path] = target
-                    video_identity[entry.source_path] = (season_id, episode)
-                    video_roles[entry.source_path] = "main_episode"
-                    video_assets[entry.source_path] = PresentationAssetPlanContract(
-                        selected_group.group_id,
-                        AssetRole("content_version"),
-                        None,
-                        build_default_version_descriptor(
-                            selected_group.group_id, season_id, episode
-                        ),
-                    )
-                    continue
-                if classification.local_role in {
-                    LocalRole.DISC_EXTRA,
-                    LocalRole.EPISODE_LIKE_BONUS,
-                    LocalRole.PROVIDER_SPECIAL,
-                }:
-                    target = (
-                        work_root
-                        / f"Season {season_id:02d}"
-                        / JELLYFIN_EXTRAS_DIR
-                        / f"{normalized_stem}{suffix}"
-                    )
-                    video_targets[entry.source_path] = target
-                    video_identity[entry.source_path] = (season_id, None)
-                    video_roles[entry.source_path] = classification.local_role.value
-                    video_assets[entry.source_path] = PresentationAssetPlanContract(
-                        selected_group.group_id,
-                        AssetRole("extra", "other"),
-                        None,
-                        None,
-                    )
-                    continue
-
-                # Unknown is still a current-plan decision.  Never retain the
-                # movie inventory draft target after the user switches to TV.
-                try:
-                    relative_source = entry.source_path.relative_to(plan.source_root)
-                except ValueError:
-                    relative_source = Path(entry.source_path.name)
-                target = work_root / "ManualReview" / relative_source
-                video_targets[entry.source_path] = target
-                video_identity[entry.source_path] = (season_id, None)
-                video_roles[entry.source_path] = "unknown"
-                video_assets[entry.source_path] = PresentationAssetPlanContract(
-                    selected_group.group_id,
-                    AssetRole("unknown"),
-                    None,
-                    None,
-                )
-                if entry.source_path.name not in unresolved_videos:
-                    unresolved_videos.append(entry.source_path.name)
-        elif (
-            len(videos) == 1
-            or primary_video_source is not None
-            or primary_video_sources is not None
-        ):
-            entries_by_source = {entry.source_path: entry for entry in videos}
-            requested_sources = tuple(
-                Path(item) for item in (primary_video_sources or ())
-            )
-            if primary_video_source is not None:
-                requested_sources += (Path(primary_video_source),)
-            if not requested_sources:
-                requested_sources = (videos[0].source_path,)
-            selected_sources = tuple(dict.fromkeys(requested_sources))
-            if any(source not in entries_by_source for source in selected_sources):
-                raise PlanReviewError("所选电影正片不在当前包的视频清单中")
-            descriptors = {}
-            labels = set()
-            refs = set()
-            for selected_source in selected_sources:
-                entry = entries_by_source[selected_source]
-                descriptor = _infer_movie_version_descriptor(
-                    entry.source_path, selected_group.group_id, plan.source_root
-                )
-                label_key = _normalized_key(descriptor.display_label or "默认版本")
-                if label_key in labels or descriptor.version_ref in refs:
-                    raise PlanReviewError(
-                        "多个电影正片无法生成唯一版本标签；请在文件名中区分 SDR、"
-                        "DoVi、分辨率或发行版后重新识别"
-                    )
-                labels.add(label_key)
-                refs.add(descriptor.version_ref)
-                descriptors[selected_source] = descriptor
-                label_suffix = (
-                    f" - {descriptor.display_label}"
-                    if descriptor.display_label else ""
-                )
-                video_targets[entry.source_path] = (
-                    work_root
-                    / f"{folder_name}{label_suffix}{entry.source_path.suffix.lower()}"
-                )
-                content_video_targets[entry.source_path] = video_targets[entry.source_path]
-                video_identity[entry.source_path] = (None, None)
-                video_roles[entry.source_path] = "movie_content"
-                video_assets[entry.source_path] = PresentationAssetPlanContract(
-                    selected_group.group_id,
-                    AssetRole("content_version"),
-                    None,
-                    descriptor,
-                )
-            for extra in videos:
-                if extra.source_path in descriptors:
-                    continue
-                owner_descriptor = _infer_owner_descriptor(
-                    extra.source_path, tuple(descriptors.values())
-                )
-                target_version_label = _movie_target_version_label(
-                    owner_descriptor.display_label
-                    if owner_descriptor is not None else None
-                )
-                label_suffix = (
-                    f" - {target_version_label}" if target_version_label else ""
-                )
-                role_label = _movie_extra_role_label(
-                    extra.source_path,
-                    use_stable_role=(len(descriptors) > 1),
-                )
-                extra_name = (
-                    f"{folder_name}{label_suffix} - {role_label}"
-                    f"{extra.source_path.suffix.lower()}"
-                )
-                video_targets[extra.source_path] = (
-                    work_root / JELLYFIN_EXTRAS_DIR / extra_name
-                )
-                video_identity[extra.source_path] = (None, None)
-                video_roles[extra.source_path] = "disc_extra"
-                video_assets[extra.source_path] = PresentationAssetPlanContract(
-                    selected_group.group_id,
-                    AssetRole("extra", "other"),
-                    None,
-                    None,
-                    owner_descriptor.version_ref if owner_descriptor is not None else None,
-                )
+            if type(mapped) is not tv_video_projection.TVVideoProjection:
+                raise PlanReviewError('剧集视频映射未返回有效结果')
+            video_targets = {row.source: row.target for row in mapped.mappings}
+            content_video_targets = {row.source: row.target for row in mapped.mappings if row.is_content}
+            video_assets = {row.source: row.asset for row in mapped.mappings}
+            video_identity = {row.source: (row.season_id, row.episode_id) for row in mapped.mappings}
+            video_roles = {row.source: row.role for row in mapped.mappings}
+            unresolved_videos = list(mapped.unresolved)
+            episode_assignment_conflicts = list(mapped.episode_conflicts)
         else:
-            confirmed_segments = tuple(
-                dict.fromkeys(
-                    Path(item) for item in (confirmed_segment_sources or ())
+            from . import movie_video_projection
+            requested_sources = (
+                tuple(Path(p) for p in (primary_video_sources or ()))
+                + ((Path(primary_video_source),) if primary_video_source is not None else ())
+                if primary_video_source is not None or primary_video_sources is not None else None
+            )
+            mapped = movie_video_projection.project_movie_videos(
+                movie_video_projection.MovieVideoInput(
+                    videos=videos, source_root=plan.source_root, work_title=work.title,
+                    group_id=selected_group.group_id, work_root=work_root,
+                    primary_sources=requested_sources,
+                    confirmed_segments=tuple(Path(p) for p in (confirmed_segment_sources or ())),
+                    excluded_sources=tuple(Path(p) for p in excluded_movie_sources),
+                    roles=tuple(supplied_roles.items()), groups_supplied=movie_version_groups is not None,
                 )
             )
-            video_sources = {entry.source_path for entry in videos}
-            if confirmed_segments and set(confirmed_segments) != video_sources:
-                raise PlanReviewError("人工确认的连续分段必须包含当前包的全部视频")
-            indexes = {
-                entry.source_path: episode_hints.get(entry.source_path)
-                for entry in videos
-            }
-            observed = {value for value in indexes.values() if value is not None}
-            expected = set(range(1, len(videos) + 1))
-            if confirmed_segments:
-                segment_sources = confirmed_segments
-                indexes = {
-                    source: index
-                    for index, source in enumerate(segment_sources, start=1)
-                }
-            elif len(observed) != len(videos) or observed != expected:
-                raise PlanReviewError(
-                    "连续电影包含多个视频，但文件名不能唯一证明完整分段；"
-                    "请改选按季和集播放，或在文件列表中人工确认版本/分段"
-                )
-            else:
-                segment_sources = tuple(
-                    entry.source_path
-                    for entry in sorted(
-                        videos,
-                        key=lambda item: indexes[item.source_path] or 0,
-                    )
-                )
-            descriptor = build_default_version_descriptor(
-                selected_group.group_id, None, None
-            )
-            entries_by_source = {entry.source_path: entry for entry in videos}
-            for source in segment_sources:
-                entry = entries_by_source[source]
-                index = indexes[source]
-                assert index is not None
-                video_targets[entry.source_path] = (
-                    work_root
-                    / f"{folder_name}-cd{index}{entry.source_path.suffix.lower()}"
-                )
-                content_video_targets[entry.source_path] = video_targets[entry.source_path]
-                video_identity[entry.source_path] = (None, None)
-                video_roles[entry.source_path] = "movie_content"
-                video_assets[entry.source_path] = PresentationAssetPlanContract(
-                    selected_group.group_id,
-                    AssetRole("content_version"),
-                    SegmentDescriptor("cd", index, len(videos)),
-                    descriptor,
-                )
+            if type(mapped) is not movie_video_projection.MovieVideoProjection:
+                raise PlanReviewError('电影视频映射未返回有效结果')
+            video_targets = {row.source: row.target for row in mapped.mappings}
+            content_video_targets = {row.source: row.target for row in mapped.mappings if row.is_content}
+            video_assets = {row.source: row.asset for row in mapped.mappings}
+            video_identity = {row.source: (None, None) for row in mapped.mappings}
+            video_roles = {row.source: row.role for row in mapped.mappings}
+            unresolved_videos = list(mapped.unresolved)
 
         subtitle_entries = tuple(
             entry for entry in plan.entries if entry.media_kind == "subtitle"
@@ -1215,25 +1455,6 @@ class PlanReviewService:
                 ),
             )
         }
-        video_target_by_stem = {
-            unicodedata.normalize("NFKC", source.stem).casefold(): target
-            for source, target in video_targets.items()
-        }
-        video_source_by_stem = {
-            unicodedata.normalize("NFKC", source.stem).casefold(): source
-            for source in video_targets
-        }
-        movie_descriptors = tuple(
-            asset.version_descriptor
-            for asset in video_assets.values()
-            if asset.version_descriptor is not None
-        )
-        owner_by_video_source = {}
-        for video_source, asset in video_assets.items():
-            if asset.version_descriptor is not None:
-                owner_by_video_source[video_source] = asset.version_descriptor.version_ref
-            else:
-                owner_by_video_source[video_source] = asset.owner_version_ref
         revised_entries = []
         for original in plan.entries:
             source = original.source_path
@@ -1266,30 +1487,26 @@ class PlanReviewService:
                     and extra_decision.target_preview is not None
                     and not extra_decision.blocks_execution
                 ):
-                    # The strict subtitle contract intentionally permits only
-                    # content-version subtitles.  A subtitle deterministically
-                    # paired with an extra is therefore kept beside that extra
-                    # as an associated resource, without making it part of the
-                    # movie's primary subtitle decision surface.
+                    # Keep the deterministic extra-video association typed.
+                    # Source partitioning must be able to close this dependency
+                    # without re-guessing from filenames or target placement.
+                    extra_identity = video_identity.get(
+                        extra_decision.association.associated_video,
+                        (None, None),
+                    )
                     revised_entries.append(replace(
                         original,
                         target_path=extra_decision.target_preview,
-                        media_kind="associated",
+                        season_id=extra_identity[0],
+                        episode_id=extra_identity[1],
+                        media_kind="subtitle",
                         role="extra_subtitle",
                         requires_review=True,
                         evidence=original.evidence + (
                             "字幕与特典视频同名，作为特典配套资源",
                         ),
-                        subtitle=None,
-                        presentation_asset=PresentationAssetPlanContract(
-                            selected_group.group_id,
-                            AssetRole("associated"),
-                            None,
-                            None,
-                            owner_by_video_source.get(
-                                extra_decision.association.associated_video
-                            ),
-                        ),
+                        subtitle=decision_to_plan_contract(extra_decision),
+                        presentation_asset=None,
                     ))
                 else:
                     # Completion must refresh even an unresolved subtitle.  A
@@ -1316,56 +1533,32 @@ class PlanReviewService:
                         ),
                     ))
                 continue
-            matching_video = video_target_by_stem.get(
-                unicodedata.normalize("NFKC", source.stem).casefold()
-            )
-            matching_video_source = video_source_by_stem.get(
-                unicodedata.normalize("NFKC", source.stem).casefold()
-            )
-            try:
-                relative_source = source.relative_to(plan.source_root)
-            except ValueError:
-                relative_source = Path(source.name)
-            target = (
-                matching_video.with_suffix(source.suffix.lower())
-                if matching_video is not None
-                else work_root / "Associated" / relative_source
-            )
-            owner_ref = owner_by_video_source.get(matching_video_source)
-            if owner_ref is None and group_kind == "movie_continuous":
-                if is_font_archive(source):
-                    owner_ref = "shared"
-                else:
-                    inferred_owner = _infer_owner_descriptor(source, movie_descriptors)
-                    owner_ref = (
-                        inferred_owner.version_ref if inferred_owner is not None else None
-                    )
-            needs_archive_role = (
-                group_kind == "movie_continuous"
-                and is_supported_font_archive(source)
-                and not is_font_archive(source)
-            )
-            revised_entries.append(replace(
-                original,
-                target_path=target,
-                requires_review=True,
-                evidence=original.evidence + ("按文件类型归为配套资源",),
-                presentation_asset=PresentationAssetPlanContract(
-                    selected_group.group_id,
-                    AssetRole("unknown" if needs_archive_role else "associated"),
-                    None,
-                    None,
-                    "shared" if needs_archive_role else owner_ref,
-                ),
-            ))
+
 
         revised_entries, unresolved_collisions = _resolve_asset_collisions(
             tuple(revised_entries), work_root, package_label=plan.source_root.name
         )
 
         metadata = dict(plan.metadata)
+        origin_fingerprint = self.plan_store.fingerprint(plan)
+        if _completion_context is None and group_kind == 'tv_episodes':
+            # Boundary selection can supply a newly identified, unpersisted
+            # draft. Bind its inventory lineage to the actual reviewed parent.
+            try:
+                origin = self.plan_store.load_version(task_id, _revision_parent_fingerprint or expected_fingerprint)
+            except PlanStoreError as exc:
+                raise PlanReviewError('找不到经过核验的库存父计划，请刷新后重新选择整理方式') from exc
+            if origin.metadata.get('mapping_source') != 'inventory_review_draft':
+                origin_context = self._completion_context_for_current(origin)
+                origin = self._load_inventory_draft(task_id, origin_context.origin_plan_fingerprint)
+            if (origin.source_root != plan.source_root
+                    or not origin.metadata.get('inventory_fingerprint')
+                    or origin.metadata.get('inventory_fingerprint') != plan.metadata.get('inventory_fingerprint')
+                    or not any(g.group_id == group_id for g in origin.presentation_groups)):
+                raise PlanReviewError('库存父计划与本次整理来源不一致')
+            origin_fingerprint = self.plan_store.fingerprint(origin)
         context = _completion_context or InventoryCompletionContext(
-            origin_plan_fingerprint=self.plan_store.fingerprint(plan),
+            origin_plan_fingerprint=origin_fingerprint,
             origin_group_id=group_id,
             group_kind=group_kind,
             work_domain=work.domain,
@@ -1379,52 +1572,17 @@ class PlanReviewService:
             season_number=(default_season_id if group_kind == "tv_episodes" else None),
             season_source=(resolved_season_source if group_kind == "tv_episodes" else "unset"),
         )
-        metadata.update({
-            "target_root": str(target_root),
-            "season_id": default_season_id if group_kind == "tv_episodes" else None,
-            "season_number": default_season_id if group_kind == "tv_episodes" else None,
-            "season_source": (
-                resolved_season_source if group_kind == "tv_episodes" else "unset"
-            ),
-            "allowed_target_root": str(target_root),
-            "initial_suggested_target_root": str(work_root),
-            "mapping_source": "inventory_smart_completion",
-            "completion_mode": completion_mode,
-            "presentation_assignment_state": (
-                "partial" if unresolved_videos else "confirmed"
-            ),
-            "smart_completion_unresolved_videos": tuple(unresolved_videos),
-            "target_root_snapshot": snapshot.to_dict(),
-            "target_root_config_fingerprint": snapshot.fingerprint,
-            "proposed_work_key": proposed_work_key,
-            "canonical_work_root": str(work_root),
-            "canonical_naming_required": True,
-            "canonical_naming_decision": naming_decision.to_dict(),
-            "catalog_work_key": (
-                catalog_match.work_key if catalog_match is not None else None
-            ),
-            "catalog_revision": (
-                catalog_match.revision if catalog_match is not None else 0
-            ),
-            "catalog_match_source": (
-                "exact_series_catalog" if series_match is not None
-                else "exact_provider" if catalog_match is not None
-                else "new_work"
-            ),
-            "series_key": series_key if group_kind == "tv_episodes" else None,
-            "season_binding_id": (
-                season_binding_id if group_kind == "tv_episodes" else None
-            ),
-            "series_catalog_revision": (
-                int(series_catalog_revision) if group_kind == "tv_episodes" else 0
-            ),
-            "owner_version_model": 1 if group_kind == "movie_continuous" else 0,
-            "asset_collision_unresolved": tuple(unresolved_collisions),
-            "episode_assignment_conflict_sources": tuple(
-                episode_assignment_conflicts
-            ),
-            "inventory_completion_context": context.to_dict(),
-        })
+        from .inventory_completion_projection import project_completion_metadata
+        metadata = project_completion_metadata(metadata, context=context, work_root=work_root,
+            naming_decision=naming_decision, proposed_work_key=proposed_work_key,
+            catalog_work_key=catalog_match.work_key if catalog_match else None,
+            catalog_revision=catalog_match.revision if catalog_match else 0,
+            catalog_match_source='exact_series_catalog' if series_match else 'exact_provider' if catalog_match else 'new_work',
+            completion_mode=completion_mode, unresolved_videos=unresolved_videos,
+            unresolved_collisions=unresolved_collisions, episode_assignment_conflicts=episode_assignment_conflicts,
+            series_key=series_key, season_binding_id=season_binding_id, series_catalog_revision=series_catalog_revision)
+        if not isinstance(metadata, dict):
+            raise PlanReviewError('完成上下文唯一投影器已断开')
         policy = plan.execution_policy
         revised = replace(
             plan,
@@ -1442,7 +1600,16 @@ class PlanReviewService:
             revision_action=f"complete_inventory_draft:{group_kind}",
             revision_reason=reason,
         )
-        revised = self._finalize_completed_movie_plan(revised)
+        if group_kind == 'movie_continuous':
+            from .movie_version_selection import create_selection, project_selection
+            prior = self.decision_state_store.load_optional(task_id)
+            record = self.work_catalog.load(catalog_match.work_key) if catalog_match is not None else None
+            selection = create_selection(revised, groups=movie_version_groups,
+                registered_versions=record['versions'] if record else (),
+                excluded_sources=excluded_movie_sources, previous=prior.movie_version_selection if prior else None)
+            from .movie_version_selection import validate_catalog_labels
+            validate_catalog_labels(selection, record['versions'] if record else ())
+            revised = project_selection(revised, selection)
         if not persist_revision:
             return revised
         linked = tuple(
@@ -1461,7 +1628,8 @@ class PlanReviewService:
         )
 
         def transform_completion(state):
-            changes = {"recovery_state": "healthy"}
+            changes = {"recovery_state": "healthy",
+                       'movie_version_selection':self.movie_selection_for_completion(revised)}
             if group_kind == "tv_episodes":
                 if series_key:
                     changes["series_binding"] = {
@@ -1469,6 +1637,7 @@ class PlanReviewService:
                         "canonical_root": str(metadata.get("canonical_work_root") or ""),
                         "catalog_revision": int(series_catalog_revision),
                         "decision_source": "new_series_intent",
+                        "registration_authority": registration.to_dict(),
                     }
                 if season_binding_id and season_number is not None:
                     changes["season_binding"] = {
@@ -1476,7 +1645,10 @@ class PlanReviewService:
                         "season_number": int(season_number),
                         "decision_source": str(season_source or "provider_crosswalk"),
                     }
-                changes["catalog_link_intent"] = None
+                work_key=str(metadata.get('catalog_work_key') or metadata.get('proposed_work_key') or '').strip()
+                changes["catalog_link_intent"] = (
+                    {'work_key':work_key,'catalog_revision':int(metadata.get('catalog_revision') or 0)}
+                    if not series_key and work_key else None)
             else:
                 work_key = str(
                     metadata.get("catalog_work_key")
@@ -1501,6 +1673,7 @@ class PlanReviewService:
             recognition,
             state_transform=transform_completion,
         )
+
 
     @staticmethod
     def _preclassify_inventory_video(
@@ -1529,11 +1702,134 @@ class PlanReviewService:
                     "Manual", "用户在处理页确认该文件参加正片编号",
                 ),
             )
+        if forced_role == 'needs_correspondence':
+            return MediaPreclassification(PreclassificationKind.UNKNOWN,
+                MediaClassification(LocalRole.UNKNOWN, season_id, 'unknown', None, 'Manual',
+                                    '作品已更正，请重新确认此视频的集号或特别篇对应'))
         if forced_role not in {None, ""}:
             raise PlanReviewError("文件用途只能设为正片候选或特典")
         return preclassify_media(
             item_path, candidate_name, season_id, extra_context_name
         )
+
+    def _prepare_replay_draft(self, current: RenamePlan, context: InventoryCompletionContext) -> RenamePlan:
+        """Keep origin classification inputs but never expand current ownership."""
+        draft = self._load_inventory_draft(current.task_id, context.origin_plan_fingerprint)
+        owned = {_path_key(path) for path in current.expected_sources}
+        if not owned.issubset({_path_key(path) for path in draft.expected_sources}):
+            raise PlanReviewError("当前来源与原始库存不一致，不能重建")
+        metadata = dict(draft.metadata)
+        for key in (
+            "canonical_naming_decision", "provider_special_observation",
+            "provider_special_observation_required", "provider_special_candidates",
+            "provider_special_eligibility_unavailable", "provider_special_decisions",
+            "provider_regular_episode_overflows", "source_partition_decisions",
+            "source_partition_fingerprint",
+        ):
+            metadata.pop(key, None)
+            if key in current.metadata:
+                metadata[key] = current.metadata[key]
+        return replace(
+            draft, metadata=metadata, work_identity=current.work_identity,
+            execution_policy=current.execution_policy,
+            entries=tuple(e for e in draft.entries if _path_key(e.source_path) in owned),
+            expected_sources=tuple(p for p in draft.expected_sources if _path_key(p) in owned),
+            ignored_sources=tuple(p for p in draft.ignored_sources if _path_key(p) in owned),
+        )
+
+    def retry_tv_inventory(self, observation: RenamePlan, recognition: RecognitionDecisionInput):
+        """Rebuild a previously completed TV inventory, not the shallow rule map.
+
+        History supplies classification inputs only after a fresh bounded scan
+        verifies their identity. The caller commits the result exactly once.
+        """
+        state = self.decision_state_store.load_optional(observation.task_id)
+        if state is None or state.layout_mode != 'tv_episodes' or recognition.layout_mode != 'tv_episodes':
+            return None
+        current = self.plan_store.load(observation.task_id)
+        if current.metadata.get('mapping_source') != 'inventory_smart_completion':
+            return None
+        candidate = recognition.candidate(state)
+        old = state.confirmed_work.get('primary_provider') or {}
+        new = candidate.confirmed_work.get('primary_provider') or {}
+        fields = ('namespace', 'entity_type', 'provider_id')
+        if any(old.get(key) != new.get(key) for key in fields):
+            return None
+        context = self._completion_context_for_current(current)
+        if (context.group_kind != 'tv_episodes'
+                or current.work_identity.domain != recognition.work_identity.domain
+                or context.season_number != recognition.season_number
+                or current.source_root != observation.source_root):
+            raise PlanReviewError('原整理范围或季度已变化，请重新确认整理方式')
+        draft = self._prepare_replay_draft(current, context)
+        from .movie_assets import inventory_movie_assets
+        inventory = inventory_movie_assets(observation.source_root)
+        if inventory.fingerprint != draft.metadata.get('inventory_fingerprint'):
+            raise PlanReviewError('源文件清单已变化，不能沿用旧附加内容选择，请重新核查来源')
+        from .projection_authority import InventoryReplayGuard, SourceIdentity
+        guard = InventoryReplayGuard(self.decision_state_store.fingerprint(state), self.plan_store.fingerprint(current),
+            observation.source_root, inventory.fingerprint,
+            tuple(SourceIdentity.from_path(p, inventory_fingerprint=inventory.fingerprint) for p in draft.expected_sources))
+        from .target_routing import TargetRootSnapshot, resolve_target_root
+        snapshot = TargetRootSnapshot.from_dict(observation.metadata['target_root_snapshot'])
+        target = resolve_target_root(recognition.work_identity.domain, 'tv_episodes', snapshot)
+        metadata = dict(draft.metadata)
+        # Provider observations belong to this retry, never to historical output.
+        for key in ('canonical_naming_decision', 'provider_special_observation',
+                    'provider_special_candidates', 'provider_special_eligibility_unavailable',
+                    'provider_regular_episode_overflows'):
+            metadata.pop(key, None)
+            if key in observation.metadata:
+                metadata[key] = observation.metadata[key]
+        draft = replace(draft, metadata=metadata, projection_receipt=None, work_identity=recognition.work_identity,
+            linked_provider_identities=recognition.linked_provider_identities,
+            execution_policy=observation.execution_policy)
+        revised = self.complete_inventory_draft(observation.task_id, self.plan_store.fingerprint(current),
+            group_id=context.origin_group_id, group_kind='tv_episodes', target_root=target,
+            root_snapshot=snapshot.to_dict(), work_domain=recognition.work_identity.domain,
+            season_number=recognition.season_number, season_source=recognition.season_source,
+            role_decisions={v.source_path: v.role for v in context.manual_role_decisions.values()},
+            reason='重试：按已核验库存重新生成完整季度计划',
+            _source_plan=draft, _completion_context=replace(context, root_snapshot=snapshot.to_dict(), target_root=target),
+            persist_revision=False)
+        return replace(revised, metadata={**revised.metadata, 'inventory_retry_guard_required': True}), guard
+
+    def retry_movie_inventory(self, draft, recognition):
+        """Replay explicit choices on a fresh scan, never re-enable an old Plan."""
+        state = self.decision_state_store.load_optional(draft.task_id)
+        if state is None or recognition.candidate(state).movie_version_selection is None:
+            return None
+        current = self.plan_store.load(draft.task_id)
+        context = self._completion_context_for_current(current)
+        original = self._prepare_replay_draft(current, context)
+        if (context.group_kind != 'movie_continuous'
+                or original.source_root != draft.source_root
+                or original.metadata.get('inventory_fingerprint') != draft.metadata.get('inventory_fingerprint')
+                or current.work_identity.domain != recognition.work_identity.domain):
+            return None
+        from .target_routing import TargetRootSnapshot, resolve_target_root
+        from .movie_version_selection import project_selection, rebind_selection
+        snapshot = TargetRootSnapshot.from_dict(draft.metadata['draft_root_snapshot'])
+        target = resolve_target_root(recognition.work_identity.domain, context.group_kind, snapshot)
+        draft = replace(draft, work_identity=recognition.work_identity,
+                        linked_provider_identities=recognition.linked_provider_identities)
+        replay_context = replace(context, root_snapshot=snapshot.to_dict(), target_root=target)
+        revised = self.complete_inventory_draft(draft.task_id, self.plan_store.fingerprint(current),
+            group_id=context.origin_group_id, group_kind=context.group_kind, target_root=target,
+            root_snapshot=snapshot.to_dict(), work_domain=recognition.work_identity.domain,
+            reason='重试：按新扫描及当前配置重新生成电影计划',
+            role_decisions={v.source_path: v.role for v in context.manual_role_decisions.values()},
+            _source_plan=draft, _completion_context=replay_context, persist_revision=False,
+            **self._movie_replay_arguments(current, state=state))
+        selection = state.movie_version_selection
+        key = str(revised.metadata.get('catalog_work_key') or revised.metadata.get('proposed_work_key') or '')
+        if (selection.to_dict()['work_key'] != key
+                or current.metadata.get('canonical_work_root') != revised.metadata.get('canonical_work_root')):
+            selection = rebind_selection(selection, key)
+        preferred = {g.group_id: g.preferred_version_ref for g in current.presentation_groups}
+        revised = project_selection(replace(revised, presentation_groups=tuple(
+            replace(g, preferred_version_ref=preferred.get(g.group_id)) for g in revised.presentation_groups)), selection)
+        return revised
 
     def recomplete_inventory_with_role_decisions(
         self,
@@ -1552,25 +1848,15 @@ class PlanReviewService:
         """
 
         current = self._current_plan(task_id, expected_current_fingerprint)
+        from .content_selection import require_legacy_writer
+        require_legacy_writer(current)
         if current.metadata.get("mapping_source") != "inventory_smart_completion":
             raise PlanReviewError("当前整理计划尚未选择整理方式")
         reason = str(reason).strip()
         if not reason:
             raise PlanReviewError("确认文件用途必须记录原因")
         context = self._completion_context_for_current(current)
-        draft = self._load_inventory_draft(
-            task_id, context.origin_plan_fingerprint
-        )
-        draft_metadata = dict(draft.metadata)
-        if "canonical_naming_decision" in current.metadata:
-            draft_metadata["canonical_naming_decision"] = current.metadata[
-                "canonical_naming_decision"
-            ]
-        draft = replace(
-            draft,
-            metadata=draft_metadata,
-            work_identity=current.work_identity,
-        )
+        draft = self._prepare_replay_draft(current, context)
         group = next(
             (item for item in draft.presentation_groups
              if item.group_id == context.origin_group_id),
@@ -1579,11 +1865,26 @@ class PlanReviewService:
         if group is None:
             raise PlanReviewError("原始整理方式已变化，请重新选择整理方式")
         entries_by_id = {entry_id(entry): entry for entry in draft.entries}
-        merged = dict(context.manual_role_decisions)
+        from . import special_decision_projection
+        transferred = special_decision_projection._transferred_ids(current)
+        merged = {key: value for key, value in context.manual_role_decisions.items()
+                  if key not in transferred}
+        special_decisions = current.metadata.get("provider_special_decisions", {})
+        state = self.decision_state_store.load(task_id)
+        movie_selection = state.movie_version_selection if context.group_kind == 'movie_continuous' else None
+        movie_reserved = set()
+        if movie_selection is not None:
+            value = movie_selection.to_dict()
+            movie_reserved = {Path(p) for g in value['groups'] for p in g['sources']} | {
+                Path(p) for p in value['excluded_sources']}
         for identifier, role_value in decisions.items():
             entry = entries_by_id.get(str(identifier))
             if entry is None or entry.media_kind != "video":
                 raise PlanReviewError("待确认文件已变化，请刷新后重试")
+            if identifier in special_decisions:
+                raise PlanReviewError("该文件已有特别篇或附加内容决定，请先在异常分集归属中修改决定")
+            if entry.source_path in movie_reserved:
+                raise PlanReviewError("该视频已选为电影正片或明确排除，请先编辑电影版本标签与保留范围")
             if role_value is None or not str(role_value).strip():
                 merged.pop(str(identifier), None)
                 continue
@@ -1599,7 +1900,8 @@ class PlanReviewService:
             decision.source_path: decision.role for decision in merged.values()
         }
         replay_context = replace(context, manual_role_decisions=merged)
-        return self.complete_inventory_draft(
+        movie_kwargs = self._movie_replay_arguments(current, state=state)
+        revised = self.complete_inventory_draft(
             task_id,
             expected_current_fingerprint,
             group_id=context.origin_group_id,
@@ -1614,8 +1916,25 @@ class PlanReviewService:
             _source_plan=draft,
             _revision_parent_fingerprint=expected_current_fingerprint,
             _completion_context=replay_context,
-            persist_revision=persist_revision,
+            **movie_kwargs,
+            persist_revision=False,
         )
+        if movie_selection is not None:
+            # Roles change only unselected assets, never the frozen movie choice.
+            from .movie_version_selection import project_selection
+            preferred = {g.group_id: g.preferred_version_ref for g in current.presentation_groups}
+            revised = project_selection(replace(revised, presentation_groups=tuple(
+                replace(g, preferred_version_ref=preferred.get(g.group_id)) for g in revised.presentation_groups)), movie_selection)
+        revised = special_decision_projection.project_special_decisions(revised, special_decisions)
+        if not persist_revision:
+            return revised
+        from .decision_state import DecisionCommandService
+        _state, projected = DecisionCommandService(self.decision_state_store, self.plan_store).update(
+            task_id, expected_revision=state.revision,
+            changes={"manual_role_decisions": {key: value.role for key, value in merged.items()}},
+            planner=lambda _state: revised, task_terminal=self._revision_task_terminal(task_id),
+        )
+        return self._record_revision(projected)
 
     def replan_for_catalog_drift(
         self, decision: object, current: RenamePlan
@@ -1630,6 +1949,9 @@ class PlanReviewService:
 
         from .catalog_binding import binding_from_decision
 
+        if current.metadata.get('work_affiliation') is not None:
+            raise PlanReviewError('当前作品归属需要通过完整作品确认重新生成，不能使用旧登记重规划')
+
         group_kinds = {group.kind for group in current.presentation_groups}
         if group_kinds != {"tv_episodes"}:
             raise PlanReviewError(
@@ -1642,25 +1964,16 @@ class PlanReviewService:
         binding = binding_from_decision(decision)
         if binding is None:
             raise PlanReviewError("当前 DecisionState 缺少可执行的作品登记身份")
-        draft = self._load_inventory_draft(
-            current.task_id, context.origin_plan_fingerprint
-        )
-        draft_metadata = dict(draft.metadata)
-        if "canonical_naming_decision" in current.metadata:
-            draft_metadata["canonical_naming_decision"] = current.metadata[
-                "canonical_naming_decision"
-            ]
-        draft = replace(
-            draft,
-            metadata=draft_metadata,
-            work_identity=current.work_identity,
-        )
+        draft = self._prepare_replay_draft(current, context)
+        owned = {_path_key(p) for p in current.expected_sources}
         role_decisions = {
             item.source_path: item.role
             for item in context.manual_role_decisions.values()
+            if _path_key(item.source_path) in owned
         }
         completion_kwargs: dict[str, object] = {}
         if binding.backend == "series":
+            from .series_registration import SeriesRegistrationAuthority
             series = getattr(decision, "series_binding", None) or {}
             if not str(series.get("canonical_root") or "").strip():
                 raise PlanReviewError("SeriesIdentity 缺少规范目录，不能安全重规划")
@@ -1670,6 +1983,7 @@ class PlanReviewService:
                 raise PlanReviewError("SeriesIdentity 重规划缺少已确认季度")
             completion_kwargs.update({
                 "series_key": binding.key,
+                "series_registration_authority": SeriesRegistrationAuthority.from_mapping(series.get('registration_authority')),
                 "series_catalog_revision": binding.revision,
                 "season_number": int(season_number),
                 "season_source": str(
@@ -1682,19 +1996,8 @@ class PlanReviewService:
                 ) or None,
             })
         else:
-            # Explicitly bind the historical draft to the authoritative Work
-            # record before replaying the same completion resolver.
-            draft_metadata = dict(draft.metadata)
-            draft_metadata.update({
-                "catalog_work_key": binding.key,
-                "catalog_link_decision": "explicit_user",
-            })
-            draft = replace(draft, metadata=draft_metadata)
-            completion_kwargs.update({
-                "season_number": context.season_number,
-                "season_source": context.season_source,
-            })
-        return self.complete_inventory_draft(
+            raise PlanReviewError('旧作品登记需经完整作品归属确认，不能由重规划补写人工关联')
+        revised = self.complete_inventory_draft(
             current.task_id,
             self.plan_store.fingerprint(current),
             group_id=context.origin_group_id,
@@ -1710,13 +2013,41 @@ class PlanReviewService:
             persist_revision=False,
             **completion_kwargs,
         )
+        from . import special_decision_projection
+        return special_decision_projection.project_special_decisions(
+            revised, decision.provider_special_decisions,
+        )
+
+    def _movie_replay_arguments(self, current, *, state=None):
+        if not any(g.kind == 'movie_continuous' for g in current.presentation_groups):
+            return {}
+        state = state if state is not None else self.decision_state_store.load(current.task_id)
+        if state.movie_version_selection is None:
+            raise PlanReviewError('旧电影缺少完整版本选择，请重新生成')
+        value = state.movie_version_selection.to_dict()
+        return dict(primary_video_sources=tuple(Path(p) for row in value['groups'] for p in row['sources']),
+                    movie_version_groups=[dict(sources=row['sources'], label=row['label']) for row in value['groups']],
+                    excluded_movie_sources=value['excluded_sources'])
 
     def _completion_context_for_current(
         self, current: RenamePlan
     ) -> InventoryCompletionContext:
         raw = current.metadata.get("inventory_completion_context")
         if raw is not None:
-            return InventoryCompletionContext.from_metadata(raw)
+            context = InventoryCompletionContext.from_metadata(raw)
+            # Older boundary completion referenced an unpersisted intermediate
+            # draft. Only an authenticated ancestry link with the same inventory
+            # can repair that pointer; corrupt existing history is never ignored.
+            origin = self.plan_store._history_path(current.task_id, context.origin_plan_fingerprint)
+            if context.group_kind == 'tv_episodes' and not origin.exists():
+                draft = self._find_inventory_draft(current)
+                if (draft.source_root != current.source_root
+                        or not draft.metadata.get('inventory_fingerprint')
+                        or draft.metadata.get('inventory_fingerprint') != current.metadata.get('inventory_fingerprint')
+                        or not any(g.group_id == context.origin_group_id for g in draft.presentation_groups)):
+                    raise PlanReviewError('库存历史与当前计划不一致，不能恢复整理选择')
+                context = replace(context, origin_plan_fingerprint=self.plan_store.fingerprint(draft))
+            return context
         draft = self._find_inventory_draft(current)
         candidates = [
             group for group in draft.presentation_groups
@@ -1802,6 +2133,14 @@ class PlanReviewService:
             revision_action="reopen_inventory_draft",
             revision_reason=reason,
         )
+        if persist_revision and current.metadata.get('movie_version_selection') is not None:
+            from .decision_state import DecisionCommandService
+            state = self.decision_state_store.load(task_id)
+            _, projected = DecisionCommandService(self.decision_state_store, self.plan_store).update(task_id,
+                expected_revision=state.revision, changes={'movie_version_selection': None, 'asset_operation': None,
+                    'layout_mode': None}, planner=lambda _: revised,
+                task_terminal=self._revision_task_terminal(task_id))
+            return self._record_revision(projected)
         return self._persist_revision(revised) if persist_revision else revised
 
     def link_existing_catalog_work(
@@ -1812,105 +2151,13 @@ class PlanReviewService:
         work_key: str,
         reason: str,
     ) -> RenamePlan:
-        """Persist an explicit cross-provider decision to reuse one movie work."""
-
-        plan = self._current_plan(task_id, expected_fingerprint)
-        reason = str(reason).strip()
-        if not reason:
-            raise PlanReviewError("关联既有电影必须记录理由")
-        work = plan.work_identity
-        if work is None or work.status != "confirmed":
-            raise PlanReviewError("请先确认当前任务的作品身份")
+        """Boundary adapter: both backends use their complete locked planners."""
+        from .work_affiliation import prepare_existing, commit_choice
         try:
-            match = self.work_catalog.get_match(work_key)
-        except WorkCatalogError as exc:
+            return commit_choice(self, prepare_existing(self, task_id, expected_fingerprint,
+                key=work_key, reason=reason))
+        except ValueError as exc:
             raise PlanReviewError(str(exc)) from exc
-        group_kinds = {group.kind for group in plan.presentation_groups}
-        if len(group_kinds) != 1:
-            raise PlanReviewError("当前计划的观看形式尚未唯一确定")
-        group_kind = next(iter(group_kinds))
-        suggestions = self.work_catalog.suggestions(
-            work.title, work.year, work.primary_provider.aliases,
-            group_kind=group_kind,
-            include_related_series=(group_kind == "tv_episodes"),
-        )
-        exact = self.work_catalog.find_exact(
-            work.primary_provider, group_kind=group_kind
-        )
-        allowed_keys = {item.work_key for item in suggestions}
-        if exact is not None:
-            allowed_keys.add(exact.work_key)
-        if work_key not in allowed_keys:
-            raise PlanReviewError("所选既有作品不在当前标题/年份候选中")
-        if match.group_kind != group_kind:
-            raise PlanReviewError("既有作品登记的观看形式与当前整理方式不一致")
-        metadata = dict(plan.metadata)
-        old_root_value = str(metadata.get("canonical_work_root") or "").strip()
-        revised_entries = plan.entries
-        if old_root_value and _path_key(Path(old_root_value)) != _path_key(match.canonical_root):
-            rebased = tuple(
-                replace(
-                    entry,
-                    target_path=_rebase_movie_target(
-                        entry.target_path, Path(old_root_value), match.canonical_root
-                    ),
-                    collision_resolution=None,
-                    evidence=entry.evidence + ("用户确认归入既有本地作品目录",),
-                )
-                for entry in plan.entries
-            )
-            revised_entries, unresolved = _resolve_asset_collisions(
-                rebased, match.canonical_root, package_label=plan.source_root.name
-            )
-            metadata["asset_collision_unresolved"] = tuple(unresolved)
-        metadata.update({
-            "catalog_work_key": match.work_key,
-            "catalog_revision": match.revision,
-            "canonical_work_root": str(match.canonical_root),
-            "catalog_link_decision": "explicit_user",
-            "catalog_link_reason": reason,
-            "catalog_allow_outside_current_root": True,
-        })
-        revised = replace(
-            plan,
-            entries=tuple(revised_entries),
-            metadata=metadata,
-            revision_parent_fingerprint=expected_fingerprint,
-            revision_action="link_existing_catalog_work",
-            revision_reason=reason,
-        )
-        recognition = RecognitionDecisionInput(
-            task_id=task_id,
-            work_identity=work,
-            linked_provider_identities=tuple(
-                item for item in plan.linked_provider_identities
-                if item.status == "confirmed"
-            ),
-            season_number=None,
-            season_source="unset",
-            layout_mode=(
-                "tv_episodes" if group_kind == "tv_episodes"
-                else "movie_versions"
-            ),
-        )
-
-        def transform_catalog_link(state):
-            return replace(
-                state,
-                catalog_link_intent={
-                    "work_key": match.work_key,
-                    "catalog_revision": match.revision,
-                },
-                series_binding=None,
-                season_binding=None,
-                recovery_state="healthy",
-            )
-
-        return self._persist_recognition_revision(
-            revised,
-            recognition,
-            state_transform=transform_catalog_link,
-        )
 
     def rebase_movie_plan_to_current_catalog(
         self,
@@ -1957,6 +2204,9 @@ class PlanReviewService:
                     and (self.work_catalog.root / f"{proposed_key}.json").exists()
                 ):
                     match = self.work_catalog.get_match(proposed_key)
+            if match is not None:
+                from . import work_catalog
+                work_catalog.require_matching_work_domain(match.domain, work.domain)
         except WorkCatalogError as exc:
             raise PlanReviewError(str(exc)) from exc
 
@@ -2035,6 +2285,38 @@ class PlanReviewService:
         group = groups.get(str(presentation_group))
         if group is None:
             raise PlanReviewError("所选呈现分组不存在；请先建立并确认分组")
+        if group.kind == 'movie_continuous' and role_kind == 'content_version':
+            from .movie_version_selection import from_plan
+            selection = from_plan(plan).to_dict() if plan.metadata.get('movie_version_selection') is not None else {
+                'groups': [], 'excluded_sources': []}
+            if plan.metadata.get('content_selection') is not None:
+                from .content_selection import from_plan as content_from_plan
+                selection['groups'] = content_from_plan(plan).to_dict()['version_groups']
+            chosen = next((row for row in selection['groups'] if str(original.source_path) in row['sources']), None)
+            if chosen is None:
+                # This is an explicit user decision over a receipted inventory,
+                # not a reader upgrading an old Plan. Existing complete groups
+                # remain frozen; only this unassigned video starts a new group.
+                if original.presentation_asset is not None and original.presentation_asset.segment is not None:
+                    raise PlanReviewError('分段电影请在版本列表中明确选择完整版本组')
+                chosen = dict(sources=[str(original.source_path)], label='默认版本')
+                selection['groups'].append(chosen)
+            values = tuple(str(value or '').strip() for value in
+                           (edition_key, resolution, dynamic_range, key_audio))
+            if any(values) and not all(values):
+                raise PlanReviewError('非默认版本必须完整填写 edition key、分辨率、动态范围和关键音频')
+            descriptor = (build_manual_version_descriptor(
+                presentation_group=group.group_id, group_kind=group.kind,
+                season_id=None, episode_id=None, edition_key=values[0],
+                edition_label=edition_label, resolution=values[1], dynamic_range=values[2],
+                key_audio=values[3], reason=reason) if all(values) else None)
+            label = ' '.join(str(part).strip() for part in (edition_label, resolution, dynamic_range, key_audio) if str(part or '').strip())
+            return self.revise_movie_versions(task_id, expected_fingerprint,
+                groups=[dict(sources=row['sources'], label=label if row is chosen and label else row['label'],
+                    **({'technical_descriptor': descriptor.to_dict()} if row is chosen and descriptor is not None else {}))
+                    for row in selection['groups']],
+                excluded_sources=selection['excluded_sources'],
+                preferred_source=original.source_path if preferred else None)
         if role_kind not in {"content_version", "extra", "associated", "unknown"}:
             raise PlanReviewError("不支持的呈现资产角色")
         if role_kind == "extra" and role_subtype not in {
@@ -2154,7 +2436,7 @@ class PlanReviewService:
             revision_action=f"revise_presentation_asset:{selected_entry_id}",
             revision_reason=reason,
         )
-        return self._persist_revision(revised)
+        return self._persist_manual_presentation_revision(revised)
 
     def ignore_plan_entry(
         self,
@@ -2170,12 +2452,24 @@ class PlanReviewService:
         reason = str(reason).strip()
         if not reason:
             raise PlanReviewError("不整理文件必须填写理由")
+        if plan.metadata.get('content_selection') is not None:
+            return self.commit_content_change(self.prepare_content_change(task_id, expected_fingerprint,
+                selected_entry_ids=(selected_entry_id,), action='exclude', reason=reason))
         matching = [
             entry for entry in plan.entries if entry_id(entry) == selected_entry_id
         ]
         if len(matching) != 1:
             raise PlanReviewError("待忽略条目不存在或不唯一")
         selected = matching[0]
+        if plan.metadata.get('movie_version_selection') is not None:
+            from .movie_version_selection import from_plan
+            value = from_plan(plan).to_dict()
+            omitted = next((row for row in value['groups'] if str(selected.source_path) in row['sources']), None)
+            groups = [dict(sources=row['sources'], label=row['label']) for row in value['groups'] if row is not omitted]
+            if not groups:
+                raise PlanReviewError('至少保留一个完整电影版本；不整理任何版本请安全放弃任务')
+            excluded = set(value['excluded_sources']) | set(omitted['sources'] if omitted else [str(selected.source_path)])
+            return self.revise_movie_versions(task_id, expected_fingerprint, groups=groups, excluded_sources=sorted(excluded))
         remaining = tuple(entry for entry in plan.entries if entry is not selected)
         metadata = dict(plan.metadata)
         work_root_value = str(metadata.get("canonical_work_root") or "").strip()
@@ -2199,234 +2493,96 @@ class PlanReviewService:
         )
         return self._persist_revision(revised)
 
-    def confirm_font_archive(
+    def build_source_partition_revisions(
+        self,
+        task_id: str,
+        expected_fingerprint: str,
+        selected_entry_ids: Iterable[str],
+        *,
+        partition_id: str,
+        partition_fingerprint: str,
+        child_task_id: str,
+        reason: str,
+    ) -> RenamePlan:
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise PlanReviewError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
+
+    def build_source_partition_revision(
         self,
         task_id: str,
         expected_fingerprint: str,
         selected_entry_id: str,
         *,
+        partition_id: str,
+        partition_fingerprint: str,
+        child_task_id: str,
         reason: str,
-        persist_revision: bool = True,
     ) -> RenamePlan:
-        """Confirm one packed .7z/.zip as a shared movie or TV font asset."""
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise PlanReviewError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
 
-        plan = self._current_plan(task_id, expected_fingerprint)
-        group_kinds = {group.kind for group in plan.presentation_groups}
-        is_movie = group_kinds == {"movie_continuous"}
-        is_tv = group_kinds == {"tv_episodes"}
-        if not is_movie and not is_tv:
-            raise PlanReviewError("当前文件不在可确认的整理审核中")
-        if (
-            is_movie
-            and plan.metadata.get("mapping_source") != "inventory_smart_completion"
-        ):
-            raise PlanReviewError("当前文件不在电影整理审核中")
-        matching = [
-            (index, entry) for index, entry in enumerate(plan.entries)
-            if entry_id(entry) == selected_entry_id
-        ]
-        if len(matching) != 1:
-            raise PlanReviewError("待确认字体包不存在或不唯一")
-        index, original = matching[0]
-        if (
-            original.media_kind != "associated"
-            or not is_supported_font_archive(original.source_path)
-        ):
-            raise PlanReviewError("仅支持把 .7z 或 .zip 明确设为字体包")
-        asset = original.presentation_asset
-        if asset is None:
-            raise PlanReviewError("字体包缺少电影呈现分组")
-        entries = list(plan.entries)
-        entries[index] = replace(
-            original,
-            role="font",
-            requires_review=True,
-            evidence=original.evidence + (str(reason).strip(),),
-            presentation_asset=PresentationAssetPlanContract(
-                asset.presentation_group,
-                AssetRole("associated"),
-                None,
-                None,
-                "shared",
-            ),
-        )
-        revised = replace(
-            plan,
-            entries=tuple(entries),
-            revision_parent_fingerprint=expected_fingerprint,
-            revision_action=f"confirm_font_archive:{selected_entry_id}",
-            revision_reason=str(reason).strip(),
-        )
-        if is_movie:
-            revised = self._finalize_completed_movie_plan(revised)
-        else:
-            # Import lazily to avoid a module cycle while ensuring review and
-            # production planning consume the same SeriesCatalog-aware font
-            # finalizer rather than maintaining a second projection.
-            from .process import _freeze_tv_font_asset_contract
+    def record_source_partition_revision(self, revised: RenamePlan) -> RenamePlan:
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise PlanReviewError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
 
-            revised = _freeze_tv_font_asset_contract(revised)
-        return self._persist_revision(revised) if persist_revision else revised
 
-    def confirm_movie_font_archive(
-        self,
-        task_id: str,
-        expected_fingerprint: str,
-        selected_entry_id: str,
-        *,
-        reason: str,
-        persist_revision: bool = True,
-    ) -> RenamePlan:
-        """Compatibility entry for existing movie review callers."""
-
-        return self.confirm_font_archive(
-            task_id,
-            expected_fingerprint,
-            selected_entry_id,
-            reason=reason,
-            persist_revision=persist_revision,
-        )
 
     def apply_provider_special_decision(
-        self,
-        task_id: str,
-        expected_fingerprint: str,
-        selected_entry_id: str,
-        *,
-        decision: Mapping[str, object],
-        reason: str,
-        persist_revision: bool = True,
+        self, task_id: str, expected_fingerprint: str, selected_entry_id: str, *,
+        decision: Mapping[str, object], reason: str, persist_revision: bool = True,
     ) -> RenamePlan:
-        """Project one explicit official-special or keep-extra decision."""
-
+        """Commit explicit authority; pure projection is shared with replay/verifier."""
+        from . import special_decision_projection
+        from .decision_state import DecisionCommandService
         plan = self._current_plan(task_id, expected_fingerprint)
-        if {group.kind for group in plan.presentation_groups} != {"tv_episodes"}:
-            raise PlanReviewError("特别篇决定只适用于按季和集整理")
-        matching = [
-            (index, entry) for index, entry in enumerate(plan.entries)
-            if entry_id(entry) == selected_entry_id
-        ]
-        if len(matching) != 1:
-            raise PlanReviewError("待确认特别篇文件不存在或不唯一")
-        candidates = plan.metadata.get("provider_special_candidates")
-        rows = (
-            candidates.get(selected_entry_id)
-            if isinstance(candidates, Mapping) else None
-        )
-        if not isinstance(rows, (list, tuple)) or not rows:
-            raise PlanReviewError("当前文件没有冻结的官方特别篇候选")
-        action = str(decision.get("action") or "")
-        if action not in {"confirmed_official_special", "unmatched_extra"}:
-            raise PlanReviewError("特别篇决定无效")
-        index, original = matching[0]
-        group_id = plan.presentation_groups[0].group_id
-        work_root_value = str(
-            plan.metadata.get("canonical_work_root")
-            or plan.metadata.get("target_root")
-            or ""
-        ).strip()
-        if not work_root_value:
-            raise PlanReviewError("当前计划缺少作品目标目录")
-        work_root = Path(work_root_value)
-        metadata = dict(plan.metadata)
-        stored = dict(metadata.get("provider_special_decisions") or {})
-        stored[selected_entry_id] = dict(decision)
-        metadata["provider_special_decisions"] = stored
-        entries = list(plan.entries)
-        if action == "confirmed_official_special":
-            expected = {
-                key: decision.get(key) for key in (
-                    "provider_namespace", "provider_entity_type", "provider_id",
-                    "season_number", "episode_number", "provider_episode_id",
-                )
-            }
-            if not any(
-                isinstance(row, Mapping)
-                and all(row.get(key) == value for key, value in expected.items())
-                for row in rows
-            ):
-                raise PlanReviewError("所选官方特别篇候选已变化，请刷新后重试")
-            season = int(decision["season_number"])
-            episode = int(decision["episode_number"])
-            target = (
-                work_root / f"Season {season:02d}"
-                / f"{work_root.name} S{season:02d}E{episode:02d}"
-                f"{original.source_path.suffix.lower()}"
-            )
-            entries[index] = replace(
-                original,
-                target_path=target,
-                season_id=season,
-                episode_id=episode,
-                role="main_episode",
-                requires_review=True,
-                evidence=original.evidence + (str(reason).strip(),),
-                presentation_asset=PresentationAssetPlanContract(
-                    group_id,
-                    AssetRole("content_version"),
-                    None,
-                    build_default_version_descriptor(group_id, season, episode),
-                ),
-            )
-            for subtitle_index, subtitle_entry in enumerate(entries):
-                subtitle = subtitle_entry.subtitle
-                if (
-                    subtitle is None
-                    or subtitle.associated_video_source_path is None
-                    or _path_key(subtitle.associated_video_source_path)
-                    != _path_key(original.source_path)
-                ):
-                    continue
-                subtitle_target = format_subtitle_target_fields(
-                    target_video=target,
-                    source_subtitle=subtitle_entry.source_path,
-                    primary_language=subtitle.primary_language or "",
-                    script=subtitle.script,
-                    track_title_tokens=subtitle.track_title_tokens,
-                    flags=subtitle.flags,
-                )
-                entries[subtitle_index] = replace(
-                    subtitle_entry,
-                    target_path=subtitle_target,
-                    season_id=season,
-                    episode_id=episode,
-                    requires_review=True,
-                )
-        else:
-            current_season = int(plan.metadata.get("season_number") or 1)
-            stem = normalize_target_stem(original.source_path.stem, work_root.name)
-            target = (
-                work_root / f"Season {current_season:02d}" / JELLYFIN_EXTRAS_DIR
-                / f"{stem or original.source_path.stem}{original.source_path.suffix.lower()}"
-            )
-            entries[index] = replace(
-                original,
-                target_path=target,
-                season_id=current_season,
-                episode_id=None,
-                role="disc_extra",
-                requires_review=True,
-                evidence=original.evidence + (str(reason).strip(),),
-                presentation_asset=PresentationAssetPlanContract(
-                    group_id, AssetRole("extra", "other"), None, None
-                ),
-            )
+        if not str(reason).strip():
+            raise PlanReviewError("特别篇决定必须记录理由")
+        state = self.decision_state_store.load_optional(task_id)
+        decisions = dict(state.provider_special_decisions if state is not None else
+                         plan.metadata.get("provider_special_decisions") or {})
+        if state is not None and state.content_selection is not None:
+            raise PlanReviewError('当前内容计划请使用完整TV特别篇确认入口')
+        decisions[selected_entry_id] = dict(decision)
+        try:
+            revised = special_decision_projection.project_special_decisions(plan, decisions)
+        except special_decision_projection.SpecialDecisionProjectionError as exc:
+            raise PlanReviewError(str(exc)) from exc
         resolved, unresolved = _resolve_asset_collisions(
-            tuple(entries), work_root, package_label=plan.source_root.name
+            revised.entries, Path(str(revised.metadata.get("canonical_work_root") or
+                                     revised.metadata.get("target_root"))),
+            package_label=plan.source_root.name,
         )
-        metadata["asset_collision_unresolved"] = tuple(unresolved)
+        # A collision fallback is not a new authority for a decided bundle.
+        # Keep canonical paths blocked instead of independently relocating sidecars.
+        coherent = []
+        for original, candidate in zip(revised.entries, resolved):
+            if candidate.target_path != original.target_path:
+                unresolved.append(original.source_path.name)
+                coherent.append(original)
+            else:
+                coherent.append(candidate)
         revised = replace(
-            plan,
-            entries=tuple(resolved),
-            metadata=metadata,
+            revised, entries=tuple(coherent),
+            metadata={**revised.metadata, "asset_collision_unresolved": tuple(unresolved)},
             revision_parent_fingerprint=expected_fingerprint,
-            revision_action=f"provider_special:{selected_entry_id}:{action}",
+            revision_action=f"provider_special:{selected_entry_id}:{decision.get('action')}",
             revision_reason=str(reason).strip(),
         )
-        return self._persist_revision(revised) if persist_revision else revised
+        if not persist_revision:
+            return revised
+        if state is None:
+            raise PlanReviewError("此旧任务尚无权威决策状态，请先重新识别")
+        _state, projected = DecisionCommandService(self.decision_state_store, self.plan_store).update(
+            task_id, expected_revision=state.revision,
+            changes={"provider_special_decisions": decisions}, planner=lambda _state: revised,
+            task_terminal=self._revision_task_terminal(task_id),
+        )
+        return self._record_revision(projected)
 
     def _persist_revision(self, revised: RenamePlan) -> RenamePlan:
-        revised = self._finalize_completed_movie_plan(revised)
+        self._require_legacy_content_task(revised.task_id)
+        from .content_selection import require_legacy_writer
+        require_legacy_writer(revised)
 
         revised = persist_plan_revision(
             self.decision_state_store,
@@ -2443,7 +2599,7 @@ class PlanReviewService:
         *,
         state_transform=None,
     ) -> RenamePlan:
-        revised = self._finalize_completed_movie_plan(revised)
+        self._require_legacy_content_task(revised.task_id)
         _decision, projected = commit_recognition_projection(
             self.decision_state_store,
             self.plan_store,
@@ -2454,13 +2610,20 @@ class PlanReviewService:
         )
         return self._record_revision(projected)
 
+    def _require_legacy_content_task(self, task_id):
+        state = self.decision_state_store.load_optional(task_id)
+        if state is not None and state.content_selection is not None:
+            raise PlanReviewError('新内容计划的旧整体改写入口尚未迁移，请使用统一内容选择')
+
     def _revision_task_terminal(self, task_id: str) -> TaskTerminalMutation:
+        from .review_operation import current_provider_selection_review_operation, finish_provider_selection
+        selection = None
 
         def update_task(_decision, projected, current):
             verification = PlanVerifier().verify(projected)
             status = (
                 "need_confirm"
-                if verification.status.value == "accepted"
+                if verification.status.value == "accepted" or projected.metadata.get('pending_work_affiliation') is not None
                 else verification.status.value
             )
             if (
@@ -2475,15 +2638,96 @@ class PlanReviewService:
                 "plan_entry_count": len(projected.entries),
                 "completed_at": None,
             })
+            if projected.revision_action in {'tv_content_season', 'tv_content_work', 'tv_content_range'} or (projected.revision_action == 'work_affiliation_pending' and _decision.season_binding is not None):
+                binding = _decision.season_binding
+                current.update(season_id=binding['season_number'],
+                    season_number=binding['season_number'], season_source=binding['decision_source'])
+            if projected.revision_action == 'movie_domain_correction':
+                current.update(is_anime=projected.work_identity.domain == 'animation', approved_at=None)
+            if projected.revision_action == 'tv_content_work':
+                current.update(approved_at=None, error=None)
             if projected.metadata.get("mapping_source") == "inventory_smart_completion":
                 current["error"] = None
+            if selection is not None and projected.revision_action in {
+                    'tv_content_season', 'tv_content_work', 'initial_tv_completion',
+                    'initial_movie_completion', 'movie_work_correction'}:
+                finish_provider_selection(current, expected=selection,
+                    result_revision=_decision.revision,
+                    result_fingerprint=PlanStore.fingerprint(projected))
             return current
 
-        return TaskTerminalMutation.prepare(
+        terminal = TaskTerminalMutation.prepare(
             self.task_root,
             task_id,
             update_task,
         )
+        try:
+            active, context = current_provider_selection_review_operation(terminal.previous_payload)
+            if context.get('lifecycle') in {'failed', 'awaiting_user'}:
+                selection = active
+        except ValueError:
+            pass  # This revision need not originate from a provider selection.
+        return terminal
+
+    def asset_actions(self):
+        from .asset_actions import AssetActionService
+        service=AssetActionService(plan_store=self.plan_store, decision_store=self.decision_state_store,
+            task_root=self.task_root, record_root=self.record_root, work_catalog=self.work_catalog,
+            series_catalog=self.series_catalog)
+        self.series_catalog.asset_action_context=service
+        return service
+
+    def confirm_asset_repair(self, task_id, expected_fingerprint, *, expected_operation_fingerprint, recovery_preparation=None):
+        return self._confirm_asset_action(task_id, expected_fingerprint,
+            expected_operation_fingerprint=expected_operation_fingerprint,
+            recovery_preparation=recovery_preparation, repair=True)
+
+    def confirm_asset_replacement(self, task_id, expected_fingerprint, *, expected_operation_fingerprint, recovery_preparation=None):
+        return self._confirm_asset_action(task_id, expected_fingerprint,
+            expected_operation_fingerprint=expected_operation_fingerprint,
+            recovery_preparation=recovery_preparation, repair=False)
+
+    def _confirm_asset_action(self, task_id, expected_fingerprint, *, expected_operation_fingerprint, recovery_preparation, repair):
+        from .decision_state import DecisionCommandService
+        current = self._current_plan(task_id, expected_fingerprint)
+        selection = self.movie_selection_for_completion(current)
+        if selection is not None:
+            value = selection.to_dict()
+            chosen = value['replacement']
+            if chosen is None:
+                raise PlanReviewError('请先从已登记电影版本下拉列表明确选择换源版本')
+            record = self.work_catalog.load(value['work_key'])
+            actual = [dict(row) for row in record['versions'] if row.get('version_ref') == chosen['version_ref']]
+            if actual != chosen['versions']:
+                raise PlanReviewError('所选电影版本登记已变化，请重新选择换源范围')
+        payload = json.loads((self.task_root / f'{task_id}.json').read_text('utf-8'))
+        ordinary = (payload.get('workflow_status') in {'need_confirm', 'invalid', 'approved'}
+            and not payload.get('execution_requires_manual_check')
+            and not payload.get('execution_may_have_written_targets')
+            and payload.get('execution_status') in {None, 'not_started', 'dry_run'})
+        if not ordinary:
+            from .asset_execution_recovery import AssetExecutionRecovery
+            context = getattr(self, 'asset_recovery_context', None)
+            if recovery_preparation is None or context is None:
+                raise PlanReviewError('当前任务必须先核查，不能改写正在执行或已完成的批准')
+            checked = AssetExecutionRecovery(context).validate_preparation(recovery_preparation)
+            if (checked.state != 'replan_required' or checked.plan.task_id != task_id
+                    or self.plan_store.fingerprint(checked.plan) != expected_fingerprint):
+                raise PlanReviewError('旧事务不满足安全重新生成条件')
+        actions = self.asset_actions()
+        operation, draft = (actions.prepare_missing if repair else actions.prepare_replacement)(current)
+        if operation.fingerprint != expected_operation_fingerprint or operation.to_dict()['mode'] != ('repair' if repair else 'replace'):
+            raise PlanReviewError('换源范围或文件已变化，请重新核对')
+        state = self.decision_state_store.load(task_id)
+        def update_task(_decision, projected, payload):
+            retained = {key: value for key, value in payload.items() if not key.startswith('execution_')}
+            return {**retained, 'workflow_status': 'need_confirm', 'execution_status': None, 'queue_operation': None,
+                'approved_at': None, 'completed_at': None, 'error': None,
+                'execution_requires_manual_check': False, 'execution_may_have_written_targets': False}
+        _, revised = DecisionCommandService(self.decision_state_store, self.plan_store).update(
+            task_id, expected_revision=state.revision, changes={'asset_operation': operation},
+            planner=lambda _: draft, task_terminal=TaskTerminalMutation.prepare(self.task_root, task_id, update_task))
+        return self._record_revision(revised)
 
     def _record_revision(self, revised: RenamePlan) -> RenamePlan:
         self._save(PlanReviewDecision(
@@ -2492,231 +2736,7 @@ class PlanReviewService:
         ))
         return revised
 
-    def _finalize_completed_movie_plan(self, plan: RenamePlan) -> RenamePlan:
-        """Freeze strict movie-font routing at the single Plan persistence exit."""
 
-        metadata = dict(plan.metadata)
-        if (
-            metadata.get("mapping_source") != "inventory_smart_completion"
-            or {group.kind for group in plan.presentation_groups} != {"movie_continuous"}
-            or plan.work_identity is None
-            or plan.work_identity.status != "confirmed"
-        ):
-            return plan
-        fonts = [
-            entry for entry in plan.entries
-            if is_font_archive(entry.source_path) or (
-                entry.role == "font" and is_supported_font_archive(entry.source_path)
-            )
-        ]
-        if not fonts:
-            if not {
-                "associated_asset_manifest", "work_font_intent"
-            }.intersection(metadata):
-                return plan
-            metadata.pop("associated_asset_manifest", None)
-            metadata.pop("work_font_intent", None)
-            return replace(plan, metadata=metadata)
-        root_value = str(metadata.get("canonical_work_root") or "").strip()
-        work_key = str(
-            metadata.get("catalog_work_key")
-            or metadata.get("proposed_work_key")
-            or ""
-        )
-        if not root_value or not work_key:
-            return plan
-        canonical_root = Path(root_value)
-        unresolved = [
-            item for item in metadata.get("asset_collision_unresolved", ())
-            if not _unresolved_references_sources(item, {entry.source_path for entry in fonts})
-        ]
-        evidence_by_source = {}
-        for entry in fonts:
-            try:
-                evidence_by_source[entry.source_path] = fingerprint_file(entry.source_path)
-            except AssetCollisionError as exc:
-                unresolved.append({
-                    "code": "movie_font_source_evidence_unavailable",
-                    "source_path": str(entry.source_path),
-                    "target_path": str(entry.target_path),
-                    "detail": str(exc),
-                })
-        identities = {
-            (evidence.sha256, evidence.size)
-            for evidence in evidence_by_source.values()
-        }
-        catalog_exists = (self.work_catalog.root / f"{work_key}.json").is_file()
-        try:
-            intent_store = WorkIntentStore(self.work_catalog.root)
-            current_content_keys = tuple(
-                make_content_key(size=size, digest=digest)
-                for digest, size in identities
-            )
-            derived_intent_key = derive_work_intent_key(
-                primary_provider=plan.work_identity.primary_provider,
-                group_kind="movie_continuous",
-            )
-            if (
-                catalog_exists
-                and metadata.get("catalog_work_key")
-                and derived_intent_key != work_key
-            ):
-                intent_snapshot = intent_store.load(work_key)
-                if not set(current_content_keys).issubset(
-                    set(intent_snapshot.content_keys)
-                ):
-                    raise WorkIntentError(
-                        "既有作品登记未授权当前字体内容"
-                    )
-            else:
-                intent_snapshot = intent_store.observe(
-                    primary_provider=plan.work_identity.primary_provider,
-                    group_kind="movie_continuous",
-                    content_keys=current_content_keys,
-                )
-        except WorkIntentError as exc:
-            raise PlanReviewError(f"无法冻结作品级字体意图：{exc}") from exc
-        primary_content_key = intent_snapshot.primary_content_key
-        registered_locations = set()
-        try:
-            if catalog_exists:
-                registered_locations = {
-                    _path_key(path)
-                    for path in self.work_catalog.validated_font_locations(work_key)
-                }
-        except WorkCatalogError as exc:
-            for entry in fonts:
-                unresolved.append({
-                    "code": "movie_font_catalog_evidence_conflict",
-                    "source_path": str(entry.source_path),
-                    "target_path": str(entry.target_path),
-                    "detail": str(exc),
-                })
-        revised_entries = []
-        manifest_assets = []
-        planned_identities = set()
-        planned_targets = set()
-        for entry in plan.entries:
-            if entry not in fonts:
-                revised_entries.append(entry)
-                continue
-            source_evidence = evidence_by_source.get(entry.source_path)
-            if source_evidence is None:
-                revised_entries.append(entry)
-                continue
-            identity = (source_evidence.sha256, source_evidence.size)
-            content_key = make_content_key(
-                size=source_evidence.size,
-                digest=source_evidence.sha256,
-            )
-            trusted = None
-            try:
-                if catalog_exists:
-                    trusted = self.work_catalog.resolve_font_location(
-                        work_key,
-                        size=source_evidence.size,
-                        digest=source_evidence.sha256,
-                    )
-                primary_target = canonical_font_archive_target(
-                    canonical_root,
-                    source_evidence.sha256,
-                    disambiguate=False,
-                    archive_suffix=entry.source_path.suffix,
-                )
-                target = trusted or canonical_font_archive_target(
-                    canonical_root,
-                    source_evidence.sha256,
-                    disambiguate=(
-                        content_key != primary_content_key
-                        or _path_key(primary_target) in registered_locations
-                    ),
-                    archive_suffix=entry.source_path.suffix,
-                )
-            except (WorkCatalogError, FontArchiveContractError) as exc:
-                unresolved.append({
-                    "code": "movie_font_catalog_evidence_conflict",
-                    "source_path": str(entry.source_path),
-                    "target_path": str(entry.target_path),
-                    "detail": str(exc),
-                })
-                revised_entries.append(entry)
-                continue
-            target_key = _path_key(target)
-            if identity in planned_identities or target_key in planned_targets:
-                unresolved.append({
-                    "code": "movie_font_duplicate_content",
-                    "source_path": str(entry.source_path),
-                    "target_path": str(target),
-                    "detail": "同一电影计划包含重复字体内容",
-                })
-            planned_identities.add(identity)
-            planned_targets.add(target_key)
-            collision = None
-            if trusted is not None:
-                try:
-                    collision = build_reuse_resolution(entry.source_path, target)
-                except AssetCollisionError as exc:
-                    unresolved.append({
-                        "code": "movie_font_catalog_evidence_conflict",
-                        "source_path": str(entry.source_path),
-                        "target_path": str(target),
-                        "detail": str(exc),
-                    })
-            elif os.path.lexists(target):
-                unresolved.append({
-                    "code": "movie_font_unregistered_target_conflict",
-                    "source_path": str(entry.source_path),
-                    "target_path": str(target),
-                    "detail": "字体目标已存在但没有可信作品登记",
-                })
-            group_id = plan.presentation_groups[0].group_id
-            revised = replace(
-                entry,
-                target_path=target,
-                media_kind="associated",
-                role="font",
-                collision_resolution=collision,
-                presentation_asset=PresentationAssetPlanContract(
-                    group_id,
-                    AssetRole("associated"),
-                    None,
-                    None,
-                    "shared",
-                ),
-            )
-            revised_entries.append(revised)
-            manifest_assets.append({
-                "role": "fonts",
-                "scope": "work",
-                "season_number": None,
-                "source_path": str(revised.source_path),
-                "target_path": str(revised.target_path),
-                "source_size": source_evidence.size,
-                "source_sha256": source_evidence.sha256,
-            })
-        metadata["associated_asset_manifest"] = {
-            "schema_version": 1,
-            "scope": "work",
-            "catalog_binding": {"backend": "work", "key": work_key},
-            "assets": tuple(manifest_assets),
-        }
-        metadata["work_font_intent"] = intent_snapshot.to_plan_contract(
-            store_root=intent_store.root,
-            assets=(
-                {
-                    "source_path": item["source_path"],
-                    "target_path": item["target_path"],
-                    "content_key": make_content_key(
-                        size=int(item["source_size"]),
-                        digest=str(item["source_sha256"]),
-                    ),
-                    "action": WORK_FONT_CONDITIONAL_ACTION,
-                }
-                for item in manifest_assets
-            ),
-        )
-        metadata["asset_collision_unresolved"] = tuple(unresolved)
-        return replace(plan, entries=tuple(revised_entries), metadata=metadata)
 
     def persist_unapproved_revision(self, revised: RenamePlan) -> RenamePlan:
         """Persist a service-generated revision and invalidate old approval."""
@@ -2743,7 +2763,9 @@ class PlanReviewService:
     ) -> RenamePlan:
         """Apply one immutable file/current-Plan-series rule atomically."""
 
-        plan = self._current_plan(task_id, expected_fingerprint)
+        current = self._current_plan(task_id, expected_fingerprint)
+        from .content_choice import subtitle_edit_view
+        plan = subtitle_edit_view(current)
         if not str(reason).strip():
             raise PlanReviewError("字幕人工决定必须填写理由")
         matching = [
@@ -2765,23 +2787,6 @@ class PlanReviewService:
             raise PlanReviewError("当前 Plan 缺少稳定 TMDB TV 身份，不能使用当前系列作用域")
         disposition_tuple = tuple(unknown_dispositions)
         _validate_unknown_dispositions(contract.unknown_tokens, disposition_tuple)
-        matcher = _subtitle_matcher(contract)
-        impacted = [selected_index]
-        if parsed_scope == SubtitleOverrideScope.SERIES:
-            impacted = [
-                index for index, entry in enumerate(plan.entries)
-                if entry.media_kind == "subtitle"
-                and entry.subtitle is not None
-                and _subtitle_matcher(entry.subtitle) == matcher
-            ]
-        if not impacted:
-            raise PlanReviewError("字幕规则没有命中任何当前 Plan 条目")
-
-        scope_id = (
-            f"{plan.task_id}:{selected_entry_id}:{expected_fingerprint}"
-            if parsed_scope == SubtitleOverrideScope.FILE
-            else plan.series_scope.scope_id  # type: ignore[union-attr]
-        )
         outcome = SubtitleRuleOutcome(
             primary_language=str(primary_language),
             script=script,
@@ -2791,106 +2796,26 @@ class PlanReviewService:
             flags=tuple(str(item) for item in flags),
             unknown_dispositions=disposition_tuple,
         )
-        rule_id = uuid.uuid4().hex
-        unsigned = SubtitleOverrideRule(
-            rule_id=rule_id,
-            scope=parsed_scope,
-            scope_id=scope_id,
-            base_plan_fingerprint=expected_fingerprint,
-            selected_entry_id=selected_entry_id,
-            matcher=matcher,
-            outcome=outcome,
-            reason=str(reason).strip(),
-            rule_fingerprint="",
-        )
-        rule_fingerprint = _rule_fingerprint(unsigned)
-        rule = replace(unsigned, rule_fingerprint=rule_fingerprint)
+        from .subtitle_batch import make_rule
+        rule = make_rule(plan, expected_fingerprint, original, outcome, parsed_scope, str(reason).strip())
 
-        entries = list(plan.entries)
-        for index in impacted:
-            current = entries[index]
-            current_contract = current.subtitle
-            assert current_contract is not None
-            selected_video = (
-                associated_video_source_path or current_contract.associated_video_source_path
-                if parsed_scope == SubtitleOverrideScope.FILE
-                else current_contract.associated_video_source_path
-            )
-            if selected_video is None:
-                raise PlanReviewError("未关联字幕必须先选择一个视频源文件")
-            associated_source = Path(selected_video)
-            videos = [
-                entry for entry in plan.entries
-                if entry.media_kind == "video"
-                and os.path.normpath(str(entry.source_path)).casefold()
-                == os.path.normpath(str(associated_source)).casefold()
-            ]
-            if len(videos) != 1:
-                raise PlanReviewError("字幕关联的视频条目不存在或不唯一")
+        owners = ((str(original.source_path), str(associated_video_source_path)),) if associated_video_source_path is not None else ()
+        return self._commit_subtitle_edit(current, plan.subtitle_override_rules + (rule,),
+            owners=owners, action=f'apply_subtitle_rule:{rule.rule_id}', reason=str(reason).strip(), persist=_persist)
 
-            titles = _titles_for_contract(
-                outcome.track_title_tokens,
-                current_contract.unknown_tokens,
-                outcome.unknown_dispositions,
-            )
-            revised_contract = replace(
-                current_contract,
-                associated_video_source_path=associated_source,
-                primary_language=outcome.primary_language,
-                script=outcome.script,
-                region_hint=outcome.region_hint,
-                additional_languages=outcome.additional_languages,
-                track_title_tokens=titles,
-                flags=outcome.flags,
-                unknown_dispositions=_dispositions_for_contract(
-                    current_contract.unknown_tokens, outcome.unknown_dispositions
-                ),
-                association_state=DimensionResolution.RESOLVED,
-                parse_state=DimensionResolution.RESOLVED,
-                decision_source=f"manual_{parsed_scope.value}",
-                manual_reason=str(reason).strip(),
-                reason_codes=current_contract.reason_codes + ("SUBTITLE_MANUAL_RULE",),
-                applied_rule_id=rule.rule_id,
-                applied_rule_fingerprint=rule.rule_fingerprint,
-                applied_rule_scope=rule.scope.value,
-                applied_rule_engine_version=rule.engine_version,
-            )
-            try:
-                target = format_subtitle_target_fields(
-                    target_video=videos[0].target_path,
-                    source_subtitle=current.source_path,
-                    primary_language=revised_contract.primary_language or "",
-                    script=revised_contract.script,
-                    track_title_tokens=revised_contract.track_title_tokens,
-                    flags=revised_contract.flags,
-                )
-            except ValueError as exc:
-                raise PlanReviewError(f"字幕目标无法格式化：{exc}") from exc
-            entries[index] = replace(
-                current,
-                target_path=target,
-                subtitle=revised_contract,
-                requires_review=True,
-                evidence=current.evidence + (str(reason).strip(),),
-            )
+    def adjust_subtitles(self, task_id, expected_fingerprint, selected_entry_ids, *,
+                         main_language, additional_languages=(), remove_tags=(), _persist=True):
+        """保存当前计划明确选中的字幕，整批只有一个新修订。"""
+        current = self._current_plan(task_id, expected_fingerprint)
+        return self._commit_subtitle_edit(current, (),
+            batch=(tuple(selected_entry_ids), main_language, tuple(additional_languages), tuple(remove_tags)),
+            action='apply_subtitle_batch', reason='调整字幕结构', persist=_persist)
 
-        revised = replace(
-            plan,
-            entries=tuple(entries),
-            subtitle_override_rules=plan.subtitle_override_rules + (rule,),
-            revision_parent_fingerprint=expected_fingerprint,
-            revision_action=f"apply_subtitle_rule:{rule.rule_id}",
-            revision_reason=str(reason).strip(),
-        )
-        verification = PlanVerifier().verify(
-            revised, validate_projection_receipt=False
-        )
-        if verification.issues:
-            codes = ", ".join(issue.code for issue in verification.issues)
-            raise PlanReviewError(f"字幕人工规则未通过 Verifier：{codes}")
-        if _persist:
-            revised = self._persist_revision(revised)
-        return revised
+    def _commit_subtitle_edit(self, current, rules, *, action, reason, owners=(), persist=True, batch=()):
+        from .public_revision import SubtitleChange, commit
+        command = SubtitleChange(current.task_id, self.plan_store.fingerprint(current), rules, owners, action, reason, batch)
+        _, projected = commit(self, command, task_terminal=self._revision_task_terminal(current.task_id), persist=persist)
+        return self._record_revision(projected) if persist else projected
 
     def revert_subtitle_rule(
         self,
@@ -2909,27 +2834,10 @@ class PlanReviewService:
             raise PlanReviewError("待撤销的字幕规则不存在或不唯一")
         if not current.subtitle_override_rules or current.subtitle_override_rules[-1].rule_id != rule_id:
             raise PlanReviewError("首版只允许撤销最后应用的字幕规则，避免丢失后续修订")
-        try:
-            base = self.plan_store.load_version(task_id, rules[0].base_plan_fingerprint)
-        except PlanStoreError as exc:
-            raise PlanReviewError(f"无法读取字幕规则基线 Plan：{exc}") from exc
-        revised = replace(
-            base,
-            revision_parent_fingerprint=expected_fingerprint,
-            revision_action=f"revert_subtitle_rule:{rule_id}",
-            revision_reason=str(reason).strip(),
-        )
-        verification = PlanVerifier().verify(
-            revised, validate_projection_receipt=False
-        )
-        base_issue_codes = tuple(
-            issue.code for issue in PlanVerifier().verify(base).issues
-        )
-        revised_issue_codes = tuple(issue.code for issue in verification.issues)
-        if revised_issue_codes != base_issue_codes:
-            codes = ", ".join(issue.code for issue in verification.issues)
-            raise PlanReviewError(f"撤销引入了新的 Verifier 问题：{codes}")
-        return self._persist_revision(revised)
+        from .subtitle_batch import rule_batches
+        first = rule_batches(current.subtitle_override_rules)[-1][0]
+        return self._commit_subtitle_edit(current, current.subtitle_override_rules[:first],
+            action=f'revert_subtitle_rule:{rule_id}', reason=str(reason).strip())
 
     def _current_plan(
         self, task_id: str, expected_fingerprint: str
@@ -3004,19 +2912,30 @@ def _movie_version_tokens(
     value: str,
     *,
     layer_label: str,
+    collection_hint: bool = False,
 ) -> tuple[Optional[str], Optional[str]]:
     """Parse one trusted evidence layer and reject same-layer conflicts."""
 
     normalized = unicodedata.normalize("NFKC", str(value)).casefold()
     token_text = re.sub(r"[^a-z0-9.+]+", " ", normalized)
     resolutions = set()
-    if re.search(r"(?<!\d)(2160p|4k)(?!\d)", normalized):
+    # Mastering labels such as RM4K are not encoded pixel dimensions.
+    if re.search(r"(?<![a-z0-9])(2160p|4k)(?![a-z0-9])", normalized):
         resolutions.add("2160p")
-    if re.search(r"(?<!\d)1080[pi]?(?!\d)", normalized):
+    if re.search(r"(?<![a-z0-9])1080[pi]?(?![a-z0-9])", normalized):
         resolutions.add("1080p")
-    if re.search(r"(?<!\d)720[pi]?(?!\d)", normalized):
+    if re.search(r"(?<![a-z0-9])720[pi]?(?![a-z0-9])", normalized):
         resolutions.add("720p")
-    if len(resolutions) > 1:
+    for width, height in re.findall(r"(?<!\d)(\d{3,4})\s*[x×]\s*(\d{3,4})(?!\d)", normalized):
+        width, height = int(width), int(height)
+        # Retain a class, not a claim that a cropped image has 2160 rows.
+        if width in {3840, 4096} and 1080 < height <= 2160:
+            resolutions.add('2160p')
+        elif (width == 1920 and 720 < height <= 1080) or (height == 1080 and 1280 < width < 3840):
+            resolutions.add('1080p')
+        elif width == 1280 and 480 < height <= 720:
+            resolutions.add('720p')
+    if len(resolutions) > 1 and not collection_hint:
         raise PlanReviewError(
             f"电影版本规格证据冲突：{layer_label}包含多个分辨率 token"
         )
@@ -3028,7 +2947,7 @@ def _movie_version_tokens(
     ):
         dynamic_ranges["dolby_vision"] = (
             "Dolby Vision P8.1"
-            if re.search(r"(?:p?8[ ._-]*1|8\.1)", normalized)
+            if re.search(r"(?:dovi|dv|dolby[ ._-]*vision)[ ._-]*p?8[ ._-]*1(?!\d)", normalized)
             else "Dolby Vision"
         )
     if re.search(r"(?<![a-z0-9])hdr10\s*\+(?![a-z0-9])", normalized):
@@ -3037,13 +2956,14 @@ def _movie_version_tokens(
         dynamic_ranges["hdr10"] = "HDR10"
     if re.search(r"\bsdr\b", token_text):
         dynamic_ranges["sdr"] = "SDR"
-    if len(dynamic_ranges) > 1:
+    incompatible = 'sdr' in dynamic_ranges and len(dynamic_ranges) > 1
+    if incompatible and not collection_hint:
         raise PlanReviewError(
             f"电影版本规格证据冲突：{layer_label}包含多个动态范围 token"
         )
     return (
-        next(iter(resolutions), None),
-        next(iter(dynamic_ranges.values()), None),
+        next(iter(resolutions), None) if len(resolutions) <= 1 else None,
+        (' '.join(dynamic_ranges.values()) or None) if not incompatible else None,
     )
 
 
@@ -3075,6 +2995,7 @@ def _infer_movie_version_descriptor(
         layer_resolution, layer_dynamic_range = _movie_version_tokens(
             value,
             layer_label=layer_label,
+            collection_hint=layer_label != "文件名",
         )
         if layer_resolution is not None:
             resolution_evidence.append((layer_resolution, layer_label))
@@ -3097,18 +3018,22 @@ def _infer_movie_version_descriptor(
         )
         for value, _label in dynamic_range_evidence
     }
-    if len(dynamic_families) > 1:
+    if 'sdr' in dynamic_families and len(dynamic_families) > 1:
         raise PlanReviewError(
             "电影版本规格证据冲突：文件名与冻结 source_root 范围内目录"
             "给出不同动态范围"
         )
     dynamic_values = {value for value, _label in dynamic_range_evidence}
-    if "Dolby Vision P8.1" in dynamic_values:
-        dynamic_range = "Dolby Vision P8.1"
-    elif "HDR10+" in dynamic_values:
-        dynamic_range = "HDR10+"
-    else:
-        dynamic_range = next(iter(dynamic_values), None)
+    dynamic_parts = []
+    if any('Dolby Vision' in value for value in dynamic_values):
+        dynamic_parts.append('Dolby Vision P8.1' if any('P8.1' in value for value in dynamic_values) else 'Dolby Vision')
+    if any('HDR10+' in value for value in dynamic_values):
+        dynamic_parts.append('HDR10+')
+    elif any('HDR10' in value for value in dynamic_values):
+        dynamic_parts.append('HDR10')
+    if 'SDR' in dynamic_values:
+        dynamic_parts.append('SDR')
+    dynamic_range = ' '.join(dynamic_parts) or None
     parts = tuple(item for item in (resolution, dynamic_range) if item)
     label = " ".join(parts) or None
     technical_key = "-".join(
@@ -3219,119 +3144,15 @@ def _resolve_asset_collisions(
     *,
     package_label: Optional[str] = None,
 ) -> tuple[list[PlanEntry], list[str]]:
-    """Freeze identical-content reuse or choose a version-scoped new target."""
-
-    descriptors = {
-        asset.version_descriptor.version_ref: asset.version_descriptor
-        for entry in entries
-        if (asset := entry.presentation_asset) is not None
-        and asset.version_descriptor is not None
-        and asset.version_descriptor.version_ref is not None
-    }
-    revised = []
-    unresolved = []
-    for entry in entries:
-        if not os.path.lexists(entry.target_path):
-            revised.append(entry)
-            continue
-        asset = entry.presentation_asset
-        if (
-            asset is None
-            or asset.asset_role.kind not in {"extra", "associated"}
-            or entry.media_kind == "subtitle"
-        ):
-            unresolved.append(entry.source_path.name)
-            revised.append(entry)
-            continue
-        resolution = _reuse_resolution(entry.source_path, entry.target_path)
-        if resolution is not None:
-            revised.append(replace(
-                entry,
-                collision_resolution=resolution,
-                evidence=entry.evidence + (
-                    "既有目标与本次源文件完整 SHA-256 相同，将复用已有文件",
-                ),
-            ))
-            continue
-        owner = asset.owner_version_ref
-        descriptor = descriptors.get(owner) if owner not in {None, "shared"} else None
-        label = _safe_media_name(descriptor.display_label or "") if descriptor else ""
-        package = _safe_media_name(package_label or "")
-        candidate = None
-        if label and asset.asset_role.kind == "associated":
-            try:
-                relative = entry.target_path.relative_to(work_root / "Associated")
-            except ValueError:
-                relative = Path(entry.target_path.name)
-            candidate = work_root / "Associated" / label / relative
-        elif label and asset.asset_role.kind == "extra":
-            if _normalized_key(label) not in _normalized_key(entry.target_path.stem):
-                candidate = entry.target_path.with_name(
-                    f"{entry.target_path.stem} - {label}{entry.target_path.suffix}"
-                )
-        if candidate is not None:
-            if not os.path.lexists(candidate):
-                revised.append(replace(
-                    entry,
-                    target_path=candidate,
-                    collision_resolution=None,
-                    evidence=entry.evidence + (
-                        f"同名资产内容不同，按版本 {label} 保存",
-                    ),
-                ))
-                continue
-            candidate_reuse = _reuse_resolution(entry.source_path, candidate)
-            if candidate_reuse is not None:
-                revised.append(replace(
-                    entry,
-                    target_path=candidate,
-                    collision_resolution=candidate_reuse,
-                    evidence=entry.evidence + (
-                        f"版本目录中的既有资产与来源包内容相同，将复用已有文件",
-                    ),
-                ))
-                continue
-
-        package_candidate = None
-        if package and asset.asset_role.kind == "associated":
-            try:
-                relative = entry.target_path.relative_to(work_root / "Associated")
-            except ValueError:
-                relative = Path(entry.target_path.name)
-            package_candidate = (
-                work_root / "Associated" / label / package / relative
-                if label else work_root / "Associated" / "Packages" / package / relative
-            )
-        elif package and asset.asset_role.kind == "extra":
-            suffix = f" - {label}" if label else ""
-            package_candidate = entry.target_path.with_name(
-                f"{entry.target_path.stem}{suffix} - {package}{entry.target_path.suffix}"
-            )
-        if package_candidate is not None:
-            if not os.path.lexists(package_candidate):
-                revised.append(replace(
-                    entry,
-                    target_path=package_candidate,
-                    collision_resolution=None,
-                    evidence=entry.evidence + (
-                        "同名资产内容不同，按来源包建立独立目标",
-                    ),
-                ))
-                continue
-            package_reuse = _reuse_resolution(entry.source_path, package_candidate)
-            if package_reuse is not None:
-                revised.append(replace(
-                    entry,
-                    target_path=package_candidate,
-                    collision_resolution=package_reuse,
-                    evidence=entry.evidence + (
-                        "同一来源包目标内容相同，将复用已有文件",
-                    ),
-                ))
-                continue
-        unresolved.append(entry.source_path.name)
-        revised.append(entry)
-    return revised, unresolved
+    """Observe and replay the shared frozen collision projector."""
+    from .collision_projection import observe_collisions, CollisionProbes, CollisionProjection
+    try:
+        _probes, result = observe_collisions(tuple(entries), work_root, package_label=package_label)
+        if type(_probes) is not CollisionProbes or type(result) is not CollisionProjection:
+            raise PlanReviewError('碰撞观察或投影器已断开')
+        return list(result.entries), list(result.unresolved)
+    except AssetCollisionError as exc:
+        raise PlanReviewError(str(exc)) from exc
 
 
 def _unresolved_references_sources(

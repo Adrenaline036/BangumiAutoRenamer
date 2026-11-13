@@ -28,6 +28,9 @@ from src.rename.rename_plan import (
     WorkIdentity,
 )
 from src.rename.series_catalog import SERIES_CATALOG_SCHEMA_VERSION
+from src.rename.series_catalog import SeriesCatalog
+from src.rename.series_registration import manual_tv_binding
+from tests.legacy_series_fixture import write_legacy_series_catalog_fixture
 from src.rename.work_catalog import WORK_CATALOG_SCHEMA_VERSION
 from tests.presentation_fixtures import with_movie_presentation, with_tv_presentation
 from tests.projection_test_support import save_plan_fixture
@@ -168,11 +171,14 @@ def _movie_plan(root: Path, task_id: str) -> RenamePlan:
             "target_root": str(target_root),
             "catalog_work_key": WORK_KEY,
             "catalog_revision": 3,
+            "canonical_work_root": str(target_root / "Movie (2024)"),
         },
         execution_policy=ExecutionPolicy(target_root=target_root, dry_run=False),
         work_identity=_movie_work_identity(),
     )
-    return with_movie_presentation(plan)
+    from src.rename.movie_version_selection import create_selection, project_selection
+    presented = with_movie_presentation(plan)
+    return project_selection(presented, create_selection(presented, registered_versions=()))
 
 
 def _approve(root: Path, plan: RenamePlan):
@@ -203,6 +209,8 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
             task_id = "movie-key-drift"
             decisions = DecisionStateStore(root / "decision")
             identity = _movie_work_identity()
+            from src.rename.movie_version_selection import from_plan
+            prepared_plan = _movie_plan(root, task_id)
             old_state = decisions.save(
                 DecisionState(
                     task_id=task_id,
@@ -210,6 +218,7 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
                     provider_evidence=(identity.primary_provider.to_dict(),),
                     library_domain="animation",
                     layout_mode="movie_versions",
+                    movie_version_selection=from_plan(prepared_plan),
                     catalog_link_intent={
                         "work_key": WORK_KEY,
                         "catalog_revision": 3,
@@ -218,7 +227,7 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
                 expected_revision=-1,
             )
             old_plan = decisions.project_plan(
-                old_state, _movie_plan(root, task_id)
+                old_state, prepared_plan
             )
             plan_store, review, fingerprint = _approve(root, old_plan)
             current_state = decisions.load(task_id)
@@ -322,7 +331,7 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
                 expected_revision=current_state.revision,
             )
             task_root = root / "task"
-            task_root.mkdir()
+            task_root.mkdir(exist_ok=True)
             (task_root / f"{old_plan.task_id}.json").write_text(
                 json.dumps({
                     "uuid": old_plan.task_id,
@@ -434,7 +443,7 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
             plan = decisions.project_plan(state, _tv_plan(root, task_id))
             plan_store, review, fingerprint = _approve(root, plan)
             task_root = root / "task"
-            task_root.mkdir()
+            task_root.mkdir(exist_ok=True)
             (task_root / f"{task_id}.json").write_text(
                 json.dumps({
                     "uuid": task_id,
@@ -577,7 +586,7 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
             canonical_root.mkdir(parents=True)
             plan_store, review, fingerprint = _approve(root, plan)
             task_root = root / "task"
-            task_root.mkdir()
+            task_root.mkdir(exist_ok=True)
             (task_root / f"{task_id}.json").write_text(
                 json.dumps({
                     "uuid": task_id,
@@ -638,7 +647,7 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
                 "uuid": task_id,
                 "path": str(source),
                 "name": "Example",
-                "is_anime": True,
+                "is_anime": False,
                 "movie_inventory": inventory_movie_assets(source).to_dict(),
                 "draft_target_root": str(root / "library"),
                 "provider_identity": {
@@ -663,43 +672,27 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
                 reason="initial legacy Work projection",
                 root_snapshot=routing_snapshot_for(
                     root / "library",
-                    domain="animation", group_kind="tv_episodes",
+                    domain="general", group_kind="tv_episodes",
                 ),
-                work_domain="animation",
+                work_domain="general",
                 season_number=1,
                 season_source="provider",
             )
             new_series_root = root / "library" / "Series Example (2024)"
             series_catalog_root = root / "series_catalog"
-            series_catalog_root.mkdir()
-            (series_catalog_root / f"{SERIES_KEY}.json").write_text(
-                json.dumps({
-                    "schema_version": SERIES_CATALOG_SCHEMA_VERSION,
-                    "series_key": SERIES_KEY,
-                    "revision": 0,
-                    "canonical_root": str(new_series_root),
-                    "canonical_display_name": "Series Example",
-                    "domain": "animation",
-                    "provider_evidence": [
-                        completed.work_identity.primary_provider.to_dict()
-                    ],
-                    "season_bindings": [],
-                    "materialization_state": "materialized",
-                    "migration_source": None,
-                    "associated_assets": [],
-                }, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            decision = DecisionState(
-                task_id=task_id,
-                library_domain="animation",
-                layout_mode="tv_episodes",
-                series_binding={
-                    "series_key": SERIES_KEY,
-                    "canonical_root": str(new_series_root),
-                    "catalog_revision": 0,
-                    "decision_source": "new_series_intent",
-                },
+            catalog = SeriesCatalog(series_catalog_root)
+            fresh = manual_tv_binding(completed.work_identity, catalog, new_series_root)
+            existing = RenamePlan('historical-drift-series', source, (),
+                work_identity=completed.work_identity, metadata={
+                    'series_key': fresh['series_key'], 'canonical_work_root': str(new_series_root),
+                    'season_binding_id': 'historical-season-one', 'season_number': 1,
+                    'season_source': 'provider'})
+            write_legacy_series_catalog_fixture(catalog, existing)
+            binding = manual_tv_binding(completed.work_identity, catalog, new_series_root)
+            decision = replace(
+                review.decision_state_store.load(task_id),
+                catalog_link_intent=None,
+                series_binding=binding,
                 season_binding={
                     "season_binding_id": "season-binding-current",
                     "season_number": 1,
@@ -714,7 +707,10 @@ class CatalogBackendSplitBrainRedContracts(unittest.TestCase):
                 entry.target_path.is_relative_to(new_series_root)
                 for entry in replanned.entries
             ))
-            self.assertEqual(SERIES_KEY, replanned.metadata["series_key"])
+            self.assertEqual(binding['series_key'], replanned.metadata["series_key"])
+            self.assertEqual(1, replanned.metadata['series_catalog_revision'])
+            self.assertFalse(any(entry.target_path.is_relative_to(new_series_root)
+                for entry in completed.entries))
             self.assertIsNone(replanned.metadata["catalog_work_key"])
 
 

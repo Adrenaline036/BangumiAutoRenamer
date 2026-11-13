@@ -1,0 +1,224 @@
+{
+  "bangumi_subjects": [
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "2789",
+      "title": "乱马1/2",
+      "original_title": "らんま1/2",
+      "air_date": "1989-04-15",
+      "episode_count": 18,
+      "platform": "TV"
+    },
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "65883",
+      "title": "乱马1/2 热斗篇",
+      "original_title": "らんま1/2 熱闘編",
+      "air_date": "1989-10-20",
+      "episode_count": 143,
+      "platform": "TV"
+    }
+  ],
+  "bangumi_relations": [
+    {
+      "from": "2789",
+      "to": "65883",
+      "relation": "续集"
+    },
+    {
+      "from": "65883",
+      "to": "2789",
+      "relation": "前传"
+    }
+  ],
+  "subject_observations": {
+    "schema_version": 1,
+    "selected_subject_id": "2789",
+    "observed_at": "2026-09-25T13:02:01+00:00",
+    "policy_version": "subject-candidate-v1",
+    "truncated": false,
+    "boundary_complete": true,
+    "subject_observations": [
+      {
+        "bangumi_subject_id": "2789",
+        "observed_at": "2026-09-25T13:02:01+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "localized",
+            "query": "乱马1/2",
+            "year": 1989,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "57706",
+                "tmdb_tv_id": "57706",
+                "match_tier": "exact",
+                "title": "乱马½",
+                "original_title": "らんま1/2",
+                "first_air_date": "1989-04-15",
+                "score_components": {
+                  "title_exact": true,
+                  "year_compatible": true,
+                  "animation_confirmed": true,
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_reason_code": "genre_id_16_present"
+                },
+                "seasons": [
+                  {
+                    "season_number": 0,
+                    "air_date": "1990-11-07",
+                    "episode_count": 16
+                  },
+                  {
+                    "season_number": 1,
+                    "air_date": "1989-04-15",
+                    "episode_count": 161
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "locale": "original",
+            "query": "らんま1/2",
+            "year": 1989,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "57706",
+                "tmdb_tv_id": "57706",
+                "match_tier": "exact",
+                "title": "乱马½",
+                "original_title": "らんま1/2",
+                "first_air_date": "1989-04-15",
+                "score_components": {
+                  "title_exact": true,
+                  "year_compatible": true,
+                  "animation_confirmed": true,
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_reason_code": "genre_id_16_present"
+                },
+                "seasons": [
+                  {
+                    "season_number": 0,
+                    "air_date": "1990-11-07",
+                    "episode_count": 16
+                  },
+                  {
+                    "season_number": 1,
+                    "air_date": "1989-04-15",
+                    "episode_count": 161
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "response_fingerprint": "0e8b0d39660e5d45db2246a8fa865eeb2dc9b6181b6f7ad0ac2ca4dc25bf6b39"
+      },
+      {
+        "bangumi_subject_id": "65883",
+        "observed_at": "2026-09-25T13:02:01+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "localized",
+            "query": "乱马1/2 热斗篇",
+            "year": 1989,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "57706",
+                "tmdb_tv_id": "57706",
+                "match_tier": "fuzzy",
+                "title": "乱马½",
+                "original_title": "らんま1/2",
+                "first_air_date": "1989-04-15",
+                "score_components": {
+                  "title_exact": false,
+                  "year_compatible": true,
+                  "animation_confirmed": true,
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_reason_code": "genre_id_16_present"
+                },
+                "seasons": [
+                  {
+                    "season_number": 0,
+                    "air_date": "1990-11-07",
+                    "episode_count": 16
+                  },
+                  {
+                    "season_number": 1,
+                    "air_date": "1989-04-15",
+                    "episode_count": 161
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "locale": "original",
+            "query": "らんま1/2 熱闘編",
+            "year": 1989,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "57706",
+                "tmdb_tv_id": "57706",
+                "match_tier": "fuzzy",
+                "title": "乱马½",
+                "original_title": "らんま1/2",
+                "first_air_date": "1989-04-15",
+                "score_components": {
+                  "title_exact": false,
+                  "year_compatible": true,
+                  "animation_confirmed": true,
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_reason_code": "genre_id_16_present"
+                },
+                "seasons": [
+                  {
+                    "season_number": 0,
+                    "air_date": "1990-11-07",
+                    "episode_count": 16
+                  },
+                  {
+                    "season_number": 1,
+                    "air_date": "1989-04-15",
+                    "episode_count": 161
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "response_fingerprint": "5994022b4705ead1b69759da7f46f77a5e1160bda1727a6af488d16489f79faf"
+      }
+    ],
+    "evidence_fingerprint": "e356dd62638456022ed66e6eff21e04ca1b4e6191c0c1bb240bff215583b1d51"
+  },
+  "selected_provider": {
+    "namespace": "bangumi",
+    "entity_type": "subject",
+    "provider_id": "2789"
+  }
+}

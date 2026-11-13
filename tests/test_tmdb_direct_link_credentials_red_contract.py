@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack, nullcontext
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,21 @@ from src.rename.plan_store import PlanStore
 from src.rename.process import Rename as ProductionRename
 from src.rename.provider_search import BangumiProviderClient
 from src.task_queue import TaskQueueManager
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
+from tests.source_collection_fixture import admit_task
+
+
+def _link_dialog(**kwargs):
+    from nicegui import Client
+    from src.rename.rename_plan import RenamePlan
+    # Credential-only cases need a real fingerprintable page snapshot; the
+    # full-flow cases retain their actual persisted Plan and Decision.
+    kwargs.setdefault('client', Client.auto_index_client)
+    kwargs.setdefault('plan', RenamePlan('credential-ui', Path.cwd(), ()))
+    kwargs.setdefault('task_decision', None)
+    return SimpleNamespace(**kwargs)
 
 
 RUNTIME_KEY = "runtime-tmdb-sentinel-r19"
@@ -122,7 +138,6 @@ def _config(root: Path, *, api_key: str) -> ConfigManager:
         "movie_path": str(root / "Movies"),
         "anime_path": str(root / "Anime"),
         "anime_movie_path": str(root / "AnimeMovies"),
-        "ai_enabled": False,
     })
     config.write_config()
     return config
@@ -139,10 +154,17 @@ def _secret_hits(root: Path, secret: str) -> list[str]:
 
 class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
     def _renamer_factory(self, root: Path, observed_keys: list[str]):
-        def factory() -> ProductionRename:
+        def factory(
+            *,
+            decision_state_root: Path,
+            provider_link_catalog_root: Path,
+        ) -> ProductionRename:
             # Real construction is essential: it invokes production Search(),
             # which must consume the same effective credential as the page.
-            renamer = ProductionRename()
+            renamer = ProductionRename(
+                decision_state_root=decision_state_root,
+                provider_link_catalog_root=provider_link_catalog_root,
+            )
             observed_keys.append(str(get_info.tmdb.API_KEY or ""))
             frozen = r1_fixture._FrozenSearch()
             frozen.TMDB_KEY = str(renamer.search.TMDB_KEY or "")
@@ -151,9 +173,6 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 user_agent="BangumiAutoRenamer-R19-contract/0.1",
                 session=r1_fixture._BangumiFlatSession(),
                 sleeper=lambda _seconds: None,
-            )
-            renamer.ai_processor = SimpleNamespace(
-                ai_client=SimpleNamespace(is_available=lambda: False)
             )
             renamer.R = {}
             renamer.ANIME_PATH = root / "Anime"
@@ -190,10 +209,10 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
             decision_state_root=decisions,
             recovery_abandon_audit_root=flow / "abandon_audit",
             plan_root=plans,
-            test_mode=False,
+
         )
         factory = self._renamer_factory(flow, observed_keys)
-        env_patch = {"TMDB_API_KEY": env_key, "BAR_FORCE_DISABLE_AI": "true"}
+        env_patch = {"TMDB_API_KEY": env_key}
         with ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ, env_patch, clear=False))
             stack.enter_context(patch.object(process_module, "cm", config))
@@ -217,32 +236,16 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 "request",
                 side_effect=AssertionError("unexpected real network access"),
             ))
-            stack.enter_context(patch.object(
-                process_module,
-                "AIProcessor",
-                return_value=SimpleNamespace(
-                    ai_client=SimpleNamespace(is_available=lambda: False)
-                ),
-            ))
             stack.enter_context(patch("src.task_queue.Rename", side_effect=factory))
             stack.enter_context(patch.object(process_module, "TASK_PATH", tasks))
             stack.enter_context(patch.object(process_module, "PLAN_PATH", plans))
-            stack.enter_context(patch.object(
-                process_module, "DECISION_STATE_PATH", decisions
-            ))
-            stack.enter_context(patch.object(
-                process_module,
-                "PROVIDER_LINK_CATALOG_PATH",
-                flow / "provider_links",
-            ))
             await manager.start()
             try:
-                await manager.enqueue(
+                await admit_task(manager,
                     source,
                     task_id=task_id,
                     is_anime=True,
                     is_movie=True,
-                    use_ai=False,
                 )
                 await asyncio.wait_for(manager._queue.join(), timeout=8)
                 with ExitStack() as review_stack:
@@ -278,12 +281,12 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                     decisions / f"{task_id}.json",
                 )
                 before = {path: path.read_bytes() for path in authority_paths}
-                dialog = SimpleNamespace(
-                    tmdb_manual_url_input=SimpleNamespace(
+                dialog = _link_dialog(
+                    provider_url_input=SimpleNamespace(
                         value="https://www.themoviedb.org/movie/763096"
                     ),
                     task_decision=(
-                        SimpleNamespace(revision=initial_state.revision + 99)
+                        replace(initial_state, revision=initial_state.revision + 99)
                         if stale_revision
                         else initial_state
                     ),
@@ -298,7 +301,7 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                     patch.object(review_page, "task_queue", manager),
                     patch.object(review_page, "notify", notifications),
                 ):
-                    await PlanReviewDialog._select_manual_provider_url(dialog, "tmdb")
+                    await PlanReviewDialog._select_manual_provider_url(dialog)
                 await asyncio.wait_for(manager._queue.join(), timeout=8)
                 after = {path: path.read_bytes() for path in authority_paths}
             finally:
@@ -334,7 +337,7 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 env_key=RUNTIME_KEY,
                 stored_key="",
             )
-            selection = result.task.get("selection_operation") or {}
+            selection = current_provider_selection_context(result.task)
             primary = getattr(result.final_plan.work_identity, "primary_provider", None)
             problems: list[str] = []
             if selection.get("state") != "succeeded":
@@ -388,10 +391,11 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
             before = config.config_path.read_bytes()
             captured_keys: list[str] = []
             selector = AsyncMock()
-            dialog = SimpleNamespace(
-                tmdb_manual_url_input=SimpleNamespace(
+            dialog = _link_dialog(
+                provider_url_input=SimpleNamespace(
                     value="https://www.themoviedb.org/movie/763096"
                 ),
+                task_data={"is_movie": True},
                 _select_provider_candidate=selector,
             )
             constructor = MagicMock(return_value=config)
@@ -416,7 +420,7 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(review_page, "resolve_provider_item_url", capture),
                 patch.object(review_page, "notify"),
             ):
-                await PlanReviewDialog._select_manual_provider_url(dialog, "tmdb")
+                await PlanReviewDialog._select_manual_provider_url(dialog)
             problems = []
             if captured_keys != [RUNTIME_KEY]:
                 problems.append(f"resolver keys are {captured_keys!r}")
@@ -437,8 +441,9 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
             before = config.config_path.read_bytes()
             session = _ManualProviderSession()
             selector = AsyncMock()
-            dialog = SimpleNamespace(
-                tmdb_manual_url_input=SimpleNamespace(value=""),
+            dialog = _link_dialog(
+                provider_url_input=SimpleNamespace(value=""),
+                task_data={"is_movie": True},
                 _select_provider_candidate=selector,
             )
             constructor = MagicMock(return_value=config)
@@ -455,12 +460,13 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                     "https://www.themoviedb.org/movie/763096",
                     "https://www.themoviedb.org/tv/53918",
                 ):
-                    dialog.tmdb_manual_url_input.value = value
-                    await PlanReviewDialog._select_manual_provider_url(dialog, "tmdb")
-            self.assertEqual(2, selector.await_count)
+                    dialog.provider_url_input.value = value
+                    dialog.task_data["is_movie"] = "/movie/" in value
+                    await PlanReviewDialog._select_manual_provider_url(dialog)
+            self.assertEqual(1, selector.await_count)
             candidates = [call.args[0] for call in selector.await_args_list]
             self.assertEqual(
-                [("movie", "763096"), ("tv", "53918")],
+                [("movie", "763096")],
                 [(item["entity_type"], item["provider_id"]) for item in candidates],
             )
             self.assertEqual(
@@ -482,8 +488,8 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
             session = _ManualProviderSession()
             selector = AsyncMock()
             notifications = Mock()
-            dialog = SimpleNamespace(
-                tmdb_manual_url_input=SimpleNamespace(
+            dialog = _link_dialog(
+                provider_url_input=SimpleNamespace(
                     value="https://www.themoviedb.org/movie/763096"
                 ),
                 _select_provider_candidate=selector,
@@ -501,7 +507,7 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(review_page, "notify", notifications),
             ):
                 os.environ.pop("TMDB_API_KEY", None)
-                await PlanReviewDialog._select_manual_provider_url(dialog, "tmdb")
+                await PlanReviewDialog._select_manual_provider_url(dialog)
             selector.assert_not_awaited()
             self.assertEqual([], session.calls)
             self.assertIn("尚未配置 TMDB API 密钥", notifications.call_args.args[0])
@@ -519,8 +525,8 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 session = _ManualProviderSession(mode=mode)
                 selector = AsyncMock()
                 notifications = Mock()
-                dialog = SimpleNamespace(
-                    tmdb_manual_url_input=SimpleNamespace(
+                dialog = _link_dialog(
+                    provider_url_input=SimpleNamespace(
                         value="https://www.themoviedb.org/movie/763096"
                     ),
                     _select_provider_candidate=selector,
@@ -540,7 +546,7 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                     patch.object(review_page, "notify", notifications),
                 ):
                     os.environ.pop("TMDB_API_KEY", None)
-                    await PlanReviewDialog._select_manual_provider_url(dialog, "tmdb")
+                    await PlanReviewDialog._select_manual_provider_url(dialog)
                 selector.assert_not_awaited()
                 visible = str(notifications.call_args.args[0])
                 self.assertNotIn(STORED_KEY, visible)
@@ -551,10 +557,11 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
             config = _config(Path(directory), api_key="")
             session = _ManualProviderSession()
             selector = AsyncMock()
-            dialog = SimpleNamespace(
-                bangumi_manual_url_input=SimpleNamespace(
+            dialog = _link_dialog(
+                provider_url_input=SimpleNamespace(
                     value="https://bgm.tv/subject/216311"
                 ),
+                task_data={"is_movie": False},
                 _select_provider_candidate=selector,
             )
             with (
@@ -570,7 +577,7 @@ class TMDBDirectLinkCredentialRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(review_page, "notify"),
             ):
                 os.environ.pop("TMDB_API_KEY", None)
-                await PlanReviewDialog._select_manual_provider_url(dialog, "bangumi")
+                await PlanReviewDialog._select_manual_provider_url(dialog)
             selector.assert_awaited_once()
             candidate = selector.await_args.args[0]
             self.assertEqual(("bangumi", "216311"), (

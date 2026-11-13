@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .series_repair import is_repair
+
 import json
 import os
 from contextlib import contextmanager
@@ -29,14 +31,14 @@ from .plan_review import (
     entry_id,
 )
 from .plan_store import PlanStore, PlanStoreError
-from .physical_identity import (
-    PhysicalIdentityUnavailable,
-    canonical_location_key,
-    canonical_physical_key,
-)
 from .path_safety import first_reparse_component
 from .plan_verifier import PlanVerifier, tv_authority_issue
-from .rename_plan import PlanStatus, RenamePlan
+from .target_routing import inspect_plan_target_routing
+from .projection_authority import (
+    ProjectionAuthorityError,
+    validate_plan_projection_receipt,
+)
+from .rename_plan import PlanStatus, RenamePlan, CollisionResolution
 from .trans import Trans, is_dry_run_enabled
 from .work_catalog import (
     WorkCatalog,
@@ -57,80 +59,55 @@ from .catalog_binding import (
     binding_from_decision,
     binding_from_plan,
 )
-from .asset_collision import (
-    AssetCollisionError,
-    build_reuse_resolution,
-    fingerprint_file,
-    validate_reuse_resolution,
-)
+from .asset_operation import plain as _plain_asset
+from .asset_collision import AssetCollisionError
 from .recovery_transaction import (
     RecoveryTransactionError,
     RecoveryTransactionStore,
     transaction_blocks_execution,
 )
-from .utils import is_font_archive
-from .font_archive_contract import (
-    FontArchiveContractError,
-    is_movie_plan,
-    is_supported_font_archive,
-    validate_movie_font_manifest,
-)
-from .work_intent import (
-    parse_content_key,
-    WorkIntentError,
-    WORK_FONT_APPEND_POLICY,
-    WORK_FONT_CONDITIONAL_ACTION,
-    WORK_INTENT_POLICY_VERSION,
-)
+from .rename_plan import is_movie_plan
 
 
 _UNSET = object()
 
 
-def _conditional_font_assets(plan: RenamePlan) -> dict[tuple[str, str], Mapping[str, object]]:
-    raw = plan.metadata.get("work_font_intent")
-    if not isinstance(raw, Mapping) or any((
-        raw.get("policy_version") != WORK_INTENT_POLICY_VERSION,
-        raw.get("asset_action") != WORK_FONT_CONDITIONAL_ACTION,
-        raw.get("append_policy") != WORK_FONT_APPEND_POLICY,
-    )):
-        return {}
-    assets = raw.get("assets")
-    if not isinstance(assets, (list, tuple)):
-        return {}
-    result = {}
-    for item in assets:
-        if not isinstance(item, Mapping):
-            return {}
-        pair = (
-            os.path.normcase(os.path.abspath(str(item.get("source_path") or ""))),
-            os.path.normcase(os.path.abspath(str(item.get("target_path") or ""))),
-        )
-        if (
-            not all(pair)
-            or item.get("action") != WORK_FONT_CONDITIONAL_ACTION
-        ):
-            return {}
-        try:
-            parse_content_key(item.get("content_key"))
-        except WorkIntentError:
-            return {}
-        result[pair] = item
-    return result
 
 
-def _conditional_asset_for_entry(
-    plan: RenamePlan,
-    entry,
-) -> Optional[Mapping[str, object]]:
-    return _conditional_font_assets(plan).get((
-        os.path.normcase(os.path.abspath(entry.source_path)),
-        os.path.normcase(os.path.abspath(entry.target_path)),
-    ))
 
 
 class PlanExecutionError(RuntimeError):
     """The approved plan could not be trusted or safely executed."""
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+DRY_RUN_PLAN_RETRY_CODE = "dry_run_plan_requires_retry"
+DRY_RUN_PLAN_RETRY_MESSAGE = (
+    "旧预演计划不能执行；请先点击“重试”生成真实整理计划"
+)
+MISSING_EXECUTION_POLICY_CODE = "execution_policy_missing"
+
+
+def require_approved_execution_policy(policy) -> None:
+    """Reject a Plan that is not eligible for production approved execution.
+
+    The immutable Plan policy is the only authority. Runtime mode may tighten
+    this later, but it must never upgrade an already-reviewed preview Plan.
+    """
+
+    if policy is None:
+        raise PlanExecutionError(
+            "整理计划缺少不可变执行策略，拒绝执行；请点击“重试”重新生成",
+            code=MISSING_EXECUTION_POLICY_CODE,
+        )
+    if policy.dry_run:
+        raise PlanExecutionError(
+            DRY_RUN_PLAN_RETRY_MESSAGE,
+            code=DRY_RUN_PLAN_RETRY_CODE,
+        )
 
 
 class CatalogExecutionFailure(PlanExecutionError):
@@ -189,12 +166,31 @@ class PlanExecutionService:
         self.catalog_drift_planner = (
             catalog_drift_planner or self.review_service.replan_for_catalog_drift
         )
+        from .completed_rebuild import CompletedRebuildService
+        self.rebuild_service = CompletedRebuildService.from_execution_context(
+            plan_store=self.plan_store, task_root=self.task_root, decision_root=self.decision_state_store.root,
+            record_root=self.record_root, catalog_root=self.work_catalog.root,
+            series_catalog_root=self.series_catalog.root, provider_link_catalog_root=self.provider_link_catalog.root)
+        self.work_catalog.rebuild_context = self.rebuild_service.work_context()
+        from .asset_actions import AssetActionService
+        self.asset_action_service = AssetActionService(plan_store=self.plan_store,
+            decision_store=self.decision_state_store, task_root=self.task_root, record_root=self.record_root,
+            work_catalog=self.work_catalog, series_catalog=self.series_catalog)
+        self.work_catalog.asset_action_context = self.asset_action_service
+        self.series_catalog.asset_action_context = self.asset_action_service
+        self.review_service.asset_recovery_context = self
 
-    def validate_approved(
-        self, task_id: str, expected_fingerprint: str
-    ) -> RenamePlan:
-        """Return the exact approved Plan, or fail before any media operation."""
+    def prepare_asset_rollback(self, task_id, expected_fingerprint):
+        from .asset_rollback import prepare
+        return prepare(self, task_id, expected_fingerprint)
 
+    def rollback_asset_replacement(self, task_id, expected_fingerprint, *, expected_recovery_fingerprint):
+        from .asset_rollback import rollback
+        return rollback(self, task_id, expected_fingerprint,
+                        expected_recovery_fingerprint=expected_recovery_fingerprint)
+
+    def validate_approved_authority(self, task_id: str, expected_fingerprint: str) -> RenamePlan:
+        """Shared fixed approval proof; recovery separately validates physical progress."""
         try:
             plan = self.plan_store.load(task_id)
         except PlanStoreError as exc:
@@ -202,9 +198,31 @@ class PlanExecutionService:
         current_fingerprint = self.plan_store.fingerprint(plan)
         if current_fingerprint != expected_fingerprint:
             raise PlanExecutionError("Plan 版本已变化，拒绝执行；请刷新并重新批准")
+        from .selection_gate import validate_selection_for_plan, require_not_retired
+        from ..utils.utils import read_task_at
+        try:
+            require_not_retired(task_id, self.plan_store.root, task_root=self.task_root,
+                                plan_fingerprint=current_fingerprint)
+            validate_selection_for_plan(read_task_at(self.task_root, task_id))
+        except ValueError as exc:
+            raise PlanExecutionError(str(exc)) from exc
+        require_approved_execution_policy(plan.execution_policy)
         self._validate_recovery_transaction_gate(plan)
-        self._validate_provider_link_preflight(plan)
-
+        try:
+            validate_plan_projection_receipt(plan)
+            state = self.decision_state_store.load(task_id)
+        except ProjectionAuthorityError as exc:
+            raise PlanExecutionError(f'分集投影凭据无效：{exc}') from exc
+        except DecisionStateError as exc:
+            raise PlanExecutionError(f'无法读取批准决定：{exc}') from exc
+        if (plan.metadata.get('decision_state_fingerprint') != self.decision_state_store.fingerprint(state)
+                or plan.metadata.get('decision_state_revision') != state.revision):
+            raise PlanExecutionError('资产决定与批准计划不一致')
+        from .content_selection import validate_plan_content
+        validate_plan_content(plan, state)
+        raw = plan.metadata.get('asset_operation')
+        if (state.asset_operation.to_dict() if state.asset_operation is not None else None) != _plain_asset(raw):
+            raise PlanExecutionError('资产操作与批准决定不一致')
         try:
             decision = self.review_service.load(task_id)
         except PlanReviewError as exc:
@@ -223,6 +241,39 @@ class PlanExecutionService:
         ):
             raise PlanExecutionError("批准条目与当前 Plan 不完整一致，拒绝执行")
 
+        return plan
+
+    def validate_approved(self, task_id: str, expected_fingerprint: str) -> RenamePlan:
+        """Validate fixed approval and the still-unwritten physical preconditions."""
+        from .content_policy import require_media_ready
+        require_media_ready(self.plan_store.load(task_id))
+        plan = self.validate_approved_authority(task_id, expected_fingerprint)
+        from . import content_selection
+        state = self.decision_state_store.load(task_id)
+        if state.content_selection is not None:
+            from .content_choice import validate_scope
+            validate_scope(self, plan, state.content_selection)
+            content_selection.validate_omission_manifest(state.content_selection, movie_selection=state.movie_version_selection)
+        if self._read_task(task_id).get('asset_rollback_phase'):
+            raise PlanExecutionError('该计划已开始回滚，不能重新执行；请完成回滚后重新生成整理计划')
+        self.asset_action_service.validate(plan, self.decision_state_store.load(plan.task_id))
+        if plan.metadata.get('completed_rebuild_observation') is not None:
+            try:
+                self.rebuild_service.validate_plan(plan)
+            except (ValueError, RuntimeError, OSError, KeyError) as exc:
+                raise PlanExecutionError(str(exc)) from exc
+        from . import series_registration
+        try:
+            if series_registration.is_series_plan(plan):
+                series_registration.validate_plan_series_registration(plan, self.decision_state_store.load(plan.task_id))
+                series_registration.validate_current_task_set(self.plan_store, self.decision_state_store, self.task_root,
+                    expected_plan=plan, record_root=self.record_root, series_catalog=self.series_catalog,
+                    provider_catalog=self.provider_link_catalog)
+                series_registration.validate_current_catalog(plan, self.series_catalog, self.provider_link_catalog)
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise PlanExecutionError(str(exc), code=getattr(exc, "code", None)) from exc
+        self._validate_provider_link_preflight(plan)
+
         verification = PlanVerifier().verify(plan)
         if verification.status == PlanStatus.INVALID or verification.issues:
             codes = ", ".join(issue.code for issue in verification.issues)
@@ -238,6 +289,9 @@ class PlanExecutionService:
 
     def _validate_recovery_transaction_gate(self, plan: RenamePlan) -> None:
         """Block before media writes when detach evidence is incomplete."""
+        from .recovery_transaction import require_no_pending_detach
+        require_no_pending_detach(plan_store=self.plan_store, task_root=self.task_root,
+            decision_root=self.decision_state_store.root, task_id=plan.task_id)
 
         if plan.metadata.get("recovery_reason") == "catalog_detached":
             raise PlanExecutionError(
@@ -290,6 +344,20 @@ class PlanExecutionService:
 
         if tv_authority_issue(plan) is not None:
             reject()
+        inventory_routing = (
+            plan.metadata.get("mapping_source") == "inventory_smart_completion"
+        )
+        if inventory_routing:
+            _routing, routing_problems = inspect_plan_target_routing(plan)
+            if routing_problems:
+                codes = ", ".join(problem.code for problem in routing_problems)
+                raise PlanExecutionError(f"冻结目标路由无效，拒绝执行：{codes}")
+            if (
+                plan.execution_policy is None
+                or _path_key(plan.execution_policy.target_root)
+                != _path_key(Path(str(plan.metadata.get("target_root") or "")))
+            ):
+                reject()
         snapshot = plan.metadata.get("provider_link_snapshot")
         if not isinstance(snapshot, Mapping):
             return
@@ -316,9 +384,11 @@ class PlanExecutionService:
             or not isinstance(catalog_revision, int)
             or catalog_revision < 0
             or policy is None
-            or _path_key(policy.target_root) != _path_key(Path(canonical_root))
-            or _path_key(Path(str(plan.metadata.get("target_root") or "")))
-            != _path_key(Path(canonical_root))
+            or (not inventory_routing and (
+                _path_key(policy.target_root) != _path_key(Path(canonical_root))
+                or _path_key(Path(str(plan.metadata.get("target_root") or "")))
+                != _path_key(Path(canonical_root))
+            ))
             or catalog_binding is None
             or catalog_binding.backend != "series"
             or catalog_binding.key != series_key
@@ -372,7 +442,7 @@ class PlanExecutionService:
 
         series_path = self.series_catalog.root / f"{series_key}.json"
         if level in {"L2", "L3"}:
-            if catalog_revision != 0 or series_path.exists():
+            if (catalog_revision != 0 or series_path.exists()) and not plan.metadata.get('series_registration_authority'):
                 reject()
         else:
             try:
@@ -382,14 +452,24 @@ class PlanExecutionService:
                     "已保存的作品季度登记不可用，请重新匹配作品"
                 ) from exc
             if (
-                current_series.revision != catalog_revision
-                or _path_key(current_series.canonical_root)
+                _path_key(current_series.canonical_root)
                 != _path_key(Path(canonical_root))
             ):
                 reject()
+            if current_series.revision != catalog_revision:
+                from .series_registration import validate_current_catalog
+                validate_current_catalog(plan, self.series_catalog, self.provider_link_catalog)
 
         anchor = snapshot.get("anchor")
         if level in {"L2", "L3"} and anchor is None:
+            from .provider_link_catalog import mapping_materializes_snapshot
+            try:
+                peers = [item for item in self.provider_link_catalog.list_mappings()
+                         if item.local_series_key == series_key or item.mapping_id == mapping_id]
+                if peers and (len(peers) != 1 or not mapping_materializes_snapshot(peers[0], snapshot)):
+                    reject()
+            except ProviderLinkCatalogError as exc:
+                raise PlanExecutionError('作品季度关系无法核验，请重新生成计划') from exc
             return
         if not isinstance(anchor, Mapping):
             reject()
@@ -412,11 +492,25 @@ class PlanExecutionService:
     ) -> PlanExecutionResult:
         """Execute once after a second, immediate version/approval verification."""
 
+        # Reject immutable preview authority before even creating an execution
+        # lock sidecar. The same gate is repeated under the lock below.
+        try:
+            safe_task_path(self.task_root, task_id)
+        except ValueError as exc:
+            raise PlanExecutionError(f"不安全的任务 ID：{task_id!r}") from exc
+        try:
+            preflight_plan = self.plan_store.load(task_id)
+        except PlanStoreError as exc:
+            raise PlanExecutionError(f"无法读取当前 Plan：{exc}") from exc
+        from .content_policy import require_media_ready
+        require_media_ready(preflight_plan)
+        require_approved_execution_policy(preflight_plan.execution_policy)
         with self._execution_lock(task_id, expected_fingerprint):
             try:
                 plan = self.plan_store.load(task_id)
             except PlanStoreError as exc:
                 raise PlanExecutionError(f"无法读取当前 Plan：{exc}") from exc
+            require_approved_execution_policy(plan.execution_policy)
             drift_result = self._replan_if_catalog_binding_drift(
                 plan, expected_fingerprint
             )
@@ -424,47 +518,53 @@ class PlanExecutionService:
                 return drift_result
             binding = binding_from_plan(plan)
             if binding is None:
-                return self._execute_locked(task_id, expected_fingerprint)
-            if binding.backend == "series":
+                result = self._execute_locked(task_id, expected_fingerprint)
+            elif binding.backend == "series":
+                from .series_registration import CatalogStateChanged, validate_current_catalog
                 try:
-                    with self.series_catalog.lock(binding.key):
-                        return self._execute_locked(
+                    from .catalog_namespace import mutation_scope
+                    with mutation_scope(self.series_catalog):
+                        with self.series_catalog.lock(binding.key):
+                            validate_current_catalog(plan, self.series_catalog, self.provider_link_catalog)
+                            self.series_catalog.require_namespace_plan(plan, binding.key)
+                        result = self._execute_locked(
                             task_id,
                             expected_fingerprint,
-                            series_catalog_lock_held=True,
                         )
+                except CatalogStateChanged as exc:
+                    raise PlanExecutionError(str(exc), code=exc.code) from exc
                 except SeriesCatalogError as exc:
                     raise PlanExecutionError(str(exc)) from exc
-            work_key = binding.key
-            try:
-                with self.work_catalog.lock(
-                    work_key,
-                    wait_seconds=(
-                        5.0 if plan.metadata.get("work_font_intent") is not None else 0.0
-                    ),
-                ):
-                    stale_reason = self._movie_plan_stale_reason(plan, work_key)
-                    if stale_reason is not None:
-                        return self._rebase_for_reapproval(
-                            plan, expected_fingerprint, stale_reason
+            else:
+                work_key = binding.key
+                try:
+                    # Repair validates retained physical history under this lock;
+                    # 多个登记文件会使此处等待较久。
+                    from .catalog_namespace import mutation_scope
+                    with mutation_scope(self.work_catalog, wait_seconds=60.0):
+                        with self.work_catalog.lock(work_key):
+                            stale_reason = self._movie_plan_stale_reason(plan, work_key)
+                            if stale_reason is not None:
+                                return self._rebase_for_reapproval(
+                                    plan, expected_fingerprint, stale_reason
+                                )
+                            self._validate_catalog_preflight(plan, work_key)
+                        result = self._execute_locked(
+                            task_id, expected_fingerprint
                         )
-                    self._validate_catalog_preflight(plan, work_key)
-                    return self._execute_locked(
-                        task_id, expected_fingerprint, catalog_lock_held=True
-                    )
-            except CatalogExecutionFailure as exc:
-                self._persist_execution_failure(plan.task_id, exc)
-                raise
-            except WorkCatalogError as exc:
-                raise PlanExecutionError(str(exc)) from exc
+                except CatalogExecutionFailure as exc:
+                    self._persist_execution_failure(plan.task_id, exc)
+                    raise
+                except WorkCatalogError as exc:
+                    raise PlanExecutionError(str(exc)) from exc
+        from .replacement_completion import finish_replacement
+        finish_replacement(self, task_id, expected_fingerprint)
+        return result
 
     def _execute_locked(
         self,
         task_id: str,
         expected_fingerprint: str,
-        *,
-        catalog_lock_held: bool = False,
-        series_catalog_lock_held: bool = False,
     ) -> PlanExecutionResult:
         task = self._read_task(task_id)
         if task.get("preview_only"):
@@ -483,9 +583,11 @@ class PlanExecutionService:
         )
         if status != "approved" and not queued_execution:
             raise PlanExecutionError("任务状态与批准执行请求不一致，拒绝执行")
-        approved_plan = self.validate_approved(task_id, expected_fingerprint)
-        if approved_plan.execution_policy is None:
-            raise PlanExecutionError("Plan 缺少不可变执行策略，拒绝执行")
+        # Reject untrusted/stale approval without changing the task. Physical
+        # preconditions belong to the guarded preparing phase below, so their
+        # rejection records a truthful no-media failure instead of escaping it.
+        approved_plan = self.validate_approved_authority(task_id, expected_fingerprint)
+        require_approved_execution_policy(approved_plan.execution_policy)
         self._validate_runtime_safety_gate(approved_plan)
 
         transition_guards = {"_allowed_statuses": {status}}
@@ -502,6 +604,7 @@ class PlanExecutionService:
             workflow_status="executing",
             execution_status="executing",
             execution_phase="preparing",
+            execution_failure_code=None,
             execution_fingerprint=expected_fingerprint,
             execution_started_at=_utc_now(),
             execution_completed_at=None,
@@ -519,23 +622,36 @@ class PlanExecutionService:
         except ValueError as exc:
             raise PlanExecutionError(f"不安全的任务 ID：{task_id!r}") from exc
         transfer_started = False
+        transfer = None
         try:
             # This second read is deliberately adjacent to Trans: a Plan or
             # review change after queueing must still fail before media writes.
             plan = self.validate_approved(task_id, expected_fingerprint)
             policy = plan.execution_policy
-            if policy is None:
-                raise PlanExecutionError("Plan 缺少不可变执行策略，拒绝执行")
+            require_approved_execution_policy(policy)
             self._validate_runtime_safety_gate(plan)
+            binding = binding_from_plan(plan)
+            if binding is not None:
+                from .catalog_namespace import require_mutation
+                require_mutation(self.series_catalog if binding.backend == 'series' else self.work_catalog)
             operations = self._build_execution_operations(plan)
             self._validate_execution_paths(plan, operations=operations)
+            from .media_file_identity import frozen_sources
             transfer_kwargs = {
+                "source_identities": frozen_sources(plan) or None,
                 "mode": policy.mode,
-                "dry_run": policy.dry_run,
+                "dry_run": False,
                 "record_root": self.record_root,
             }
-            if any(item["action"] == "reuse_existing" for item in operations):
+            if plan.metadata.get('generated_outputs') is not None:
+                from .generated_outputs import approved_outputs
+                transfer_kwargs['generated_outputs'] = approved_outputs(plan, expected_fingerprint)
+            replacing = (plan.metadata.get('asset_operation') or {}).get('mode') == 'replace' or is_repair(plan.metadata.get('asset_operation'))
+            if replacing or any(item["action"] in {"reuse_existing", "replace"} for item in operations):
                 transfer_kwargs["operations"] = operations
+            if replacing:
+                from .asset_replacement import approved_batch
+                transfer_kwargs['replacement_authority'] = approved_batch(plan, expected_fingerprint)
             self._update_task(
                 task_id,
                 _allowed_statuses={"executing"},
@@ -565,77 +681,65 @@ class PlanExecutionService:
             ledger_status = str(ledger.get("status"))
             if transfer_error:
                 raise PlanExecutionError(str(transfer_error))
-            if ledger_status not in {"completed", "dry_run"}:
+            if ledger_status != "completed":
                 raise PlanExecutionError(
                     f"执行 ledger 未进入可信终态：{ledger_status}"
                 )
         except Exception as exc:
             message = str(exc)
+            residual = transfer_started and not (type(transfer) is Trans and transfer.media_unchanged)
             recovery_message = (
                 "执行已进入文件操作边界，目标目录可能已有完整或部分结果；"
                 "请先核对本次整理记录与目标文件，再决定重试或清理。"
-                if transfer_started
+                if residual
                 else None
             )
             self._update_task(
                 task_id,
+                _allowed_statuses={"executing"},
+                _expected_queue_operation=("execute_approved" if queued_execution else _UNSET),
+                _expected_requested_fingerprint=(expected_fingerprint if queued_execution else _UNSET),
+                _expected_execution_phase=("media_boundary_entered" if transfer_started else "preparing"),
+                _expected_execution_fingerprint=expected_fingerprint,
                 workflow_status="failed",
                 execution_status="failed",
                 execution_ledger=str(ledger_path),
                 execution_completed_at=_utc_now(),
                 execution_phase=(
-                    "media_boundary_entered"
-                    if transfer_started
-                    else "failed_before_media"
+                    "media_boundary_entered" if residual else
+                    "failed_without_media_changes" if transfer_started else "failed_before_media"
                 ),
-                execution_requires_manual_check=transfer_started,
-                execution_may_have_written_targets=transfer_started,
+                execution_requires_manual_check=residual,
+                execution_may_have_written_targets=residual,
                 execution_recovery_message=recovery_message,
+                execution_failure_code=getattr(exc, "code", None),
                 error=f"[批准计划执行] {message}",
             )
             if isinstance(exc, PlanExecutionError):
                 raise
             raise PlanExecutionError(message) from exc
 
-        if ledger_status == "dry_run":
-            self._update_task(
-                task_id,
-                workflow_status="approved",
-                execution_status="dry_run",
-                execution_ledger=str(ledger_path),
-                execution_completed_at=_utc_now(),
-                execution_phase="completed",
-                completed_at=None,
-                execution_requires_manual_check=False,
-                execution_may_have_written_targets=False,
-                execution_recovery_message=None,
-                error=None,
-            )
+        if ledger_status != "completed":
+            raise PlanExecutionError(f"执行 ledger 未进入可信终态：{ledger_status}")
         else:
             try:
                 is_tv = any(
                     group.kind == "tv_episodes"
                     for group in plan.presentation_groups
                 )
+                from .catalog_namespace import require_mutation
                 if is_tv and plan.metadata.get("series_key"):
-                    if not series_catalog_lock_held:
-                        raise SeriesCatalogError("SeriesCatalog 执行锁未持有")
-                    self.series_catalog.register_completed(
-                        plan,
-                        expected_revision=int(
-                            plan.metadata.get("series_catalog_revision") or 0
-                        ),
-                        completed_ledger=ledger,
-                    )
+                    require_mutation(self.series_catalog)
+                    with self.series_catalog.lock(plan.metadata['series_key']):
+                        self.series_catalog.register_completed(plan,
+                            expected_revision=int(plan.metadata.get("series_catalog_revision") or 0),
+                            completed_ledger=ledger)
                 elif self._catalog_work_key(plan) is not None:
-                    self.work_catalog.register_completed(
-                        plan,
-                        ledger,
-                        expected_revision=int(
-                            plan.metadata.get("catalog_revision") or 0
-                        ),
-                        lock_held=catalog_lock_held,
-                    )
+                    require_mutation(self.work_catalog)
+                    with self.work_catalog.lock(self._catalog_work_key(plan)):
+                        self.work_catalog.register_completed(plan, ledger,
+                            expected_revision=int(plan.metadata.get("catalog_revision") or 0),
+                            lock_held=True)
                 self._materialize_provider_link(plan)
             except (
                 SeriesCatalogError, WorkCatalogError, ProviderLinkCatalogError,
@@ -660,14 +764,13 @@ class PlanExecutionService:
                 raise PlanExecutionError(recovery_message) from exc
             completed_at = _utc_now()
             self._clear_execution_failure(plan.task_id)
+            from .replacement_completion import media_completion_fields
             self._update_task(
                 task_id,
-                workflow_status="completed",
+                **media_completion_fields(plan, completed_at),
                 execution_status="completed",
                 execution_ledger=str(ledger_path),
                 execution_completed_at=completed_at,
-                execution_phase="completed",
-                completed_at=completed_at,
                 execution_requires_manual_check=False,
                 execution_may_have_written_targets=False,
                 execution_recovery_message=None,
@@ -690,11 +793,40 @@ class PlanExecutionService:
         materialize_provider_link_snapshot(self.provider_link_catalog, snapshot)
 
     @staticmethod
+    def _uses_current_source_authority(plan: RenamePlan) -> bool:
+        """Recognize frozen package authority independently of the mapping recipe."""
+        from .tv_planning_authority import (
+            TV_PLANNING_AUTHORITY_POLICY_VERSION,
+            TV_PLANNING_AUTHORITY_SCHEMA_VERSION,
+        )
+
+        typed_tv = plan.metadata.get("tv_planning_authority_required") is True
+        if not typed_tv and plan.metadata.get("mapping_source") != "inventory_smart_completion":
+            return False
+        try:
+            validate_plan_projection_receipt(plan)
+        except (ProjectionAuthorityError, TypeError, ValueError) as exc:
+            raise PlanExecutionError("分集投影凭据无效，请重新生成整理计划") from exc
+        if typed_tv and (
+            plan.metadata.get("tv_planning_authority_schema_version")
+            != TV_PLANNING_AUTHORITY_SCHEMA_VERSION
+            or plan.metadata.get("tv_planning_authority_policy_version")
+            != TV_PLANNING_AUTHORITY_POLICY_VERSION
+        ):
+            raise PlanExecutionError("分集权威版本无效，请重新生成整理计划")
+        return True
+
+    @staticmethod
     def _validate_source_projection_authority(
         plan: RenamePlan,
         snapshot: Mapping[str, object],
         season_edges: tuple[Mapping[str, object], ...],
     ) -> None:
+        if PlanExecutionService._uses_current_source_authority(plan):
+            # Current TV/inventory authority owns the whole package, not merely the
+            # selected provider subject's relative episode range. Its frozen
+            # receipt/entry ownership is also checked by the final Verifier.
+            return
         projection = plan.metadata.get("source_episode_projection")
         if not isinstance(projection, Mapping):
             raise PlanExecutionError("分集投影信息缺失，请重新生成整理计划")
@@ -748,118 +880,26 @@ class PlanExecutionService:
             raise PlanExecutionError("分集投影未完整覆盖主视频")
 
     @staticmethod
-    def _validate_source_projection_identity(plan: RenamePlan) -> None:
-        snapshot = plan.metadata.get("provider_link_snapshot")
-        if (
-            not isinstance(snapshot, Mapping)
-            or int(snapshot.get("schema_version") or 1) < 2
-            or snapshot.get("mapping_shape") != "many_subjects_one_season"
-        ):
-            return
-        projection = plan.metadata.get("source_episode_projection")
-        if not isinstance(projection, Mapping):
-            raise PlanExecutionError("分集投影信息缺失，请重新生成整理计划")
-        rows = projection.get("episode_mapping")
-        if not isinstance(rows, (list, tuple)):
-            raise PlanExecutionError("分集投影条目无效")
-        for row in rows:
-            if not isinstance(row, Mapping):
-                raise PlanExecutionError("分集投影条目损坏")
-            source = Path(str(row.get("source_path") or ""))
-            try:
-                stat = source.stat()
-            except OSError as exc:
-                raise PlanExecutionError(f"源文件无法读取：{source}") from exc
-            expected = (
-                row.get("source_size"), row.get("source_mtime_ns"),
-                row.get("source_device"), row.get("source_inode"),
-            )
-            current = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
-            if current != expected:
-                raise PlanExecutionError(
-                    f"源文件在批准后发生变化，请重新生成整理计划：{source}"
-                )
-
-    @staticmethod
     def _catalog_work_key(plan: RenamePlan) -> Optional[str]:
         binding = binding_from_plan(plan)
         return binding.key if binding is not None and binding.backend == "work" else None
 
-    def _conditional_catalog_matches(
-        self,
-        plan: RenamePlan,
-        work_key: str,
-        record: Mapping[str, object],
-    ) -> bool:
-        raw = plan.metadata.get("work_font_intent")
-        assets = _conditional_font_assets(plan)
-        if (
-            not isinstance(raw, Mapping)
-            or not assets
-            or raw.get("work_key") != work_key
-            or not self.work_catalog.compatible_base(record, plan)
-        ):
-            return False
-        frozen = record.get("work_intent")
-        compared = (
-            "schema_version", "policy_version", "work_key", "group_kind",
-            "content_revision", "primary_content_key",
-            "primary_decision_source", "snapshot_fingerprint", "append_policy",
-        )
-        if (
-            not isinstance(frozen, Mapping)
-            or any(frozen.get(key) != raw.get(key) for key in compared)
-            or tuple(frozen.get("content_keys", ()))
-            != tuple(raw.get("content_keys", ()))
-        ):
-            return False
-        root = Path(str(record.get("canonical_root") or ""))
-        if not root.is_dir():
-            return False
-        for row in tuple(record.get("versions", ())) + tuple(record.get("assets", ())):
-            if not isinstance(row, Mapping) or not Path(
-                str(row.get("target") or "")
-            ).is_file():
-                return False
-        registered_assets = tuple(
-            item for item in record.get("assets", ())
-            if isinstance(item, Mapping)
-        )
-        for item in assets.values():
-            try:
-                size, digest = parse_content_key(item.get("content_key"))
-            except WorkIntentError:
-                return False
-            target = Path(str(item.get("target_path") or ""))
-            matches = [
-                row for row in registered_assets
-                if _path_key(Path(str(row.get("target") or ""))) == _path_key(target)
-                and row.get("content_key") == f"sha256:{size}:{digest}"
-                and row.get("size") == size
-                and str(row.get("sha256") or "").casefold() == digest
-            ]
-            if len(matches) != 1 or not target.is_file():
-                return False
-            try:
-                evidence = fingerprint_file(target)
-            except AssetCollisionError:
-                return False
-            if evidence.size != size or evidence.sha256 != digest:
-                return False
-        return True
 
     def _build_execution_operations(
         self,
         plan: RenamePlan,
     ) -> list[dict[str, object]]:
-        """Resolve only approved conditional font actions under the work lock."""
-
-        work_key = self._catalog_work_key(plan)
-        record = None
-        if work_key and (self.work_catalog.root / f"{work_key}.json").is_file():
-            record = self.work_catalog.load(work_key)
         operations = []
+        from .asset_operation import AssetOperation
+        intent = plan.metadata.get('asset_operation')
+        replacements = {row['target']: row for row in AssetOperation.from_mapping(intent).to_dict()['replaces']} if intent else {}
         for entry in plan.entries:
+            if str(entry.target_path) in replacements:
+                row = replacements[str(entry.target_path)]
+                if row['source'] != str(entry.source_path):
+                    raise PlanExecutionError('换源来源与批准条目不一致')
+                operations.append(dict(source=entry.source_path, target=entry.target_path, action='replace', replacement_evidence=row))
+                continue
             if entry.collision_resolution is not None:
                 operations.append({
                     "source": entry.source_path,
@@ -868,53 +908,21 @@ class PlanExecutionService:
                     "collision_resolution": entry.collision_resolution.to_dict(),
                 })
                 continue
-            intent_asset = _conditional_asset_for_entry(plan, entry)
-            if intent_asset is None or not os.path.lexists(entry.target_path):
-                operations.append({
-                    "source": entry.source_path,
-                    "target": entry.target_path,
-                    "action": "create",
-                    "collision_resolution": None,
-                })
-                continue
-            if (
-                work_key is None
-                or record is None
-                or not self._conditional_catalog_matches(plan, work_key, record)
-            ):
-                raise PlanExecutionError(
-                    "电影字体目标虽已存在，但没有匹配的已完成作品登记"
-                )
-            try:
-                collision = build_reuse_resolution(
-                    entry.source_path, entry.target_path
-                )
-                size, digest = parse_content_key(intent_asset.get("content_key"))
-            except (AssetCollisionError, WorkIntentError) as exc:
-                raise PlanExecutionError(str(exc)) from exc
-            if (
-                collision.source_size != size
-                or collision.source_sha256 != digest
-            ):
-                raise PlanExecutionError("电影字体内容与批准的 work_intent 不一致")
-            operations.append({
-                "source": entry.source_path,
-                "target": entry.target_path,
-                "action": "reuse_existing",
-                "collision_resolution": collision.to_dict(),
-                "conditional_authority": {
-                    "policy": WORK_FONT_APPEND_POLICY,
-                    "work_key": work_key,
-                    "catalog_schema_version": record.get("schema_version"),
-                    "catalog_revision": record.get("revision"),
-                    "catalog_fingerprint": catalog_record_fingerprint(record),
-                    "content_key": intent_asset.get("content_key"),
-                    "target_path": str(entry.target_path),
-                },
-            })
+            operations.append(dict(source=entry.source_path, target=entry.target_path,
+                                   action='create', collision_resolution=None))
         return operations
 
     def _validate_catalog_preflight(self, plan: RenamePlan, work_key: str) -> None:
+        self.work_catalog.require_namespace_plan(plan, work_key)
+        if plan.metadata.get('completed_rebuild_observation') is not None:
+            self.rebuild_service.validate_plan(plan)
+            return
+        from .movie_asset_scope import validate_append
+        if validate_append(plan, self.work_catalog):
+            return
+        if (plan.metadata.get('asset_operation') or {}).get('mode') == 'replace':
+            self.asset_action_service.validate(plan, self.decision_state_store.load(plan.task_id))
+            return
         catalog_key = plan.metadata.get("catalog_work_key")
         path = self.work_catalog.root / f"{work_key}.json"
         if catalog_key:
@@ -954,12 +962,8 @@ class PlanExecutionService:
                     f"作品登记已有 {len(missing)} 个文件缺失，禁止继续追加"
                 )
         elif path.exists():
-            try:
-                record = self.work_catalog.load(work_key)
-            except WorkCatalogError as exc:
-                raise PlanExecutionError(f"既有作品登记不可用：{exc}") from exc
-            if not self._conditional_catalog_matches(plan, work_key, record):
-                raise PlanExecutionError("拟创建的本地作品键已存在，请重新生成整理计划")
+            raise PlanExecutionError("拟创建的本地作品键已存在，请重新生成整理计划")
+
 
     def _replan_if_catalog_binding_drift(
         self, plan: RenamePlan, expected_fingerprint: str
@@ -1062,6 +1066,17 @@ class PlanExecutionService:
     ) -> Optional[str]:
         """Explain catalog/target facts that appeared after Plan approval."""
 
+        operation = plan.metadata.get("asset_operation") or {}
+        if plan.metadata.get("completed_rebuild_observation") is not None or operation.get("mode") == "replace":
+            # Selected-slot predicates validate these operations independently.
+            return None
+        if operation.get("mode") == "append" and operation.get("movie_scope") is not None:
+            from .movie_asset_scope import validate_append
+            try:
+                validate_append(plan, self.work_catalog)
+            except (ValueError, RuntimeError, OSError) as exc:
+                raise PlanExecutionError(str(exc)) from exc
+            return None
         catalog_key = plan.metadata.get("catalog_work_key")
         if isinstance(catalog_key, str) and catalog_key:
             try:
@@ -1073,7 +1088,6 @@ class PlanExecutionService:
             ):
                 return "作品登记在排队期间已被另一项任务更新"
         else:
-            compatible_sibling = False
             work = plan.work_identity
             if work is not None and work.status == "confirmed":
                 try:
@@ -1082,24 +1096,19 @@ class PlanExecutionService:
                         work.primary_provider, group_kind=group_kind
                     )
                     if exact is not None:
-                        record = self.work_catalog.load(exact.work_key)
-                        compatible_sibling = self._conditional_catalog_matches(
-                            plan, work_key, record
-                        )
-                        if not compatible_sibling:
-                            return "同一作品已由另一项任务建立作品登记"
+                        return "同一作品已由另一项任务建立作品登记"
                 except WorkCatalogError:
                     return None
             if (
                 (self.work_catalog.root / f"{work_key}.json").exists()
-                and not compatible_sibling
             ):
                 return "本整理计划的作品登记已在排队期间建立"
 
         if any(
             os.path.lexists(entry.target_path)
             and entry.collision_resolution is None
-            and _conditional_asset_for_entry(plan, entry) is None
+            and not any(row.get('target') == str(entry.target_path)
+                        for row in (plan.metadata.get('asset_operation') or {}).get('replaces', ()))
             for entry in plan.entries
         ):
             return "整理目标在批准后发生变化"
@@ -1162,65 +1171,16 @@ class PlanExecutionService:
             safe_task_path(self.task_root, task_id)
         except ValueError as exc:
             raise PlanExecutionError(f"不安全的任务 ID：{task_id!r}") from exc
-        lock_root = self.task_root / ".execution-locks"
-        lock_root.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_root / f"{task_id}.lock"
+        from .file_lock import task_operation_lock
         try:
-            with advisory_file_lock(
-                lock_path,
-                owner={
-                    "kind": "plan_execution",
-                    "task_id": task_id,
-                    "plan_fingerprint": fingerprint,
-                },
-            ):
+            with task_operation_lock(self.task_root, task_id,
+                    operation='plan_execution', fingerprint=fingerprint):
                 yield
         except FileLockBusyError as exc:
             raise PlanExecutionError(
                 "该任务已有执行者持有执行锁；拒绝并发执行，请稍后重试"
             ) from exc
 
-    def _conditional_ledger_row_valid(
-        self,
-        plan: RenamePlan,
-        plan_entry,
-        row: Mapping[str, object],
-    ) -> bool:
-        asset = _conditional_asset_for_entry(plan, plan_entry)
-        authority = row.get("conditional_authority")
-        if not isinstance(asset, Mapping) or not isinstance(authority, Mapping):
-            return False
-        work_key = self._catalog_work_key(plan)
-        try:
-            size, digest = parse_content_key(asset.get("content_key"))
-            if work_key is None:
-                return False
-            record = self.work_catalog.load(work_key)
-            source = fingerprint_file(plan_entry.source_path)
-            target = fingerprint_file(plan_entry.target_path)
-        except (WorkIntentError, WorkCatalogError, AssetCollisionError):
-            return False
-        return all((
-            row.get("status") == "reused_identical_asset",
-            row.get("action") == "reuse_existing",
-            row.get("transfer_type") == "reuse_existing",
-            authority.get("policy") == WORK_FONT_APPEND_POLICY,
-            authority.get("work_key") == work_key,
-            authority.get("catalog_schema_version") == record.get("schema_version"),
-            authority.get("catalog_revision") == record.get("revision"),
-            authority.get("catalog_fingerprint") == catalog_record_fingerprint(record),
-            authority.get("content_key") == asset.get("content_key"),
-            _path_key(Path(str(authority.get("target_path") or "")))
-            == _path_key(plan_entry.target_path),
-            source.size == size,
-            source.sha256 == digest,
-            target.size == size,
-            target.sha256 == digest,
-            row.get("source_size") == size,
-            row.get("source_sha256") == digest,
-            row.get("target_size") == size,
-            row.get("target_sha256") == digest,
-        ))
 
     def _load_ledger(
         self,
@@ -1236,13 +1196,22 @@ class PlanExecutionService:
             raise PlanExecutionError(f"无法读取执行 ledger：{exc}") from exc
         if not isinstance(ledger, dict):
             raise PlanExecutionError("执行 ledger 根节点不是对象")
-        if ledger.get("schema_version") not in {1, 2}:
+        if ledger.get("schema_version") not in {1, 2, 3}:
             raise PlanExecutionError("执行 ledger schema_version 不受支持")
+        if ledger.get("schema_version") == 3:
+            from .asset_operation import AssetOperation
+            validate_plan_projection_receipt(plan)
+            raw = plan.metadata.get("asset_operation")
+            if raw is None or (AssetOperation.from_mapping(raw).to_dict()["mode"] != "replace" and not is_repair(raw)):
+                raise PlanExecutionError("换源 ledger 缺少已批准的资产操作权威")
         if ledger.get("task_id") != task_id:
             raise PlanExecutionError("执行 ledger task_id 不匹配")
         if ledger.get("plan_fingerprint") != expected_fingerprint:
             raise PlanExecutionError("执行 ledger Plan fingerprint 不匹配")
         ledger_status = ledger.get("status")
+        if ledger_status == 'completed':
+            from .generated_outputs import validate_completed
+            validate_completed(plan, ledger)
         policy = plan.execution_policy
         if policy is None:
             raise PlanExecutionError("执行 ledger 对应 Plan 缺少执行策略")
@@ -1271,6 +1240,11 @@ class PlanExecutionService:
             actual_pairs.append((_path_key(Path(source)), _path_key(Path(target))))
         if actual_pairs != expected_pairs:
             raise PlanExecutionError("执行 ledger 映射与已批准 Plan 不一致")
+        if ledger_status in {'rolled_back', 'rollback_failed', 'failed'}:
+            allowed = {'planned', 'created', 'failed', 'rolled_back', 'rollback_failed', 'reused_identical_asset'}
+            if any(row.get('status') not in allowed for row in raw_entries):
+                raise PlanExecutionError('失败整理记录包含未知文件状态')
+            return ledger
         if expected_dry_run:
             if any(entry.get("status") != "planned" for entry in raw_entries):
                 raise PlanExecutionError("执行 ledger 条目状态不是 planned")
@@ -1278,14 +1252,6 @@ class PlanExecutionService:
             for item, plan_entry in zip(raw_entries, plan.entries):
                 if plan_entry.collision_resolution is not None:
                     expected = "reused_identical_asset"
-                elif item.get("status") == "reused_identical_asset":
-                    if not self._conditional_ledger_row_valid(
-                        plan, plan_entry, item
-                    ):
-                        raise PlanExecutionError(
-                            "执行 ledger 的条件复用权威与已批准作品意图不一致"
-                        )
-                    continue
                 else:
                     expected = "created"
                 if item.get("status") != expected:
@@ -1296,22 +1262,24 @@ class PlanExecutionService:
             for entry, plan_entry in zip(raw_entries, plan.entries):
                 collision = plan_entry.collision_resolution
                 if collision is not None:
+                    if collision.evidence_kind == 'hardlink-identity-v1':
+                        if (entry.get('evidence_kind') != collision.evidence_kind or any(
+                                (entry.get(f'{prefix}_device'), entry.get(f'{prefix}_inode')) !=
+                                (collision.target_device, collision.target_inode) for prefix in ('source', 'target'))
+                                or not isinstance(entry.get('target_link_count'), int)
+                                or entry['target_link_count'] < 2):
+                            raise PlanExecutionError('执行记录缺少已批准的同一硬链接实体证明')
                     if (
                         entry.get("transfer_type") != "reuse_existing"
+                        or entry.get('evidence_kind') != collision.evidence_kind
+                        or entry.get('source_xxh3_128') != collision.source_xxh3_128
+                        or entry.get('target_xxh3_128') != collision.target_xxh3_128
                         or entry.get("source_size") != collision.source_size
-                        or entry.get("source_sha256") != collision.source_sha256
                         or entry.get("target_size") != collision.target_size
-                        or entry.get("target_sha256") != collision.target_sha256
+                        or entry.get('target_device') != collision.target_device
+                        or entry.get('target_inode') != collision.target_inode
                     ):
                         raise PlanExecutionError("执行 ledger 缺少可信的同内容复用证明")
-                    continue
-                if entry.get("status") == "reused_identical_asset":
-                    if not self._conditional_ledger_row_valid(
-                        plan, plan_entry, entry
-                    ):
-                        raise PlanExecutionError(
-                            "执行 ledger 缺少可信的作品级条件复用证明"
-                        )
                     continue
                 if entry.get("transfer_type") != "hardlink":
                     raise PlanExecutionError("执行 ledger 不是已批准的 hardlink")
@@ -1343,8 +1311,7 @@ class PlanExecutionService:
         """Let live controls tighten an approved policy, never weaken it."""
 
         policy = plan.execution_policy
-        if policy is None:
-            raise PlanExecutionError("Plan 缺少不可变执行策略，拒绝执行")
+        require_approved_execution_policy(policy)
         if cm.get_config("mode") != "链接":
             raise PlanExecutionError(
                 "运行时重命名模式已不再是链接；拒绝绕过已批准 hardlink 策略"
@@ -1376,19 +1343,8 @@ class PlanExecutionService:
             raise PlanExecutionError("Plan 执行策略不是保留源文件的 hardlink")
         if _path_key(policy.target_root) != _path_key(target_root):
             raise PlanExecutionError("Plan 执行策略 target_root 不匹配")
-        PlanExecutionService._validate_frozen_associated_assets(plan)
-        PlanExecutionService._validate_source_projection_identity(plan)
-        for entry in plan.entries:
-            source = entry.source_path
-            if not source.exists():
-                raise PlanExecutionError(f"源文件不存在，拒绝执行：{source}")
-            if not source.is_file():
-                raise PlanExecutionError(f"源路径不是普通文件，拒绝执行：{source}")
-            if not _resolved_within(source, plan.source_root):
-                raise PlanExecutionError(
-                    f"源文件真实路径越出 Plan 源根目录：{source}"
-                )
-        PlanExecutionService._validate_frozen_source_identities(plan)
+        from .media_file_identity import frozen_sources
+        frozen_sources(plan)
         frozen_operations = operations or [
             {
                 "action": (
@@ -1408,133 +1364,35 @@ class PlanExecutionService:
                     f"目标文件真实路径越出 Plan 目标根目录：{target}"
                 )
             reuse = operation.get("action") == "reuse_existing"
+            replacement = operation.get('action') == 'replace'
+            if replacement:
+                from .asset_operation import AssetOperation
+                from .asset_replacement import ReplacementEvidence
+                validate_plan_projection_receipt(plan)
+                intent = AssetOperation.from_mapping(plan.metadata.get('asset_operation')).to_dict()
+                evidence = ReplacementEvidence.from_dict(operation.get('replacement_evidence'))
+                if (evidence.to_dict() not in intent['replaces'] or evidence.source != str(source)
+                        or evidence.target != str(target)):
+                    raise PlanExecutionError('运行换源操作与批准集合不一致')
+                evidence.validate_current()
             collision = entry.collision_resolution
             if reuse and not target.is_file():
                 raise PlanExecutionError(f"批准复用的既有目标已不存在：{target}")
-            if not reuse and collision is None and os.path.lexists(target):
-                raise PlanExecutionError(f"目标已存在，拒绝执行：{target}")
+            if not reuse and not replacement and collision is None and os.path.lexists(target):
+                raise PlanExecutionError(f"目标已存在，拒绝执行：{target}",
+                                         code="target_conflict_requires_replan")
 
     @staticmethod
     def _validate_frozen_source_identities(plan: RenamePlan) -> None:
-        rows = plan.metadata.get("source_identity_manifest")
-        if rows is None:
-            if plan.metadata.get("projection_authority_required") is True:
-                raise PlanExecutionError("Plan 缺少冻结来源物理身份")
-            return
-        if not isinstance(rows, (list, tuple)):
-            raise PlanExecutionError("Plan 冻结来源物理身份格式无效")
-        frozen = {
-            str(row.get("location_key") or "").casefold(): row
-            for row in rows
-            if isinstance(row, Mapping)
-        }
-        for entry in plan.entries:
-            source = entry.source_path
-            try:
-                stat_result = source.stat()
-                location_key = canonical_location_key(source)
-                physical_key = canonical_physical_key(stat_result)
-            except (OSError, PhysicalIdentityUnavailable) as exc:
-                raise PlanExecutionError(
-                    f"源文件物理身份不可用或已变化：{source}"
-                ) from exc
-            expected = frozen.get(location_key)
-            if expected is None or (
-                str(expected.get("physical_key") or "").casefold(),
-                int(expected.get("size", -1)),
-                int(expected.get("mtime_ns", -1)),
-            ) != (
-                physical_key.casefold(),
-                int(stat_result.st_size),
-                int(stat_result.st_mtime_ns),
-            ):
-                raise PlanExecutionError(
-                    f"源文件在批准后发生identity漂移：{source}"
-                )
+        from .media_file_identity import frozen_sources, media_identity
+        try:
+            for source, expected in frozen_sources(plan).items():
+                if media_identity(source) != expected:
+                    raise ValueError(f'源文件identity漂移：{source}')
+        except (ValueError, OSError) as exc:
+            raise PlanExecutionError(str(exc)) from exc
 
-    @staticmethod
-    def _validate_frozen_associated_assets(plan: RenamePlan) -> None:
-        if is_movie_plan(plan):
-            try:
-                validate_movie_font_manifest(plan, verify_current=True)
-            except FontArchiveContractError as exc:
-                raise PlanExecutionError(str(exc)) from exc
-            return
-        if not any(group.kind == "tv_episodes" for group in plan.presentation_groups):
-            return
-        manifest = plan.metadata.get("associated_asset_manifest")
-        font_pairs = [
-            (_path_key(entry.source_path), _path_key(entry.target_path))
-            for entry in plan.entries
-            if is_font_archive(entry.source_path) or (
-                entry.role == "font"
-                and entry.media_kind == "associated"
-                and is_supported_font_archive(entry.source_path)
-            )
-        ]
-        if len(set(font_pairs)) != len(font_pairs):
-            raise PlanExecutionError("Plan 字体条目重复")
-        if manifest is None:
-            if font_pairs and plan.metadata.get("tv_authority_required") is True:
-                raise PlanExecutionError("Plan 缺少完整字体来源清单")
-            return
-        if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
-            raise PlanExecutionError("Plan 字体来源清单格式无效")
-        rows = manifest.get("assets")
-        if not isinstance(rows, (list, tuple)):
-            raise PlanExecutionError("Plan 字体来源清单资产无效")
-        entries = {
-            (_path_key(entry.source_path), _path_key(entry.target_path)): entry
-            for entry in plan.entries
-        }
-        seen_pairs = set()
-        season_number = plan.metadata.get("season_number")
-        for row in rows:
-            if not isinstance(row, Mapping):
-                raise PlanExecutionError("Plan 字体来源清单条目无效")
-            source = Path(str(row.get("source_path") or ""))
-            target = Path(str(row.get("target_path") or ""))
-            size = row.get("source_size")
-            digest = str(row.get("source_sha256") or "")
-            entry = entries.get((_path_key(source), _path_key(target)))
-            pair = (_path_key(source), _path_key(target))
-            if (
-                row.get("role") != "fonts"
-                or row.get("scope") != "series"
-                or not isinstance(size, int)
-                or isinstance(size, bool)
-                or size < 0
-                or len(digest) != 64
-                or any(char not in "0123456789abcdef" for char in digest)
-                or entry is None
-                or row.get("season_number") != season_number
-                or pair in seen_pairs
-            ):
-                raise PlanExecutionError("Plan 字体来源清单与批准条目不一致")
-            seen_pairs.add(pair)
-            try:
-                source_evidence = fingerprint_file(source)
-                if entry.collision_resolution is not None:
-                    _source, target_evidence = validate_reuse_resolution(
-                        source,
-                        target,
-                        entry.collision_resolution,
-                    )
-                    if (
-                        target_evidence.size != size
-                        or target_evidence.sha256 != digest
-                    ):
-                        raise PlanExecutionError(
-                            "批准复用的字体位置已变化，请重新生成整理计划"
-                        )
-            except AssetCollisionError as exc:
-                raise PlanExecutionError(str(exc)) from exc
-            if source_evidence.size != size or source_evidence.sha256 != digest:
-                raise PlanExecutionError(
-                    "字体源文件已变化，请重新生成并批准整理计划"
-                )
-        if seen_pairs != set(font_pairs):
-            raise PlanExecutionError("Plan 字体来源清单未覆盖全部批准字体条目")
+
 
     def _read_task(self, task_id: str) -> dict:
         try:

@@ -1,0 +1,68 @@
+{
+  "schema_version": "r24-bangumi-primary-optional-tmdb/v2",
+  "incident": {
+    "selected_subject": {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "425211",
+      "title": "辉夜大小姐想让我告白-初吻不会结束-",
+      "original_title": "かぐや様は告らせたい-ファーストキッスは終わらない-",
+      "year": 2022,
+      "air_date": "2022-12-17",
+      "platform": "TV"
+    },
+    "optional_metadata_links": [
+      {
+        "status": "confirmed",
+        "namespace": "tmdb",
+        "entity_type": "movie",
+        "provider_id": "997317",
+        "title": "辉夜大小姐想让我告白-初吻不会结束-",
+        "year": 2022,
+        "decision_source": "explicit_optional_metadata"
+      }
+    ],
+    "tmdb_tv_observation": {
+      "outcome": "no_match",
+      "truncated": false,
+      "candidates": []
+    },
+    "expected": {
+      "library_domain": "animation",
+      "layout_mode": "tv_episodes",
+      "standalone_season": 1,
+      "primary_identity": ["bangumi", "subject", "425211"],
+      "optional_movie_identity": ["tmdb", "movie", "997317"]
+    }
+  },
+  "provider_drift_incident": {
+    "selected_subject_id": "425211",
+    "initial_observation": {
+      "observed_at": "2026-07-30T00:00:00+00:00",
+      "outcome": "ok",
+      "tmdb_tv_id": "330299",
+      "match_tier": "exact",
+      "candidate_state": "available"
+    },
+    "replacement_observation": {
+      "observed_at": "2026-09-04T00:00:00+00:00",
+      "outcome": "no_match",
+      "truncated": false,
+      "candidates": [],
+      "candidate_state": "deleted_or_merged"
+    },
+    "expected": {
+      "new_primary_identity": ["bangumi", "subject", "425211"],
+      "new_tmdb_tv_id": null,
+      "new_plan_is_unapproved": true,
+      "old_plan_is_executable": false,
+      "detail_reads_after_complete_no_match": 0
+    }
+  },
+  "privacy": {
+    "contains_credentials": false,
+    "contains_real_absolute_media_paths": false,
+    "contains_browser_state": false,
+    "contains_provider_raw_payload": false
+  }
+}

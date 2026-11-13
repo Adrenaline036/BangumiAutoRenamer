@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.rename.plan_execution import PlanExecutionError, PlanExecutionService
+from src.rename.asset_execution_recovery import AssetExecutionRecovery
 from src.rename.plan_review import PlanReviewService, entry_id
 from src.rename.plan_store import PlanStore
 from src.rename.rename_plan import (
@@ -26,113 +27,65 @@ from src.rename.rename_plan import (
     build_default_version_descriptor,
 )
 from src.rename.asset_collision import build_reuse_resolution
-from src.rename.decision_state import DecisionStateStore
+from src.rename.decision_state import DecisionState, DecisionStateStore
+from src.rename.projection_authority import commit_projected_plan
+from src.rename.series_catalog import SeriesCatalog
+from src.rename.series_registration import manual_tv_binding
 from src.rename.subtitle_labels import (
     DimensionResolution,
     SUBTITLE_ASSOCIATION_RULE_VERSION,
     SUBTITLE_LABEL_RULE_VERSION,
 )
 from tests.presentation_fixtures import with_tv_presentation
-from tests.projection_test_support import save_plan_fixture
+
+
+def _save_registered_tv_fixture(store, plan, *, task_root):
+    """Explicit legal TV preconditions for these execution component tests.
+
+    This is not a migration for arbitrary legacy fixtures. Only the successful
+    ordinary TMDB fixture is initialized here; later revisions retain its exact
+    Decision authority and use the production final projector.
+    """
+    states = DecisionStateStore(store.root.parent / 'decision_state')
+    previous = states.load_optional(plan.task_id)
+    if previous is None:
+        provider = ProviderIdentity('confirmed', 'tmdb', 'tv', 'fixture-tv-1',
+            'Example', 2026, 'explicit_user')
+        work = (plan.work_identity if plan.work_identity is not None
+            and plan.work_identity.status == 'confirmed' else
+            WorkIdentity('confirmed', 'general', 'Example', 2026, provider, 'provider_selection'))
+        if work.domain == 'unknown':
+            # with_tv_presentation intentionally leaves domain undecided. This
+            # ordinary-TV fixture explicitly selects the general TV domain.
+            work = replace(work, domain='general', domain_source='provider_selection')
+        provider = work.primary_provider
+        canonical_root = Path(plan.metadata['target_root'])
+        binding = manual_tv_binding(work, SeriesCatalog(store.root.parent / 'series_catalog'),
+            canonical_root)
+        candidate = DecisionState(task_id=plan.task_id, confirmed_work=work.to_dict(),
+            provider_evidence=(provider.to_dict(),), library_domain='general', layout_mode='tv_episodes',
+            series_binding=binding, season_binding={'season_binding_id': f'season-{plan.task_id}',
+                'season_number': 1, 'decision_source': 'explicit_user'})
+        plan = replace(plan, work_identity=work)
+    else:
+        candidate = previous
+    from tests.projection_test_support import task_source_scope_fixture
+    task_source_scope_fixture(store, plan, task_root=task_root)
+    decision, projected = commit_projected_plan(states, store, previous=previous,
+        candidate=candidate, draft_plan=plan)
+    task_path = task_root / f'{plan.task_id}.json'
+    task = json.loads(task_path.read_text('utf-8')) if task_path.exists() else {
+        'uuid': plan.task_id, 'path': str(plan.source_root), 'workflow_status': 'pending',
+        'completed_at': None}
+    task.update(plan_fingerprint=store.fingerprint(projected),
+        decision_state_revision=decision.revision,
+        decision_state_fingerprint=states.fingerprint(decision))
+    task_root.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(json.dumps(task), encoding='utf-8')
+    return projected
 
 
 class PlanExecutionTests(unittest.TestCase):
-    def test_execution_creates_new_hardlink_and_reuses_approved_identical_asset(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source_root = root / "source"
-            source_root.mkdir()
-            video = source_root / "Episode.mkv"
-            font = source_root / "Fonts.7z"
-            video.write_bytes(b"video")
-            font.write_bytes(b"fonts")
-            target_root = root / "library"
-            video_target = target_root / "Season 01" / "Example S01E01.mkv"
-            font_target = target_root / "Associated" / "Fonts.7z"
-            font_target.parent.mkdir(parents=True)
-            font_target.write_bytes(b"fonts")
-            collision = build_reuse_resolution(font, font_target)
-            self.assertIsNotNone(collision)
-            group = PresentationGroup("tv-episodes", "tv_episodes", "TV 分集版", None)
-            plan = RenamePlan(
-                task_id="mixed-create-reuse",
-                source_root=source_root,
-                entries=(
-                    PlanEntry(
-                        video, video_target, season_id=1, episode_id=1,
-                        media_kind="video", role="main_episode", requires_review=True,
-                        presentation_asset=PresentationAssetPlanContract(
-                            group.group_id, AssetRole("content_version"), None,
-                            build_default_version_descriptor(group.group_id, 1, 1),
-                        ),
-                    ),
-                    PlanEntry(
-                        font, font_target, media_kind="associated", role="font",
-                        requires_review=True,
-                        presentation_asset=PresentationAssetPlanContract(
-                            group.group_id, AssetRole("associated"), None, None,
-                        ),
-                        collision_resolution=collision,
-                    ),
-                ),
-                expected_sources=(video, font),
-                metadata={
-                    "target_root": str(target_root),
-                    "season_number": 1,
-                    "associated_asset_manifest": {
-                        "schema_version": 1,
-                        "assets": [{
-                            "role": "fonts",
-                            "scope": "series",
-                            "season_number": 1,
-                            "source_path": str(font),
-                            "target_path": str(font_target),
-                            "source_size": font.stat().st_size,
-                            "source_sha256": hashlib.sha256(
-                                font.read_bytes()
-                            ).hexdigest(),
-                        }],
-                    },
-                },
-                execution_policy=ExecutionPolicy(target_root=target_root, dry_run=False),
-                presentation_groups=(group,),
-                work_identity=WorkIdentity(
-                    "confirmed", "animation", "Example", 2026,
-                    ProviderIdentity(
-                        "confirmed", "bangumi", "subject", "1", "Example", 2026,
-                        "explicit_user",
-                    ),
-                    "provider_selection",
-                ),
-            )
-            task_root = root / "tasks"
-            task_root.mkdir()
-            (task_root / f"{plan.task_id}.json").write_text(json.dumps({
-                "uuid": plan.task_id, "path": str(source_root),
-                "workflow_status": "approved", "completed_at": None,
-            }), encoding="utf-8")
-            store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
-            review = PlanReviewService(store, root / "reviews")
-            fingerprint = store.fingerprint(plan)
-            review.approve_entries(
-                plan.task_id, fingerprint, tuple(entry_id(entry) for entry in plan.entries)
-            )
-            service = PlanExecutionService(
-                store, review, task_root=task_root, record_root=root / "records",
-                catalog_root=root / "catalog",
-            )
-
-            result = service.execute(plan.task_id, fingerprint)
-
-            self.assertEqual("completed", result.ledger_status)
-            self.assertEqual(video.stat().st_ino, video_target.stat().st_ino)
-            self.assertNotEqual(font.stat().st_ino, font_target.stat().st_ino)
-            ledger = json.loads(result.ledger_path.read_text("utf-8"))
-            self.assertEqual(
-                ["created", "reused_identical_asset"],
-                [item["status"] for item in ledger["entries"]],
-            )
     def _approved_service(
         self,
         root: Path,
@@ -183,8 +136,9 @@ class PlanExecutionTests(unittest.TestCase):
             encoding="utf-8",
         )
         store = PlanStore(root / "plan")
-        plan = save_plan_fixture(store, plan)
-        review = PlanReviewService(store, root / "review")
+        plan = _save_registered_tv_fixture(store, plan, task_root=task_root)
+        review = PlanReviewService(store, root / "review",
+            decision_state_root=root / 'decision_state', task_root=task_root)
         fingerprint = store.fingerprint(plan)
         review.approve_entries(
             task_id, fingerprint, (entry_id(plan.entries[0]),)
@@ -194,7 +148,7 @@ class PlanExecutionTests(unittest.TestCase):
         class FakeTransfer:
             def __init__(
                 self, mapping, identifier, plan_fingerprint, *,
-                mode, dry_run, record_root: Path,
+                mode, dry_run, record_root: Path, source_identities=None,
             ):
                 calls.append((mapping, identifier, plan_fingerprint))
                 self.plan_fingerprint = plan_fingerprint
@@ -253,6 +207,8 @@ class PlanExecutionTests(unittest.TestCase):
             task_root=task_root,
             record_root=record_root,
             transfer_factory=FakeTransfer,
+            series_catalog_root=root / 'series_catalog',
+            decision_state_root=root / 'decision_state',
         )
         return service, store, plan, fingerprint, calls, task_root
 
@@ -272,7 +228,8 @@ class PlanExecutionTests(unittest.TestCase):
             task = json.loads(
                 (task_root / f"{plan.task_id}.json").read_text("utf-8")
             )
-            self.assertEqual(task["workflow_status"], "completed")
+            self.assertEqual(task["workflow_status"], "partial_failed")
+            self.assertTrue(task["font_error"])
             self.assertEqual(task["execution_status"], "completed")
             self.assertEqual(task["execution_fingerprint"], fingerprint)
             self.assertTrue(task["execution_ledger"].endswith(".ledger.json"))
@@ -293,14 +250,40 @@ class PlanExecutionTests(unittest.TestCase):
     def test_stale_fingerprint_rejects_before_transfer(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            service, _store, plan, _fingerprint, calls, _task_root = (
+            service, _store, plan, _fingerprint, calls, task_root = (
                 self._approved_service(root)
             )
+            task_path = task_root / f'{plan.task_id}.json'
+            before = task_path.read_bytes()
 
             with self.assertRaisesRegex(PlanExecutionError, "版本已变化"):
                 service.execute(plan.task_id, "0" * 64)
 
             self.assertEqual(calls, [])
+            self.assertEqual(before, task_path.read_bytes())
+
+    def test_preparing_failure_cannot_overwrite_another_task_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _store, plan, fingerprint, calls, task_root = self._approved_service(Path(temp_dir))
+            original = service.validate_approved
+            task_path = task_root / f'{plan.task_id}.json'
+            newer = []
+
+            def changed(*args, **kwargs):
+                if service._read_task(plan.task_id).get('execution_phase') == 'preparing':
+                    task = json.loads(task_path.read_text('utf-8'))
+                    task.update(workflow_status='needs_review', execution_fingerprint='newer-request')
+                    task_path.write_text(json.dumps(task), encoding='utf-8')
+                    newer.append(task_path.read_bytes())
+                    raise PlanExecutionError('controlled pre-write rejection after state change')
+                return original(*args, **kwargs)
+
+            with patch.object(service, 'validate_approved', side_effect=changed):
+                with self.assertRaises(PlanExecutionError):
+                    service.execute(plan.task_id, fingerprint)
+            self.assertEqual(1, len(newer))
+            self.assertEqual(newer[0], task_path.read_bytes(), 'stale execution failure overwrote newer task')
+            self.assertEqual([], calls)
 
     def test_pending_catalog_detach_without_transaction_blocks_before_transfer(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -322,6 +305,7 @@ class PlanExecutionTests(unittest.TestCase):
                 record_root=base.record_root,
                 transfer_factory=base.transfer_factory,
                 decision_state_root=decision_root,
+                series_catalog_root=root / 'series_catalog',
                 recovery_transaction_root=root / "transactions",
             )
 
@@ -346,7 +330,7 @@ class PlanExecutionTests(unittest.TestCase):
                     "decision_state_fingerprint": "stale-decision-fingerprint",
                 },
             )
-            revised_plan = save_plan_fixture(store, revised_plan)
+            revised_plan = _save_registered_tv_fixture(store, revised_plan, task_root=base.task_root)
             revised_fingerprint = store.fingerprint(revised_plan)
             service = PlanExecutionService(
                 store,
@@ -355,6 +339,7 @@ class PlanExecutionTests(unittest.TestCase):
                 record_root=base.record_root,
                 transfer_factory=base.transfer_factory,
                 decision_state_root=decision_root,
+                series_catalog_root=root / 'series_catalog',
                 recovery_transaction_root=root / "transactions",
             )
 
@@ -404,21 +389,13 @@ class PlanExecutionTests(unittest.TestCase):
                 self._approved_service(root)
             )
             unsafe = replace(plan, execution_policy=None)
-            unsafe = save_plan_fixture(store, unsafe)
-            fingerprint = store.fingerprint(unsafe)
-            service.review_service.approve_entries(
-                unsafe.task_id,
-                fingerprint,
-                tuple(entry_id(entry) for entry in unsafe.entries),
-            )
-            task_path = task_root / f"{unsafe.task_id}.json"
-            task = json.loads(task_path.read_text("utf-8"))
-            task["workflow_status"] = "approved"
-            task_path.write_text(json.dumps(task), encoding="utf-8")
-
-            with self.assertRaisesRegex(PlanExecutionError, "不可变执行策略"):
-                service.execute(unsafe.task_id, fingerprint)
-
+            # A current TV projection cannot sign a missing execution policy.
+            with self.assertRaisesRegex(ValueError, "冻结执行策略"):
+                _save_registered_tv_fixture(store, unsafe, task_root=task_root)
+            self.assertEqual(plan,store.load(plan.task_id))
+            # Legacy-shaped consumer still rejects independently of projection.
+            with self.assertRaises(PlanExecutionError):
+                service._validate_frozen_associated_assets(unsafe)
             self.assertEqual([], calls)
 
     def test_ledger_mode_must_match_approved_policy(self):
@@ -516,6 +493,8 @@ class PlanExecutionTests(unittest.TestCase):
                 task_root=base.task_root,
                 record_root=base.record_root,
                 transfer_factory=BlockingTransfer,
+                decision_state_root=root / 'decision_state',
+                series_catalog_root=root / 'series_catalog',
             )
             first_errors = []
 
@@ -547,13 +526,15 @@ class PlanExecutionTests(unittest.TestCase):
             class RacingService(PlanExecutionService):
                 validations = 0
 
-                def validate_approved(self, task_id, expected_fingerprint):
-                    result = super().validate_approved(
+                # Both reads still verify approval authority; only the second
+                # performs physical checks. Inject between those same reads.
+                def validate_approved_authority(self, task_id, expected_fingerprint):
+                    result = super().validate_approved_authority(
                         task_id, expected_fingerprint
                     )
                     self.validations += 1
                     if self.validations == 1:
-                        save_plan_fixture(
+                        _save_registered_tv_fixture(
                             store,
                             replace(
                                 plan,
@@ -561,7 +542,7 @@ class PlanExecutionTests(unittest.TestCase):
                                     **dict(plan.metadata),
                                     "changed": True,
                                 },
-                            )
+                            ), task_root=task_root,
                         )
                     return result
 
@@ -571,6 +552,8 @@ class PlanExecutionTests(unittest.TestCase):
                 task_root=base.task_root,
                 record_root=base.record_root,
                 transfer_factory=base.transfer_factory,
+                decision_state_root=root / 'decision_state',
+                series_catalog_root=root / 'series_catalog',
             )
 
             with self.assertRaisesRegex(PlanExecutionError, "版本已变化"):
@@ -586,23 +569,115 @@ class PlanExecutionTests(unittest.TestCase):
             self.assertFalse(task["execution_may_have_written_targets"])
             self.assertIsNone(task["execution_recovery_message"])
 
-    def test_dry_run_ledger_keeps_plan_approved_and_not_completed(self):
+    def test_approved_dry_run_plan_is_rejected_before_transfer_or_ledger(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             service, _store, plan, fingerprint, calls, task_root = (
                 self._approved_service(root, ledger_status="dry_run")
             )
 
-            result = service.execute(plan.task_id, fingerprint)
+            protected_roots = (
+                root / "plan",
+                root / "review",
+                root / "decision_state",
+                root / "catalog",
+                root / "series_catalog",
+                root / "record",
+                root / "library",
+                task_root,
+            )
 
-            self.assertEqual(result.ledger_status, "dry_run")
-            self.assertEqual(len(calls), 1)
+            def snapshot():
+                return {
+                    str(path.relative_to(root)): path.read_bytes()
+                    for protected in protected_roots
+                    if protected.exists()
+                    for path in protected.rglob("*")
+                    if path.is_file()
+                }
+
+            before = snapshot()
+            service._replan_if_catalog_binding_drift = lambda *_args: self.fail(
+                "dry-run Plan reached catalog drift handling"
+            )
+
+            with self.assertRaises(PlanExecutionError) as raised:
+                service.execute(plan.task_id, fingerprint)
+
+            self.assertEqual(raised.exception.code, "dry_run_plan_requires_retry")
+            self.assertRegex(str(raised.exception), "旧预演计划|重试生成真实计划")
+            self.assertEqual(calls, [])
+            self.assertFalse(
+                (root / "records" / f"{plan.task_id}.ledger.json").exists()
+            )
             task = json.loads(
                 (task_root / f"{plan.task_id}.json").read_text("utf-8")
             )
             self.assertEqual(task["workflow_status"], "approved")
-            self.assertEqual(task["execution_status"], "dry_run")
             self.assertIsNone(task["completed_at"])
+            self.assertEqual(before, snapshot())
+
+    def test_dry_run_plan_is_rejected_by_authority_used_for_asset_recovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service, _store, plan, fingerprint, calls, task_root = (
+                self._approved_service(root, ledger_status="dry_run")
+            )
+            task_before = (task_root / f"{plan.task_id}.json").read_bytes()
+
+            with self.assertRaises(PlanExecutionError) as raised:
+                service.validate_approved_authority(plan.task_id, fingerprint)
+            self.assertEqual(raised.exception.code, "dry_run_plan_requires_retry")
+            with self.assertRaisesRegex(ValueError, "旧预演计划|重试生成真实计划"):
+                AssetExecutionRecovery(service).inspect(plan.task_id, fingerprint)
+
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                task_before,
+                (task_root / f"{plan.task_id}.json").read_bytes(),
+            )
+            self.assertFalse((root / "record").exists())
+
+    def test_executor_uses_the_canonical_approved_execution_policy_gate(self):
+        import inspect
+
+        authority = inspect.getsource(PlanExecutionService.validate_approved_authority)
+        execute = inspect.getsource(PlanExecutionService.execute)
+        locked = inspect.getsource(PlanExecutionService._execute_locked)
+        self.assertIn("require_approved_execution_policy", authority)
+        self.assertIn("require_approved_execution_policy", execute)
+        self.assertIn("require_approved_execution_policy", locked)
+        self.assertNotIn("ledger_status == \"dry_run\"", locked)
+
+    def test_executor_fails_closed_when_canonical_policy_gate_is_disconnected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service, _store, plan, fingerprint, calls, task_root = (
+                self._approved_service(root)
+            )
+            before = (task_root / f"{plan.task_id}.json").read_bytes()
+            service._replan_if_catalog_binding_drift = lambda *_args: self.fail(
+                "disconnected gate reached catalog drift handling"
+            )
+            disconnected = PlanExecutionError(
+                "执行策略权威门已断开",
+                code="execution_policy_gate_disconnected",
+            )
+            with patch(
+                "src.rename.plan_execution.require_approved_execution_policy",
+                create=True,
+                side_effect=disconnected,
+            ) as gate:
+                with self.assertRaises(PlanExecutionError) as raised:
+                    service.execute(plan.task_id, fingerprint)
+            self.assertIs(raised.exception, disconnected)
+            gate.assert_called_once()
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                before, (task_root / f"{plan.task_id}.json").read_bytes()
+            )
+            self.assertFalse((root / "record").exists())
+            self.assertFalse((root / "library").exists())
 
     def test_mismatched_ledger_fingerprint_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -672,20 +747,22 @@ class PlanExecutionTests(unittest.TestCase):
 
             self.assertEqual(len(calls), 1)
 
-    def test_directory_source_rejects_before_transfer_boundary(self):
+    def test_directory_source_cannot_complete_or_leave_targets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             service, _store, plan, fingerprint, calls, task_root = (
                 self._approved_service(root)
             )
             source = plan.entries[0].source_path
-            source.unlink()
+            source.rename(source.with_suffix(".held"))
             source.mkdir()
 
-            with self.assertRaisesRegex(PlanExecutionError, "不是普通文件"):
+            from src.rename.trans import Trans
+            service.transfer_factory = Trans
+            with patch("src.rename.trans.cm.get_config",return_value="链接"), self.assertRaises(PlanExecutionError):
                 service.execute(plan.task_id, fingerprint)
 
-            self.assertEqual(calls, [])
+            self.assertFalse(plan.entries[0].target_path.exists())
             task = json.loads(
                 (task_root / f"{plan.task_id}.json").read_text("utf-8")
             )
@@ -742,6 +819,8 @@ class PlanExecutionTests(unittest.TestCase):
                 base.review_service,
                 task_root=task_root,
                 record_root=record_root,
+                decision_state_root=root / 'decision_state',
+                series_catalog_root=root / 'series_catalog',
             )
 
             with patch("src.rename.trans.RECORD_PATH", record_root), patch(
@@ -806,8 +885,9 @@ class PlanExecutionTests(unittest.TestCase):
                 execution_policy=ExecutionPolicy(target_root=target_root),
             ))
             store = PlanStore(root / "plan")
-            plan = save_plan_fixture(store, plan)
-            review = PlanReviewService(store, root / "review")
+            plan = _save_registered_tv_fixture(store, plan, task_root=task_root)
+            review = PlanReviewService(store, root / "review",
+                decision_state_root=root / 'decision_state', task_root=task_root)
             revised = review.override_subtitle_decision(
                 plan.task_id,
                 store.fingerprint(plan),
@@ -832,6 +912,7 @@ class PlanExecutionTests(unittest.TestCase):
                     "path": str(source_root),
                     "workflow_status": "approved",
                     "completed_at": None,
+                    "plan_fingerprint": fingerprint,
                 }),
                 encoding="utf-8",
             )
@@ -840,6 +921,8 @@ class PlanExecutionTests(unittest.TestCase):
                 review,
                 task_root=task_root,
                 record_root=record_root,
+                decision_state_root=root / 'decision_state',
+                series_catalog_root=root / 'series_catalog',
             )
 
             with patch("src.rename.trans.RECORD_PATH", record_root), patch(

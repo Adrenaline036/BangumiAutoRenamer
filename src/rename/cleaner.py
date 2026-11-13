@@ -344,8 +344,19 @@ def parse_release_title(value: str) -> ParsedReleaseTitle:
             (_flatten_title_brackets(source), '保留全部括号字段的原始回退候选')
         )
 
+    episode_variants: List[Tuple[str, str]] = []
+    for title, reason in base_variants:
+        episode = re.fullmatch(
+            r'(?P<title>.+?)\s+[-–—]\s+S\d{1,2}E\d{1,3}\s+[-–—]\s+\S.*',
+            title, flags=re.IGNORECASE,
+        )
+        if episode:
+            episode_variants.append((episode.group('title'),
+                reason + '；明确分隔的集号和单集标题仅作检索字段'))
+        episode_variants.append((title, reason))
+
     candidates: List[SearchTitleCandidate] = []
-    for base_title, base_reason in base_variants:
+    for base_title, base_reason in episode_variants:
         year_match = re.search(r'(?<!\d)((?:19|20)\d{2})\s*$', base_title)
         if year_match:
             year = int(year_match.group(1))
@@ -416,7 +427,7 @@ def is_chinese_percentage_sufficient(text: str):
         return False
 
 
-def extract_season(text: str):
+def extract_season(text: str, *, allow_bare_number: bool = True):
     '''
     用于提取字符串中的 季 信息
     '''
@@ -437,6 +448,8 @@ def extract_season(text: str):
             return season_number
 
     for p in season_partten:
+        if not allow_bare_number and p == r' ([\d]{1,2}) ':
+            continue
         match = re.search(p, text)
         if match:
             if p == r'(First|Second|Third|Fourth|Fifth) Season':

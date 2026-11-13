@@ -8,15 +8,19 @@ granting ordinary retry, delete, or direct execution authority.
 
 from __future__ import annotations
 
+from tests._approval_stage_helpers import approve_dialog
 import asyncio
 import inspect
 import json
 import tempfile
 import unittest
-from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+    persist_provider_selection_attempt,
+)
 
 from src.pages import data_table_page, plan_review_page as review_page_module
 from src.utils import utils as utils_module
@@ -36,17 +40,33 @@ from src.task_queue import TaskQueueManager
 from src.utils.utils import (
     mutate_task_at,
     read_task_at,
+    restore_task_record_at,
     task_record_lock,
     write_task_at,
 )
 from tests.presentation_fixtures import with_tv_presentation
-from tests.projection_test_support import save_plan_fixture
+from tests.test_plan_execution import _save_registered_tv_fixture
 
 
 FINGERPRINT = "a" * 64
 
 
 class _UiStub:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def set_visibility(self, visible):
+        self.visible = visible
+
+    def set_text(self, text):
+        self.text = text
+
+    def disable(self):
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True
+
     def classes(self, *_args, **_kwargs):
         return self
 
@@ -110,6 +130,29 @@ class _DialogStub(_UiStub):
         return done().__await__()
 
 
+class _ReviewDialogStub(_DialogStub):
+    """Review opener lifecycle; confirmation dialogs keep their own submit flag."""
+    def __init__(self):
+        super().__init__()
+        self.submitted = asyncio.Event()
+        self.is_deleted = False
+        self.exit_requested = False
+        self.value = False
+        self.on_loaded = lambda: None
+
+    def open(self):
+        self.value = True
+
+    def _load_plan_view(self, plan, *, snapshot=None):
+        self.plan = plan
+        self.snapshot = snapshot
+        self.on_loaded()
+
+    def __await__(self):
+        self.exit_requested = True
+        return super().__await__()
+
+
 def _legacy_task(task_id: str, fingerprint: str = FINGERPRINT) -> dict:
     return {
         "uuid": task_id,
@@ -162,8 +205,13 @@ def _make_approved_plan(root: Path, task_id: str):
         )
     )
     store = PlanStore(root / "plan")
-    plan = save_plan_fixture(store, plan)
-    review = PlanReviewService(store, root / "review", root / "work_catalog")
+    # Legacy execution-state recovery still needs a current, explicitly
+    # registered TV Plan before new approval; it cannot mint a legacy bypass.
+    plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
+    review = PlanReviewService(
+        store, root / "review", root / "work_catalog",
+        decision_state_root=root / "decision_state", task_root=root / "task",
+    )
     fingerprint = store.fingerprint(plan)
     review.approve_entries(
         task_id,
@@ -266,7 +314,7 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 acknowledge_execution_recovery(task_id, task_root)
             self.assertEqual(acknowledged_bytes, task_path.read_bytes())
 
-            manager = TaskQueueManager(task_root=task_root, test_mode=False)
+            manager = TaskQueueManager(task_root=task_root)
             await manager.start()
             await asyncio.sleep(0)
             restarted = read_task_at(task_root, task_id)
@@ -334,7 +382,11 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
             plan, store, _review, fingerprint, _source, _target = (
                 _make_approved_plan(root, task_id)
             )
-            task = _reapproval_task(task_id, fingerprint)
+            task = {
+                **read_task_at(root / "task", task_id),
+                **_reapproval_task(task_id, fingerprint),
+                "path": str(plan.source_root), "is_anime": False,
+            }
             current = {"task": task}
             labels: list[str] = []
             visible: list[str] = []
@@ -352,9 +404,10 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 visible.append(str(value))
                 return _UiStub()
 
-            def capture_dialog(opened_plan, opened_task):
-                opened.append((opened_plan, dict(opened_task)))
-                return _DialogStub()
+            def capture_dialog(opened_plan, opened_task, *, loading=False):
+                dialog = _ReviewDialogStub()
+                dialog.on_loaded = lambda: opened.append((opened_plan, dict(opened_task)))
+                return dialog
 
             with (
                 patch.object(
@@ -368,12 +421,11 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                     return_value=None,
                 ),
                 patch.object(data_table_page, "_path_tree_button"),
-                patch.object(data_table_page.ui, "card", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "row", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "column", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "badge", side_effect=record_text),
-                patch.object(data_table_page.ui, "label", side_effect=record_text),
-                patch.object(data_table_page.ui, "button", side_effect=record_button),
+                patch.object(data_table_page, "dialog_card", _UiStub),
+                patch.object(data_table_page, "ui", SimpleNamespace(
+                    card=_UiStub, row=_UiStub, column=_UiStub,
+                    badge=record_text, label=record_text, button=record_button,
+                )),
                 patch.object(data_table_page, "notify") as notify,
                 patch.object(
                     data_table_page,
@@ -499,12 +551,11 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                     return_value=None,
                 ),
                 patch.object(data_table_page, "_path_tree_button"),
-                patch.object(data_table_page.ui, "card", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "row", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "column", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "badge", side_effect=record_text),
-                patch.object(data_table_page.ui, "label", side_effect=record_text),
-                patch.object(data_table_page.ui, "button", side_effect=record_button),
+                patch.object(data_table_page, "dialog_card", _UiStub),
+                patch.object(data_table_page, "ui", SimpleNamespace(
+                    card=lambda *a,**k:_UiStub(), row=lambda *a,**k:_UiStub(),
+                    column=lambda *a,**k:_UiStub(), badge=record_text,
+                    label=record_text, button=record_button)),
             ):
                 real_task_card(payload)
             for button in buttons:
@@ -625,6 +676,7 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
             execution_phase="failed_before_media",
             execution_recovery_disposition=None,
             execution_requires_manual_check=False,
+            execution_may_have_written_targets=False,
             execution_reapproval_fingerprint=None,
         )
         self.assertEqual(
@@ -676,7 +728,7 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 patch.object(data_table_page, "get_task", return_value=task),
                 patch.object(
                     data_table_page.task_queue,
-                    "enqueue",
+                    "enqueue_batch",
                     new=AsyncMock(),
                 ) as enqueue,
                 patch.object(
@@ -721,12 +773,13 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 root, task_id
             )
             task_root = root / "task"
-            task_root.mkdir()
-            task = _reapproval_task(task_id, fingerprint)
+            task = {
+                **read_task_at(task_root, task_id),
+                **_reapproval_task(task_id, fingerprint),
+                "path": str(plan.source_root), "is_anime": False,
+            }
             write_task_at(task_root, task_id, task)
-            decision_path = root / "decision" / f"{task_id}.json"
-            decision_path.parent.mkdir()
-            decision_path.write_bytes(b"decision-authority")
+            decision_path = root / "decision_state" / f"{task_id}.json"
             frozen_plan = store.path_for(task_id).read_bytes()
             frozen_decision = decision_path.read_bytes()
             frozen_source = source.read_bytes()
@@ -735,8 +788,8 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
             captured: list[_DialogStub] = []
             confirm_buttons: list[tuple[str, object]] = []
 
-            def capture_dialog(opened_plan, opened_task):
-                dialog = _DialogStub()
+            def capture_dialog(opened_plan, opened_task, *, loading=False):
+                dialog = _ReviewDialogStub()
                 dialog.plan = opened_plan
                 dialog.snapshot = build_plan_review_snapshot(opened_plan)
                 dialog.review_service = review
@@ -751,8 +804,7 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 dialog._queue_execution = MethodType(
                     PlanReviewDialog._queue_execution, dialog
                 )
-                dialog.exit_requested = True
-                captured.append(dialog)
+                dialog.on_loaded = lambda: captured.append(dialog)
                 return dialog
 
             def record_confirm_button(label, *args, **kwargs):
@@ -786,17 +838,13 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
                 patch.object(review_page_module, "notify"),
-                patch.object(
-                    review_page_module.ui, "dialog", return_value=_DialogStub()
-                ),
-                patch.object(review_page_module.ui, "card", return_value=_UiStub()),
-                patch.object(review_page_module.ui, "row", return_value=_UiStub()),
-                patch.object(review_page_module.ui, "label", return_value=_UiStub()),
-                patch.object(
-                    review_page_module.ui,
-                    "button",
-                    side_effect=record_confirm_button,
-                ),
+                patch.object(review_page_module, "dialog_card", _UiStub),
+                patch.object(review_page_module, "ui", SimpleNamespace(
+                    context=SimpleNamespace(client=None),
+                    dialog=_DialogStub, card=_UiStub, row=_UiStub,
+                    label=lambda *_: _UiStub(), linear_progress=_UiStub,
+                    button=record_confirm_button,
+                )),
                 patch.object(
                     review_page_module.task_queue,
                     "enqueue_approved",
@@ -812,6 +860,12 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                     dialog.task_data.get("execution_recovery_disposition"),
                 )
 
+                # This opener stub resolves its dialog await immediately (and
+                # marks it closed). Reopen before exercising live UI clicks;
+                # the async approval callback correctly refuses closed owners.
+                dialog.exit_requested = False
+                dialog.open()
+
                 # A dialog opened before recovery acknowledgement must not
                 # approve over the newer on-disk reapproval authority.
                 authoritative_bytes = (
@@ -822,7 +876,7 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                     "workflow_status": "need_confirm",
                     "execution_recovery_disposition": None,
                 }
-                PlanReviewDialog._approve_all(dialog)
+                await approve_dialog(dialog)
                 self.assertEqual(
                     authoritative_bytes,
                     (task_root / f"{task_id}.json").read_bytes(),
@@ -834,36 +888,39 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 # and preserved instead of being overwritten by stale data.
                 dialog.task_data = dict(task)
 
-                def drift_then_mutate(identifier, mutation):
+                original_compare = utils_module.replace_task_record_at_if_sha256
+                def drift_then_mutate(root, identifier, *, expected_sha256, data):
                     drifted = read_task_at(task_root, identifier)
                     drifted.update(
                         {
                             "workflow_status": "executing",
-                            "selection_operation": {
-                                "state": "concurrent-sentinel"
-                            },
                         }
                     )
+                    persist_provider_selection_attempt(
+                        drifted, {"state": "concurrent-sentinel"}
+                    )
                     write_task_at(task_root, identifier, drifted)
-                    return mutate_task_at(task_root, identifier, mutation)
+                    return original_compare(root, identifier, expected_sha256=expected_sha256, data=data)
 
                 with patch.object(
-                    review_page_module,
-                    "mutate_task",
+                    utils_module,
+                    "replace_task_record_at_if_sha256",
                     side_effect=drift_then_mutate,
                 ):
-                    PlanReviewDialog._approve_all(dialog)
+                    await approve_dialog(dialog)
                 drifted = read_task_at(task_root, task_id)
                 self.assertEqual("executing", drifted.get("workflow_status"))
                 self.assertEqual(
-                    {"state": "concurrent-sentinel"},
-                    drifted.get("selection_operation"),
+                    "concurrent-sentinel",
+                    current_provider_selection_context(drifted).get("state"),
                 )
                 enqueue.assert_not_awaited()
 
-                write_task_at(task_root, task_id, task)
-                dialog.task_data = dict(task)
-                PlanReviewDialog._approve_all(dialog)
+                # End only this test's injected concurrent selection. Ordinary
+                # write_task_at correctly preserves newer canonical authority.
+                restore_task_record_at(task_root, task_id, authoritative_bytes)
+                dialog.task_data = read_task_at(task_root, task_id)
+                await approve_dialog(dialog)
                 enqueue.assert_not_awaited()
                 stored = read_task_at(task_root, task_id)
                 approved = review.load(task_id)
@@ -940,12 +997,11 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                     "load_execution_recovery",
                     return_value=snapshot,
                 ),
-                patch.object(data_table_page.ui, "dialog", return_value=dialog),
-                patch.object(data_table_page.ui, "card", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "column", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "row", return_value=_UiStub()),
-                patch.object(data_table_page.ui, "label", side_effect=record_text),
-                patch.object(data_table_page.ui, "button", side_effect=record_button),
+                patch.object(data_table_page, "dialog_card", _UiStub),
+                patch.object(data_table_page, "ui", SimpleNamespace(
+                    dialog=lambda: dialog, card=_UiStub, column=_UiStub,
+                    row=_UiStub, label=record_text, button=record_button,
+                )),
                 patch.object(data_table_page, "notify") as notify,
                 patch.object(data_table_page, "refresh_dashboard"),
                 patch.object(data_table_page._review_tasks, "refresh"),
@@ -1080,7 +1136,7 @@ class LegacyExecutionReapprovalRedContracts(unittest.IsolatedAsyncioTestCase):
                 task_root=root,
                 execution_service=FakeExecutionService(),
                 approved_executor=approved_executor,
-                test_mode=False,
+
             )
             try:
                 with self.assertRaises(PlanExecutionError):

@@ -39,22 +39,24 @@ from .projection_authority import (
     ProjectionAuthorityError,
     validate_plan_projection_receipt,
 )
-from .target_routing import inspect_frozen_target_routing
+from .target_routing import inspect_plan_target_routing
 from .canonical_naming import (
     CanonicalNamingError,
     is_portable_media_leaf,
     read_naming_decision,
 )
-from .work_intent import (
-    WorkIntentError,
-    WorkIntentStore,
-    derive_work_intent_key,
-    parse_content_key,
-    WORK_FONT_APPEND_POLICY,
-    WORK_FONT_CONDITIONAL_ACTION,
-    WORK_FONT_INTENT_SCHEMA_VERSION,
-    WORK_INTENT_POLICY_VERSION,
-)
+
+from .media_classifier import LocalRole
+from . import provider_special_evidence as provider_special
+
+
+_MOVIE_EXTRA_SUBTYPES = frozenset({
+    "trailer", "featurette", "interview", "behind_the_scenes",
+    "deleted_scene", "scene", "short", "clip", "sample", "other",
+})
+_TV_EXTRA_SUBTYPES = frozenset(
+    role.value for role in LocalRole if role is not LocalRole.MAIN_EPISODE
+) | {"other"}
 
 
 @dataclass(frozen=True)
@@ -75,7 +77,35 @@ class PlanVerificationResult:
         return self.status == PlanStatus.ACCEPTED
 
 
-def tv_authority_issue(plan: RenamePlan) -> Optional[PlanIssue]:
+def subtitle_conflicts(entries):
+    """返回现行输出轨道冲突的两方，核查与界面共用同一分组。"""
+    from .content_associations import subtitle_track_keys
+    entries = tuple(entries)
+    tracks = subtitle_track_keys((e.source_path, e.subtitle.associated_video_source_path,
+        (e.subtitle.primary_language, e.subtitle.script, e.subtitle.region_hint,
+         e.subtitle.additional_languages, e.subtitle.track_title_tokens, e.subtitle.flags))
+        for e in entries if e.media_kind == 'subtitle' and e.subtitle is not None)
+    semantics, defaults = {}, {}
+    for index, entry in enumerate(entries):
+        contract = entry.subtitle
+        if entry.media_kind != 'subtitle' or contract is None:
+            continue
+        owner = (_path_key(contract.associated_video_source_path)
+                 if contract.associated_video_source_path is not None else '<unresolved>')
+        key = (owner, contract.primary_language, contract.script, contract.region_hint,
+               contract.additional_languages, contract.track_title_tokens, contract.flags)
+        if key in semantics and tracks[semantics[key].source_path] != tracks[entry.source_path]:
+            yield index, 'duplicate_subtitle_semantics', semantics[key], entry
+        else:
+            semantics[key] = entry
+        if 'default' in contract.flags and contract.associated_video_source_path is not None:
+            if owner in defaults and tracks[defaults[owner].source_path] != tracks[entry.source_path]:
+                yield index, 'multiple_default_subtitles', defaults[owner], entry
+            else:
+                defaults[owner] = entry
+
+
+def tv_authority_issue(plan: RenamePlan, *, validate_projection_receipt=True) -> Optional[PlanIssue]:
     """Return one stable operator-facing issue for incomplete TV authority."""
 
     tv_groups = tuple(
@@ -101,17 +131,8 @@ def tv_authority_issue(plan: RenamePlan) -> Optional[PlanIssue]:
     season_number = metadata.get("season_number")
     catalog_revision = metadata.get("series_catalog_revision")
     canonical_root = str(metadata.get("canonical_work_root") or "").strip()
-    complete = (
-        isinstance(snapshot, Mapping)
-        and bool(series_key)
-        and str(snapshot.get("series_key") or "").strip() == series_key
-        and bool(str(snapshot.get("mapping_id") or "").strip())
-        and str(snapshot.get("automation_level") or "") in {"L0", "L1", "L2", "L3"}
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(snapshot.get("evidence_fingerprint") or ""),
-        )
-        is not None
+    common_complete = (
+        bool(series_key)
         and bool(season_binding_id)
         and isinstance(season_number, int)
         and not isinstance(season_number, bool)
@@ -120,12 +141,55 @@ def tv_authority_issue(plan: RenamePlan) -> Optional[PlanIssue]:
         and not isinstance(catalog_revision, bool)
         and catalog_revision >= 0
         and bool(canonical_root)
+    )
+    provider_link_complete = (
+        isinstance(snapshot, Mapping)
+        and str(snapshot.get("series_key") or "").strip() == series_key
+        and bool(str(snapshot.get("mapping_id") or "").strip())
+        and str(snapshot.get("automation_level") or "") in {"L0", "L1", "L2", "L3"}
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(snapshot.get("evidence_fingerprint") or ""),
+        )
+        is not None
         and any(
             isinstance(item, Mapping)
             and item.get("season_number") == season_number
             for item in snapshot.get("season_assignments", ()) or ()
         )
     )
+    typed_authority_complete = (
+        metadata.get("tv_planning_authority_required") is True
+        and metadata.get("tv_planning_authority_schema_version") == 2
+        and metadata.get("tv_planning_authority_policy_version")
+        == "tv-planning-authority-v2"
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(metadata.get("tv_planning_authority_fingerprint") or ""),
+        ) is not None
+    )
+    complete = common_complete and (
+        provider_link_complete or typed_authority_complete
+    )
+    provider = plan.work_identity.primary_provider if plan.work_identity else None
+    from .series_registration import (validate_plan_series_registration,
+        _validate_series_registration_contents, _is_manual_subject_registration)
+    registration_reader = (validate_plan_series_registration if validate_projection_receipt
+                           else _validate_series_registration_contents)
+    try:
+        manual_subject = _is_manual_subject_registration(plan, registration_reader(plan))
+    except (ValueError, TypeError):
+        manual_subject = False
+    if provider is not None and ((provider.namespace, provider.entity_type) == ('tmdb', 'tv')
+            or (provider.namespace, provider.entity_type) == ('bangumi', 'subject') and manual_subject):
+        # Direct choices consume their frozen registration proof. Legacy
+        # Bangumi inventory keeps its existing authority and routing checks.
+        try:
+            registration = registration_reader(plan)
+            complete = (common_complete and registration is not None
+                        and registration.namespace == provider.namespace and registration.series_key == series_key)
+        except (ValueError, TypeError):
+            complete = False
     if complete:
         return None
     return PlanIssue(
@@ -140,6 +204,8 @@ def _provider_regular_episode_range_issues(
     """Validate final regular episode projections against frozen authority."""
 
     snapshot = plan.metadata.get("provider_link_snapshot")
+    if not any(e.media_kind == 'video' for e in plan.entries):
+        return ()
     if not isinstance(snapshot, Mapping) or "derived_episode_ranges" not in snapshot:
         return ()
     selected_subject_id = str(snapshot.get("selected_subject_id") or "")
@@ -197,20 +263,38 @@ def _provider_regular_episode_range_issues(
 
     raw_ownership = plan.metadata.get("task_episode_ownership", ())
     owned_by_source = {}
+    primary = plan.work_identity.primary_provider if plan.work_identity else None
+    expected_work_key = (
+        ":".join((
+            str(primary.namespace or ""),
+            str(primary.entity_type or ""),
+            str(primary.provider_id or ""),
+        ))
+        if primary is not None else ""
+    )
+    expected_work_fingerprint = (
+        hashlib.sha256(expected_work_key.encode("utf-8")).hexdigest()
+        if expected_work_key else ""
+    )
     if isinstance(raw_ownership, (list, tuple)):
         for row in raw_ownership:
             if not isinstance(row, Mapping):
                 continue
             source_path = str(row.get("source_path") or "")
             row_subject = str(row.get("bangumi_subject_id") or "")
-            row_tmdb = str(row.get("tmdb_tv_id") or "")
+            row_work_key = str(row.get("work_identity_key") or "")
+            row_work_fingerprint = str(
+                row.get("work_identity_fingerprint") or ""
+            )
             row_season = row.get("season_number")
             row_source_episode = row.get("source_episode")
             row_target_episode = row.get("target_episode")
             if (
                 source_path
                 and row_subject
-                and row_tmdb == tmdb_tv_id
+                and row.get("schema_version") == 2
+                and row_work_key == expected_work_key
+                and row_work_fingerprint == expected_work_fingerprint
                 and isinstance(row_season, int)
                 and not isinstance(row_season, bool)
                 and isinstance(row_source_episode, int)
@@ -219,7 +303,6 @@ def _provider_regular_episode_range_issues(
                 and not isinstance(row_target_episode, bool)
                 and any(
                     candidate[0] == row_subject
-                    and candidate[1] == row_tmdb
                     and candidate[2] == row_season
                     and candidate[3] <= row_source_episode <= candidate[4]
                     for candidate in normalized
@@ -259,138 +342,8 @@ def _provider_regular_episode_range_issues(
     return tuple(issues)
 
 
-def _tv_font_manifest_issues(plan: RenamePlan) -> tuple[PlanIssue, ...]:
-    """Require the TV font authority from Plan shape, never an optional marker."""
-
-    if not any(group.kind == "tv_episodes" for group in plan.presentation_groups):
-        return ()
-    fonts = tuple(
-        entry for entry in plan.entries
-        if entry.media_kind == "associated"
-        and (
-            entry.role == "font"
-            or "[fonts]" in entry.target_path.name.casefold()
-        )
-    )
-    if not fonts:
-        return ()
-    manifest = plan.metadata.get("associated_asset_manifest")
-    if not isinstance(manifest, Mapping) or not manifest:
-        return (PlanIssue(
-            "tv_font_manifest_required",
-            "电视剧字体包缺少冻结的作品/系列关联清单；请重新生成整理计划",
-        ),)
-    return ()
 
 
-def _work_font_intent_issues(plan: RenamePlan) -> tuple[PlanIssue, ...]:
-    """Validate the versioned pending authority without adopting live targets."""
-
-    raw = plan.metadata.get("work_font_intent")
-    if raw is None:
-        return ()
-    invalid = PlanIssue(
-        "work_font_intent_invalid",
-        "电影字体的作品级条件动作无效；请重新生成整理计划",
-    )
-    if not isinstance(raw, Mapping):
-        return (invalid,)
-    work = plan.work_identity
-    group_kinds = {group.kind for group in plan.presentation_groups}
-    work_key = str(
-        plan.metadata.get("catalog_work_key")
-        or plan.metadata.get("proposed_work_key")
-        or ""
-    )
-    store_root = Path(str(raw.get("store_root") or ""))
-    assets = raw.get("assets")
-    try:
-        if (
-            work is None
-            or work.status != "confirmed"
-            or group_kinds != {"movie_continuous"}
-            or raw.get("schema_version") != WORK_FONT_INTENT_SCHEMA_VERSION
-            or raw.get("policy_version") != WORK_INTENT_POLICY_VERSION
-            or raw.get("asset_action") != WORK_FONT_CONDITIONAL_ACTION
-            or raw.get("append_policy") != WORK_FONT_APPEND_POLICY
-            or raw.get("work_key") != work_key
-            or raw.get("group_kind") != "movie_continuous"
-            or store_root.name != ".work-intents"
-            or not isinstance(assets, (list, tuple))
-            or not assets
-        ):
-            return (invalid,)
-        if (
-            plan.metadata.get("catalog_link_decision") != "explicit_user"
-            and derive_work_intent_key(
-                primary_provider=work.primary_provider,
-                group_kind="movie_continuous",
-            ) != work_key
-        ):
-            return (invalid,)
-        font_pairs = {
-            (str(entry.source_path), str(entry.target_path))
-            for entry in plan.entries
-            if entry.media_kind == "associated" and entry.role == "font"
-        }
-        asset_pairs = set()
-        contract_content_keys = set()
-        for item in assets:
-            if not isinstance(item, Mapping):
-                return (invalid,)
-            pair = (
-                str(item.get("source_path") or ""),
-                str(item.get("target_path") or ""),
-            )
-            if (
-                not all(pair)
-                or item.get("action") != WORK_FONT_CONDITIONAL_ACTION
-            ):
-                return (invalid,)
-            parse_content_key(item.get("content_key"))
-            asset_pairs.add(pair)
-            contract_content_keys.add(str(item["content_key"]))
-        shared_content_keys = set(
-            str(value) for value in raw.get("content_keys", ())
-        )
-        if (
-            asset_pairs != font_pairs
-            or not contract_content_keys
-            or not contract_content_keys.issubset(shared_content_keys)
-        ):
-            return (invalid,)
-        store = WorkIntentStore(store_root.parent, create=False)
-        if store.root != store_root:
-            return (invalid,)
-        current = store.load(work_key)
-    except (TypeError, ValueError, WorkIntentError):
-        return (invalid,)
-
-    issues = []
-    if any((
-        current.content_revision != raw.get("content_revision"),
-        current.snapshot_fingerprint != raw.get("snapshot_fingerprint"),
-        current.content_keys != tuple(str(value) for value in raw.get("content_keys", ())),
-    )):
-        issues.append(PlanIssue(
-            "work_intent_revision_stale",
-            "同一作品的待处理字体内容已变化；请刷新计划后共同决定主字体包",
-        ))
-    if len(current.content_keys) > 1 and current.primary_content_key is None:
-        issues.append(PlanIssue(
-            "work_font_primary_content_unresolved",
-            "同一作品出现多个不同字体包；必须先选择作品级主内容",
-        ))
-    catalog_path = store_root.parent / f"{work_key}.json"
-    if (
-        any(os.path.lexists(Path(target)) for _source, target in asset_pairs)
-        and not catalog_path.is_file()
-    ):
-        issues.append(PlanIssue(
-            "work_font_target_catalog_pending",
-            "作品级字体目标已存在但登记尚未完成；请先恢复作品登记",
-        ))
-    return tuple(issues)
 
 
 class PlanVerifier:
@@ -414,6 +367,32 @@ class PlanVerifier:
             )
 
         issues: List[PlanIssue] = []
+        from .episode_range import validate_projection as validate_ranges
+        if any(r.get('conflict') for r in (plan.metadata.get('generated_outputs') or {}).get('files', ())):
+            issues.append(PlanIssue('generated_output_conflict', 'NFO目标存在冲突，请核查或明确换源'))
+        valid_range_ids = set()
+        try:
+            valid_range_ids = validate_ranges(plan)
+        except (ValueError, TypeError, KeyError) as exc:
+            issues.append(PlanIssue('episode_range_invalid', str(exc)))
+        from .episode_versions import validate_projection as validate_versions
+        try:
+            valid_range_ids.update(validate_versions(plan))
+        except (ValueError, TypeError, KeyError) as exc:
+            issues.append(PlanIssue('episode_versions_invalid', str(exc)))
+        from .content_policy import require_media_ready, require_content_complete
+        try:
+            (require_media_ready if validate_projection_receipt else require_content_complete)(plan)
+        except (ValueError, ProjectionAuthorityError) as exc:
+            issues.append(PlanIssue('content_policy_pending', str(exc)))
+        from .content_selection import validate_plan_content
+        try:
+            validate_plan_content(plan)
+        except (ValueError, TypeError, KeyError) as exc:
+            issues.append(PlanIssue('content_selection_invalid', str(exc)))
+        if {'movie_continuous','tv_episodes'}.issubset({g.kind for g in plan.presentation_groups}):
+            issues.append(PlanIssue('mixed_presentation_requires_partition',
+                '电影连续版与剧集分集版不能在同一任务执行；请按观看形式拆为独立任务后分别确认'))
         if validate_projection_receipt and (
             plan.projection_receipt is not None
             or plan.metadata.get("projection_authority_required") is True
@@ -470,10 +449,12 @@ class PlanVerifier:
                         "linked_provider_identity_authority_missing",
                         "整理计划丢失了所选 Bangumi 作品身份；请重新识别作品",
                     ))
-        authority_issue = tv_authority_issue(plan)
+        authority_issue = tv_authority_issue(plan, validate_projection_receipt=validate_projection_receipt)
         if authority_issue is not None:
             issues.append(authority_issue)
-        issues.extend(_provider_regular_episode_range_issues(plan))
+        from dataclasses import replace
+        inferred_entries = tuple(e for e in plan.entries if _entry_id(e) not in valid_range_ids)
+        issues.extend(_provider_regular_episode_range_issues(replace(plan, entries=inferred_entries)))
         projection_candidates = plan.metadata.get(
             "source_episode_projection_candidates"
         )
@@ -571,27 +552,7 @@ class PlanVerifier:
         # routing snapshot.  Legacy/rules Plans still use work-root semantics
         # and must not be silently reinterpreted here.
         if plan.metadata.get("mapping_source") == "inventory_smart_completion":
-            group_kinds = {
-                group.kind for group in plan.presentation_groups
-                if group.kind in {"movie_continuous", "tv_episodes"}
-            }
-            work_domain = (
-                plan.work_identity.domain
-                if plan.work_identity is not None else ""
-            )
-            _routing, routing_problems = inspect_frozen_target_routing(
-                root_snapshot=plan.metadata.get("target_root_snapshot"),
-                root_config_fingerprint=plan.metadata.get(
-                    "target_root_config_fingerprint"
-                ),
-                domain=work_domain,
-                group_kind=(
-                    next(iter(group_kinds)) if len(group_kinds) == 1 else ""
-                ),
-                target_root=plan.metadata.get("target_root"),
-                canonical_work_root=plan.metadata.get("canonical_work_root"),
-                target_paths=(entry.target_path for entry in plan.entries),
-            )
+            _routing, routing_problems = inspect_plan_target_routing(plan)
             for problem in routing_problems:
                 issues.append(PlanIssue(
                     problem.code,
@@ -688,11 +649,12 @@ class PlanVerifier:
                     )
                 )
 
-            if entry.episode_id is not None and entry.episode_id <= 0:
+            from .episode_range import valid_episode
+            if entry.episode_id is not None and not valid_episode(entry.episode_id):
                 issues.append(
                     PlanIssue(
                         "invalid_episode",
-                        f"集号必须大于 0：{entry.episode_id}",
+                        f"集号必须是0至99999的整数：{entry.episode_id}",
                         source_path=entry.source_path,
                         target_path=entry.target_path,
                     )
@@ -712,7 +674,7 @@ class PlanVerifier:
                 entry.media_kind == "video"
                 and entry.season_id is not None
                 and entry.episode_id is not None
-                and entry.episode_id > 0
+                and valid_episode(entry.episode_id)
             ):
                 version_ref = (
                     entry.presentation_asset.version_descriptor.version_ref
@@ -720,20 +682,25 @@ class PlanVerifier:
                     and entry.presentation_asset.version_descriptor is not None
                     else None
                 )
-                episode_key = (entry.season_id, entry.episode_id, version_ref)
-                previous_episode = video_episodes.get(episode_key)
-                if previous_episode is not None:
-                    issues.append(
-                        PlanIssue(
-                            "duplicate_video_episode",
-                            "多个视频占用同一季集："
-                            f"S{entry.season_id:02d}E{entry.episode_id:02d}",
-                            source_path=entry.source_path,
-                            target_path=entry.target_path,
-                        )
-                    )
-                else:
-                    video_episodes[episode_key] = entry
+                from .episode_range import coverage
+                from .rename_plan import build_version_ref
+                try:
+                    slots = coverage(entry)
+                except ValueError:
+                    slots = ()
+                descriptor = entry.presentation_asset.version_descriptor if entry.presentation_asset else None
+                for season, episode in sorted(slots):
+                    slot_version = version_ref
+                    if entry.episode_end is not None and descriptor is not None and descriptor.edition.value is not None:
+                        slot_version = build_version_ref(entry.presentation_asset.presentation_group,
+                            season, episode, descriptor.edition.value.key, descriptor.technical_variant_key)
+                    episode_key = (season, episode, slot_version)
+                    if episode_key in video_episodes:
+                        issues.append(PlanIssue('duplicate_video_episode',
+                            f'多个视频占用同一季集：S{season:02d}E{episode:02d}',
+                            source_path=entry.source_path, target_path=entry.target_path))
+                    else:
+                        video_episodes[episode_key] = entry
             if entry.media_kind == "video":
                 video_sources.setdefault(source_key, []).append(entry)
 
@@ -752,12 +719,14 @@ class PlanVerifier:
                     entry.target_path,
                 ))
 
-        self._verify_presentation(plan, issues)
+        self._verify_presentation(plan, issues, valid_range_ids)
 
-        subtitle_semantics: Dict[Tuple[object, ...], PlanEntry] = {}
-        default_by_video: Dict[str, PlanEntry] = {}
+        conflicts = {}
+        for index, code, _, _ in subtitle_conflicts(plan.entries):
+            conflicts.setdefault(index, []).append(code)
         referenced_rule_ids: set[str] = set()
-        for entry in plan.entries:
+        inherited = self._verify_inherited_subtitles(plan, issues)
+        for index, entry in enumerate(plan.entries):
             contract = entry.subtitle
             if entry.media_kind != "subtitle" or contract is None:
                 continue
@@ -766,40 +735,25 @@ class PlanVerifier:
                 referenced_rule_ids,
                 {group.group_id for group in plan.presentation_groups},
                 issues,
+                inherited=inherited,
             )
 
-            semantic_key = (
-                _path_key(contract.associated_video_source_path)
-                if contract.associated_video_source_path is not None else "<unresolved>",
-                contract.primary_language,
-                contract.script,
-                contract.region_hint,
-                contract.additional_languages,
-                contract.track_title_tokens,
-                contract.flags,
-            )
-            previous_semantic = subtitle_semantics.get(semantic_key)
-            if previous_semantic is not None:
-                issues.append(PlanIssue(
-                    "duplicate_subtitle_semantics",
-                    "同一视频存在语义完全相同的字幕轨道",
-                    entry.source_path,
-                    entry.target_path,
-                ))
-            else:
-                subtitle_semantics[semantic_key] = entry
-            if "default" in contract.flags and contract.associated_video_source_path is not None:
-                video_key = _path_key(contract.associated_video_source_path)
-                if video_key in default_by_video:
-                    issues.append(PlanIssue(
-                        "multiple_default_subtitles",
-                        "同一视频只能有一条 default 外挂字幕",
-                        entry.source_path,
-                        entry.target_path,
-                    ))
-                else:
-                    default_by_video[video_key] = entry
+            for code in conflicts.get(index, ()):
+                message = ('同一视频存在语义完全相同的字幕轨道' if code == 'duplicate_subtitle_semantics'
+                           else '同一视频只能有一条 default 外挂字幕')
+                issues.append(PlanIssue(code, message, entry.source_path, entry.target_path))
 
+        self._verify_material_rule_references(plan, rules_by_id, referenced_rule_ids, issues,
+            {entry.source_path for entry in plan.entries}, inherited=inherited)
+        # 同一文件的新人工决定覆盖旧决定，旧规则仍保留在可核对的历史中。
+        from .rename_plan import SubtitleOverrideScope
+        later_files = set()
+        for rule in reversed(plan.subtitle_override_rules):
+            if rule.scope == SubtitleOverrideScope.FILE:
+                if rule.selected_entry_id in later_files:
+                    referenced_rule_ids.add(rule.rule_id)
+                if rule.rule_id in referenced_rule_ids:
+                    later_files.add(rule.selected_entry_id)
         for rule_id in sorted(set(rules_by_id) - referenced_rule_ids):
             issues.append(PlanIssue(
                 "subtitle_rule_unreferenced",
@@ -809,7 +763,6 @@ class PlanVerifier:
         planned_keys = set(planned_sources)
         ignored_keys = set(ignored)
         expected_keys = set(expected)
-
         for source_key in sorted(expected_keys - planned_keys - ignored_keys):
             issues.append(
                 PlanIssue(
@@ -852,7 +805,14 @@ class PlanVerifier:
         self,
         plan: RenamePlan,
         issues: List[PlanIssue],
+        valid_range_ids: set,
     ) -> None:
+        if plan.metadata.get('movie_version_selection') is not None:
+            from .movie_version_selection import validate_selection
+            try:
+                validate_selection(plan)
+            except (ValueError, KeyError, TypeError) as exc:
+                issues.append(PlanIssue('movie_version_selection_invalid', str(exc)))
         groups: Dict[str, PresentationGroup] = {}
         content_by_unit: Dict[Tuple[str, Optional[int], Optional[int]], List[PlanEntry]] = {}
         versions_by_group: Dict[str, Dict[str, List[PlanEntry]]] = {}
@@ -919,27 +879,10 @@ class PlanVerifier:
             ))
         if work is not None and work.domain_source not in {
             "provider_selection", "task_metadata", "manual_library_selection", "unknown",
-            "v4_migration_provider_selection",
-            "v4_migration_task_metadata", "v4_migration_unknown",
         }:
             issues.append(PlanIssue(
                 "work_identity_domain_source_invalid",
                 f"不支持的作品领域来源：{work.domain_source}",
-            ))
-        if plan.migrated_from_schema is not None:
-            if (
-                plan.migrated_from_schema != 4
-                or re.fullmatch(r"[0-9a-f]{64}", plan.migration_source_fingerprint)
-                is None
-            ):
-                issues.append(PlanIssue(
-                    "plan_migration_provenance_invalid",
-                    "schema 迁移来源或原始版本标识无效",
-                ))
-        elif plan.migration_source_fingerprint:
-            issues.append(PlanIssue(
-                "plan_migration_provenance_invalid",
-                "原始版本标识缺少 schema 迁移来源",
             ))
         for linked in plan.linked_provider_identities:
             if linked.status not in {"candidate", "confirmed", "rejected"}:
@@ -957,6 +900,13 @@ class PlanVerifier:
                     "关联资料身份的 Provider namespace/type 未注册",
                 ))
 
+        if (plan.metadata.get('asset_operation') or {}).get('requires_choice'):
+            message = ('已选择替换此电影版本，请核对并确认换源范围；完成前不能批准'
+                       if (plan.metadata.get('movie_version_selection') or {}).get('replacement') is not None
+                       else '该电影版本槽位已有登记，请新增其他版本或明确选择换源'
+                       if {g.kind for g in plan.presentation_groups} == {'movie_continuous'}
+                       else '本季度已有另一份资源，请明确选择换源；不会自动替换')
+            issues.append(PlanIssue('asset_replace_choice_required', message))
         unresolved_collisions = plan.metadata.get("asset_collision_unresolved", ())
         if unresolved_collisions:
             count = (
@@ -968,35 +918,182 @@ class PlanVerifier:
                 f"有 {count} 个同名附加内容不同且无法确定版本归属",
             ))
 
-        issues.extend(_work_font_intent_issues(plan))
-        issues.extend(_tv_font_manifest_issues(plan))
+        if {group.kind for group in plan.presentation_groups} == {'movie_continuous'}:
+            from .movie_asset_scope import validate_movie_authority
+            try:
+                validate_movie_authority(plan)
+            except (ValueError, TypeError, KeyError) as exc:
+                issues.append(PlanIssue('movie_asset_authority_invalid', str(exc)))
+        from .audio_projection import validate_audio
+        try:
+            validate_audio(plan)
+        except ValueError as exc:
+            issues.append(PlanIssue('external_audio_projection_invalid',str(exc)))
 
         special_candidates = plan.metadata.get("provider_special_candidates")
         special_decisions = plan.metadata.get("provider_special_decisions")
-        if isinstance(special_candidates, Mapping):
-            decided = (
-                special_decisions if isinstance(special_decisions, Mapping) else {}
+        from .special_decision_projection import validated_special_decisions
+        valid_special_ids, special_projection_error = validated_special_decisions(plan)
+        if special_projection_error is not None:
+            issues.append(PlanIssue(
+                special_projection_error,
+                "特别篇或附加内容决定与当前文件投影不一致；请重新生成整理计划",
+            ))
+        observation_value = plan.metadata.get("provider_special_observation")
+        provider_special_observation = None
+        if isinstance(observation_value, Mapping):
+            try:
+                provider_special_observation = (
+                    provider_special.ProviderSpecialObservation.from_mapping(
+                        observation_value
+                    )
+                )
+            except provider_special.ProviderSpecialEvidenceError:
+                provider_special_observation = None
+        provider_special_authority_applicable = (
+            isinstance(observation_value, Mapping)
+            or bool(plan.metadata.get("provider_special_observation_required"))
+            or (
+                plan.work_identity is not None
+                and plan.work_identity.primary_provider.namespace == "tmdb"
+                and plan.work_identity.primary_provider.entity_type == "tv"
             )
+            or any(
+                identity.namespace == "tmdb" and identity.entity_type == "tv"
+                for identity in plan.linked_provider_identities
+            )
+        )
+        unavailable_special_eligibility = plan.metadata.get(
+            "provider_special_eligibility_unavailable"
+        )
+        unavailable_ids = (
+            {
+                str(identifier)
+                for identifier in unavailable_special_eligibility
+                if isinstance(identifier, str) and identifier
+            }
+            if isinstance(unavailable_special_eligibility, (list, tuple))
+            else set()
+        )
+        decided = (
+            {key: value for key, value in special_decisions.items() if key in valid_special_ids}
+            if isinstance(special_decisions, Mapping) else {}
+        )
+        candidates = (
+            special_candidates if isinstance(special_candidates, Mapping) else {}
+        )
+        evidence_unavailable_ids: set[str] = set()
+        for entry in plan.entries:
+            if entry.media_kind != "video":
+                continue
+            identity = os.path.normpath(str(entry.source_path)).casefold()
+            identifier = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+            if identifier in valid_special_ids or identifier in valid_range_ids:
+                continue
+            eligibility = provider_special._provider_special_eligibility(entry)
+            if eligibility == "eligible" and provider_special_authority_applicable:
+                if (
+                    provider_special_observation is None
+                    or provider_special_observation.state
+                    in {"not_run", "unavailable_or_error"}
+                ):
+                    evidence_unavailable_ids.add(identifier)
+                    continue
+                if provider_special_observation.schema_version == 3 and not provider_special_observation.displayable:
+                    evidence_unavailable_ids.add(identifier)
+                    continue
+                if provider_special_observation.schema_version in (2, 3):
+                    issues.append(PlanIssue('provider_special_decision_required',
+                        '特别篇资料不完整，请明确对应或描述性命名' if provider_special_observation.state == 'incomplete'
+                        else '请确认特别篇对应或描述性命名；官方原始编号不直接决定输出集号',
+                        entry.source_path, entry.target_path))
+                    continue
+                if provider_special_observation.state == "completed_with_rows":
+                    rows = candidates.get(identifier)
+                    if not rows:
+                        evidence_unavailable_ids.add(identifier)
+                    elif identifier not in decided:
+                        issues.append(PlanIssue(
+                            "provider_special_decision_required",
+                            "发现官方特别篇候选，请确认归入特别篇或保留为附加内容",
+                            entry.source_path,
+                            entry.target_path,
+                        ))
+        if evidence_unavailable_ids:
             for entry in plan.entries:
                 identity = os.path.normpath(str(entry.source_path)).casefold()
                 identifier = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
-                rows = special_candidates.get(identifier)
-                if rows and identifier not in decided:
+                if identifier in evidence_unavailable_ids:
                     issues.append(PlanIssue(
-                        "provider_special_decision_required",
-                        "发现官方特别篇候选，请确认归入特别篇或保留为附加内容",
+                        "provider_special_evidence_unavailable",
+                        "特别篇资料尚不可用，请打开特别篇选择获取资料或手动描述性归入",
+                        entry.source_path,
+                        entry.target_path,
+                    ))
+        if unavailable_ids:
+            for entry in plan.entries:
+                identity = os.path.normpath(str(entry.source_path)).casefold()
+                identifier = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+                if identifier in unavailable_ids and identifier not in valid_special_ids and identifier not in valid_range_ids:
+                    issues.append(PlanIssue(
+                        "provider_special_eligibility_unavailable",
+                        "附加视频缺少可信的特别篇资格，请重新生成整理计划",
                         entry.source_path,
                         entry.target_path,
                     ))
 
+        rebuild_reuse_targets = set()
+        operation = plan.metadata.get('asset_operation') or {}
+        if operation.get('mode') == 'replace':
+            try:
+                from .projection_authority import validate_plan_projection_receipt
+                from .asset_operation import AssetOperation
+                validate_plan_projection_receipt(plan)
+                frozen = AssetOperation.from_mapping(operation).to_dict()
+                previous = {row['target_path']: row.get('target_evidence')
+                            for row in frozen['previous_assets']}
+                if frozen['policy']=='asset-operation-v3':
+                    scope = frozen['season_directory']
+                    previous = {row['target']:row['evidence'] for row in scope['files'] + scope.get('special_files', [])}
+                for item in plan.entries:
+                    collision = item.collision_resolution
+                    evidence = previous.get(str(item.target_path))
+                    if collision is not None and evidence is not None and (
+                        collision.target_size == evidence['size']
+                        and collision.target_xxh3_128 == evidence.get('xxh3_128')
+                        and collision.evidence_kind == evidence.get('kind')
+                        and collision.target_device == evidence['device']
+                        and collision.target_inode == evidence['inode']
+                    ):
+                        rebuild_reuse_targets.add(str(item.target_path))
+            except (ValueError, RuntimeError, KeyError, TypeError):
+                pass
+        if plan.metadata.get('completed_rebuild_observation') is not None:
+            try:
+                from .projection_authority import validate_plan_projection_receipt
+                validate_plan_projection_receipt(plan)
+                rebuild_reuse_targets.update(plan.metadata['completed_rebuild_observation']['reuse_targets'])
+            except (ValueError, RuntimeError, KeyError, TypeError):
+                pass
         for entry in plan.entries:
             asset = entry.presentation_asset
             collision = entry.collision_resolution
+            rebuild_reuse = collision is not None and str(entry.target_path) in rebuild_reuse_targets
             if collision is not None:
+                try:
+                    from .rename_plan import CollisionResolution
+                    from .asset_collision import requires_manual_collision
+                    valid_evidence = CollisionResolution.from_dict(collision.to_dict()) == collision
+                    if collision.evidence_kind == 'content-xxh3-128-v1':
+                        valid_evidence = valid_evidence and not requires_manual_collision(entry.source_path)
+                    elif collision.evidence_kind != 'hardlink-identity-v1':
+                        valid_evidence = False
+                except (ValueError, TypeError, KeyError):
+                    valid_evidence = False
                 if (
-                    collision.action != "reuse_existing"
+                    not valid_evidence or collision.action != "reuse_existing"
                     or collision.source_size != collision.target_size
-                    or collision.source_sha256 != collision.target_sha256
+                    or collision.source_xxh3_128 != collision.target_xxh3_128
                 ):
                     issues.append(PlanIssue(
                         "asset_collision_resolution_invalid",
@@ -1004,7 +1101,7 @@ class PlanVerifier:
                         entry.source_path,
                         entry.target_path,
                     ))
-                if entry.media_kind == "subtitle":
+                if entry.media_kind == "subtitle" and not rebuild_reuse:
                     issues.append(PlanIssue(
                         "subtitle_collision_resolution_forbidden",
                         "字幕不能通过附加资产复用合同绕过字幕关联规则",
@@ -1046,7 +1143,7 @@ class PlanVerifier:
                 ))
 
             role = asset.asset_role
-            if collision is not None and role.kind not in {"extra", "associated"}:
+            if collision is not None and role.kind not in {"extra", "associated"} and not rebuild_reuse:
                 issues.append(PlanIssue(
                     "asset_collision_role_invalid",
                     "当前只允许特典或配套资源复用已有同内容目标",
@@ -1067,13 +1164,15 @@ class PlanVerifier:
                     entry.source_path,
                     entry.target_path,
                 ))
-            if role.kind == "extra" and role.subtype not in {
-                "trailer", "featurette", "interview", "behind_the_scenes",
-                "deleted_scene", "scene", "short", "clip", "sample", "other",
-            }:
+            valid_extra_subtypes = (
+                _TV_EXTRA_SUBTYPES
+                if group.kind == "tv_episodes"
+                else _MOVIE_EXTRA_SUBTYPES
+            )
+            if role.kind == "extra" and role.subtype not in valid_extra_subtypes:
                 issues.append(PlanIssue(
                     "presentation_extra_subtype_invalid",
-                    "电影特典必须具有受支持的 subtype",
+                    "附加内容必须具有与呈现分组匹配的 subtype",
                     entry.source_path,
                     entry.target_path,
                 ))
@@ -1149,7 +1248,7 @@ class PlanVerifier:
                         entry.source_path,
                         entry.target_path,
                     ))
-                if asset.segment is not None and descriptor.display_label:
+                if asset.segment is not None and descriptor.display_label and descriptor.identity_policy is None:
                     issues.append(PlanIssue(
                         "presentation_segment_version_conflict",
                         "Jellyfin 多段电影不能同时使用多版本标签",
@@ -1163,10 +1262,13 @@ class PlanVerifier:
                 entry.episode_id if group.kind == "tv_episodes" else None
             )
             unit = (asset.presentation_group, bound_season, bound_episode)
+            from .special_selection import validate_descriptive_special
+            if validate_descriptive_special(plan, entry):
+                unit = (asset.presentation_group, bound_season, descriptor.version_ref)
             content_by_unit.setdefault(unit, []).append(entry)
-            self._verify_version_descriptor(entry, descriptor, issues)
+            self._verify_version_descriptor(entry, descriptor, issues, plan=plan)
             edition = descriptor.edition.value
-            if isinstance(edition, EditionValue) and descriptor.technical_variant_key:
+            if isinstance(edition, EditionValue) and descriptor.technical_variant_key and descriptor.identity_policy is None:
                 expected_ref = build_version_ref(
                     asset.presentation_group,
                     bound_season,
@@ -1209,7 +1311,7 @@ class PlanVerifier:
             for entry in entries:
                 descriptor = entry.presentation_asset.version_descriptor
                 if (
-                    descriptor.edition.kind == "structural_default"
+                    descriptor.identity_policy is None and descriptor.edition.kind == "structural_default"
                     and descriptor.technical_variant_key == "default"
                 ):
                     all_segmented = all(
@@ -1222,7 +1324,7 @@ class PlanVerifier:
                     ):
                         issues.append(PlanIssue(
                             "presentation_structural_default_not_unique",
-                            "default 哨兵只能用于唯一视频或同一版本的完整分段",
+                            "多个正片版本中有视频尚未明确规格；请在该文件的版本设置中确认分辨率或版本名称",
                             entry.source_path,
                             entry.target_path,
                         ))
@@ -1305,10 +1407,35 @@ class PlanVerifier:
         entry: PlanEntry,
         descriptor: VersionDescriptor,
         issues: List[PlanIssue],
+        *, plan=None,
     ) -> None:
         assert entry.presentation_asset is not None
         version = entry.presentation_asset.version_descriptor
         assert version is not None
+        from .special_selection import DESCRIPTIVE_POLICY, validate_descriptive_special
+        if version.identity_policy == DESCRIPTIVE_POLICY:
+            if not validate_descriptive_special(plan, entry):
+                issues.append(PlanIssue('descriptive_special_invalid', '描述性特别篇与冻结人工决定不一致', entry.source_path, entry.target_path))
+            return
+        from .episode_versions import POLICY as TV_VERSION_POLICY, validate_projection as validate_versions
+        if version.identity_policy == TV_VERSION_POLICY:
+            try:
+                validate_versions(plan)
+            except (ValueError, TypeError, KeyError) as exc:
+                issues.append(PlanIssue('episode_versions_invalid', str(exc), entry.source_path, entry.target_path))
+            return
+        from .movie_version_selection import POLICY, safe_label
+        if version.identity_policy is not None:
+            if version.identity_policy != POLICY or not re.fullmatch(r'mv-[0-9a-f]{32}', str(version.version_ref)):
+                issues.append(PlanIssue('movie_version_identity_invalid', '电影版本内部身份或合同版本无效', entry.source_path, entry.target_path))
+            try:
+                if safe_label(version.display_label) != version.display_label:
+                    raise ValueError('电影版本标签未规范化')
+            except ValueError as exc:
+                issues.append(PlanIssue('movie_version_label_invalid', str(exc), entry.source_path, entry.target_path))
+            for name in ('edition', 'resolution', 'dynamic_range', 'key_audio'):
+                self._verify_evidence(entry, name, getattr(version, name), issues)
+            return
         if not version.version_ref or not version.technical_variant_key:
             issues.append(PlanIssue(
                 "presentation_version_identity_missing",
@@ -1528,6 +1655,7 @@ class PlanVerifier:
         referenced_rule_ids: set[str],
         presentation_group_ids: set[str],
         issues: List[PlanIssue],
+        *, inherited=None,
     ) -> None:
         # The caller guarantees this exact schema type through PlanEntry.
         subtitle = entry.subtitle
@@ -1631,14 +1759,24 @@ class PlanVerifier:
         else:
             video = matching_videos[0]
             video_asset = video.presentation_asset
+            valid_video_role = (
+                video_asset is not None
+                and (
+                    video_asset.asset_role.kind == "content_version"
+                    or (
+                        entry.role == "extra_subtitle"
+                        and video_asset.asset_role.kind in {"extra", "unknown"}
+                    )
+                )
+            )
             if (
                 video_asset is None
-                or video_asset.asset_role.kind != "content_version"
+                or not valid_video_role
                 or video_asset.presentation_group not in presentation_group_ids
             ):
                 issues.append(PlanIssue(
                     "subtitle_video_not_content_version",
-                    "字幕只能关联到当前 Plan 中有有效呈现分组的内容版本视频",
+                    "字幕只能关联到当前 Plan 中有有效呈现分组的内容版本或特典视频",
                     entry.source_path,
                     entry.target_path,
                 ))
@@ -1679,27 +1817,29 @@ class PlanVerifier:
                 entry.source_path,
                 entry.target_path,
             ))
-        if subtitle.primary_language not in {"zh", "ja", "en", "ko", "hi"}:
-            issues.append(PlanIssue(
-                "subtitle_primary_language_invalid",
-                "字幕主语言缺失或不在当前支持集合",
-                entry.source_path,
-                entry.target_path,
-            ))
-        if subtitle.primary_language == "zh" and subtitle.script not in {"Hans", "Hant"}:
-            issues.append(PlanIssue(
-                "subtitle_chinese_script_invalid",
-                "中文字幕必须明确 Hans 或 Hant",
-                entry.source_path,
-                entry.target_path,
-            ))
-        if subtitle.primary_language != "zh" and subtitle.script is not None:
-            issues.append(PlanIssue(
-                "subtitle_script_language_mismatch",
-                "当前合同只允许中文携带 Hans/Hant script",
-                entry.source_path,
-                entry.target_path,
-            ))
+        self._verify_subtitle_metadata(entry, rules_by_id, referenced_rule_ids, issues, inherited=inherited)
+
+    def _verify_subtitle_metadata(self, entry, rules_by_id, referenced_rule_ids, issues, *, inherited=None):
+        """Shared rule/label semantics, independent of output collisions."""
+        subtitle = entry.subtitle
+        assert subtitle is not None
+        from .inherited_subtitle_edits import InheritedPlanProof
+        if subtitle.decision_source == 'manual_transfer':
+            if (not subtitle.inherited_edit_fingerprint or type(inherited) is not InheritedPlanProof
+                    or dict(inherited.contracts).get(entry.source_path) != subtitle):
+                issues.append(PlanIssue('subtitle_inherited_reference_invalid',
+                    '字幕继承引用缺少同源有限材料证明', entry.source_path, entry.target_path))
+        elif subtitle.inherited_edit_fingerprint:
+            issues.append(PlanIssue('subtitle_inherited_reference_unexpected',
+                '非继承字幕不能携带有限引用', entry.source_path, entry.target_path))
+        from .subtitle_languages import format_language, language_key, multilingual_title
+        try:
+            main = format_language(subtitle.primary_language, subtitle.script)
+            if any(language_key(v) != v for v in subtitle.additional_languages):
+                raise ValueError('附加语言代码未规范化')
+            multilingual_title(main, subtitle.additional_languages)
+        except ValueError as exc:
+            issues.append(PlanIssue('subtitle_primary_language_invalid', str(exc), entry.source_path, entry.target_path))
         if tuple(flag for flag in ("default", "forced", "sdh") if flag in subtitle.flags) != subtitle.flags:
             issues.append(PlanIssue(
                 "subtitle_flags_invalid",
@@ -1760,7 +1900,7 @@ class PlanVerifier:
                     entry.target_path,
                 ))
         if subtitle.decision_source not in {
-            "automatic", "manual", "manual_file", "manual_series"
+            "automatic", "manual", "manual_file", "manual_series", "manual_transfer"
         }:
             issues.append(PlanIssue(
                 "subtitle_decision_source_invalid",
@@ -1837,12 +1977,51 @@ class PlanVerifier:
                 entry.target_path,
             ))
 
+    def _verify_material_rule_references(self, plan, rules_by_id, referenced_rule_ids, issues, visible_sources, *, inherited=None):
+        from .content_selection import from_plan
+        choice = from_plan(plan)
+        if choice is None:
+            return
+        for row in choice.to_dict()['materials']:
+            if row['media_kind'] != 'subtitle' or Path(row['source_path']) in visible_sources:
+                continue
+            entry = PlanEntry.from_dict({**row, 'target_path': row['source_path'], 'collision_resolution': None})
+            contract = entry.subtitle
+            if contract is not None and (contract.decision_source in {'manual_file', 'manual_series', 'manual_transfer'}
+                    or any((contract.applied_rule_id, contract.applied_rule_fingerprint,
+                            contract.applied_rule_scope, contract.applied_rule_engine_version, contract.inherited_edit_fingerprint))):
+                self._verify_subtitle_metadata(entry, rules_by_id, referenced_rule_ids, issues, inherited=inherited)
+
+    def _verify_inherited_subtitles(self, plan, issues):
+        from .inherited_subtitle_edits import validate_plan, InheritedPlanProof, POLICY
+        try:
+            result = validate_plan(plan)
+            raw = plan.metadata.get('content_selection')
+            from .source_decision_transfer import ORIGIN
+            if isinstance(raw, Mapping) and (raw.get('policy') == POLICY or raw.get('origin_kind') == ORIGIN):
+                if (type(result) is not InheritedPlanProof or result.task_id != plan.task_id
+                        or result.content_fingerprint != plan.metadata.get('content_selection_fingerprint')):
+                    raise ValueError('有限字幕共同验证结果已断开或不属于本计划')
+            return result
+        except (ValueError, TypeError, KeyError) as exc:
+            issues.append(PlanIssue('subtitle_inherited_content_invalid', str(exc)))
+            return None
+
+    def verify_subtitle_rule_materials(self, plan):
+        """Canonical content consumer; no hidden output or collision checks."""
+        issues = []
+        rules = self._verify_subtitle_rules(plan, issues)
+        inherited = self._verify_inherited_subtitles(plan, issues)
+        self._verify_material_rule_references(plan, rules, set(), issues, set(), inherited=inherited)
+        return tuple(issues)
+
     def _verify_subtitle_rules(
-        self, plan: RenamePlan, issues: List[PlanIssue]
+        self, plan: RenamePlan, issues: List[PlanIssue], *, invalid_rule_ids=None
     ) -> Dict[str, SubtitleOverrideRule]:
         rules_by_id: Dict[str, SubtitleOverrideRule] = {}
         fingerprints: set[str] = set()
         for rule in plan.subtitle_override_rules:
+            start = len(issues)
             if not rule.rule_id or rule.rule_id in rules_by_id:
                 issues.append(PlanIssue(
                     "subtitle_rule_id_invalid",
@@ -1892,6 +2071,8 @@ class PlanVerifier:
                         "subtitle_rule_series_scope_mismatch",
                         "系列字幕规则缺少稳定 TMDB TV 身份或作用域不匹配",
                     ))
+            if invalid_rule_ids is not None and len(issues) > start:
+                invalid_rule_ids.add(rule.rule_id)
         return rules_by_id
 
 

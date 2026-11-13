@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -42,6 +43,16 @@ class RecoveryTransactionError(RuntimeError):
     pass
 
 
+def require_no_pending_detach(*, plan_store, task_root, decision_root, task_id):
+    """未完成的登记事务阻止批准、执行及移除任务。"""
+    root = Path(task_root).parent
+    if Path(plan_store.root).parent != root or Path(decision_root).parent != root:
+        raise RecoveryTransactionError('登记恢复不属于当前数据上下文')
+    transaction = RecoveryTransactionStore(root / 'recovery_transactions').load_optional(task_id)
+    if transaction is not None and transaction.phase != 'completed':
+        raise RecoveryTransactionError('作品登记恢复事务尚未完成，请先取消或恢复原操作')
+
+
 @dataclass(frozen=True)
 class RecoveryTransaction:
     task_id: str
@@ -56,6 +67,10 @@ class RecoveryTransaction:
     catalog_record_fingerprint: str = ""
     recovery_nonce: str = ""
 
+    def __post_init__(self):
+        if self.recovery_nonce and re.fullmatch(r'[0-9a-f]{32}', self.recovery_nonce) is None:
+            raise RecoveryTransactionError('恢复事务标识损坏，请核查恢复记录')
+
     @classmethod
     def from_dict(cls, value: object) -> "RecoveryTransaction":
         if not isinstance(value, Mapping):
@@ -69,6 +84,11 @@ class RecoveryTransaction:
             raise RecoveryTransactionError("恢复事务 phase 无效")
         if not task_id:
             raise RecoveryTransactionError("恢复事务缺少 task_id")
+        if (value.get('catalog_backend') not in {'work', 'series'}
+                or re.fullmatch(r'[A-Za-z0-9._-]+', str(value.get('catalog_key') or '')) is None):
+            raise RecoveryTransactionError('恢复作品登记身份无效')
+        if re.fullmatch(r'[0-9a-f]{32}', str(value.get('recovery_nonce') or '')) is None:
+            raise RecoveryTransactionError('恢复事务标识缺失或损坏，请核查恢复记录')
         return cls(
             task_id=task_id,
             operation=operation,
@@ -145,9 +165,12 @@ class RecoveryTransactionStore:
         if not path.exists():
             return None
         try:
-            return RecoveryTransaction.from_dict(
+            transaction = RecoveryTransaction.from_dict(
                 json.loads(path.read_text(encoding="utf-8"))
             )
+            if transaction.task_id != task_id:
+                raise RecoveryTransactionError('恢复记录不属于当前任务')
+            return transaction
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise RecoveryTransactionError(f"无法读取恢复事务：{exc}") from exc
 
@@ -221,6 +244,7 @@ class CatalogDetachService:
         self.task_root = Path(task_root)
 
     def _task_terminal(self, task_id: str) -> TaskTerminalMutation:
+        self._require_current_task(task_id)
         def update(_decision, projected, current):
             verification = PlanVerifier().verify(projected)
             current.update({
@@ -237,6 +261,20 @@ class CatalogDetachService:
 
         return TaskTerminalMutation.prepare(self.task_root, task_id, update)
 
+    def _require_current_task(self, task_id):
+        from ..utils.utils import safe_task_path
+        path = safe_task_path(self.task_root, task_id)
+        if not path.is_file():
+            raise RecoveryTransactionError('原任务已移除，请从菜单“恢复记录”核查，不能恢复为新任务')
+        payload = json.loads(path.read_text('utf-8'))
+        if payload.get('uuid') != task_id:
+            raise RecoveryTransactionError('原任务身份不一致，不能继续恢复')
+
+
+    def pending_transaction(self, task_id):
+        return self.transaction_store.load_optional(task_id)
+
+
     def execute(
         self, task_id: str, *, catalog_backend: str, catalog_key: str
     ) -> tuple[object, object, RecoveryTransaction]:
@@ -245,6 +283,7 @@ class CatalogDetachService:
         if not str(catalog_key).strip():
             raise RecoveryTransactionError("作品登记键为空")
         with self.transaction_store.lock(task_id):
+            self._require_current_task(task_id)
             transaction = self.transaction_store.load_optional(task_id)
             if transaction is None:
                 transaction = self._prepare(
@@ -266,12 +305,48 @@ class CatalogDetachService:
                 )
             return self._advance(transaction)
 
+    def cancel_prepared(self, task_id):
+        """Cancel only a never-archived operation, retaining its immutable audit."""
+        with self.transaction_store.lock(task_id):
+            self._require_current_task(task_id)
+            transaction = self.transaction_store.load_optional(task_id)
+            if transaction is None or transaction.phase != 'prepared':
+                raise RecoveryTransactionError('只有尚未归档的旧登记事务可以取消')
+            if self._catalog_status(transaction) != 'intact':
+                raise RecoveryTransactionError('登记或归档证据已变化，不能直接取消')
+            decision, plan = self.decision_store.load(task_id), self.plan_store.load(task_id)
+            self._assert_catalog_binding(decision, plan, catalog_backend=transaction.catalog_backend,
+                                         catalog_key=transaction.catalog_key)
+            archive = self._evidence_path('cancelled', f'{task_id}.{transaction.recovery_nonce}.json')
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(transaction.to_dict(), ensure_ascii=False, sort_keys=True).encode('utf-8')
+            if archive.exists():
+                if archive.read_bytes() != payload:
+                    raise RecoveryTransactionError('旧事务取消记录冲突')
+                if decision.recovery_state == 'healthy':
+                    from .projection_authority import validate_plan_projection_receipt
+                    validate_plan_projection_receipt(plan)
+                    self.transaction_store.delete(task_id)
+                    return decision, plan
+            else:
+                if decision.recovery_state != 'catalog_detach_pending':
+                    raise RecoveryTransactionError('旧登记事务状态已变化')
+                with archive.open('xb') as handle:
+                    handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+            decision, projected = commit_projected_plan(self.decision_store, self.plan_store,
+                previous=decision, candidate=replace(decision, recovery_state='healthy', execution_failure=None),
+                draft_plan=plan, task_terminal=self._task_terminal(task_id))
+            self.transaction_store.delete(task_id)
+            return decision, projected
+
     def reconcile_and_execute(
         self, task_id: str, *, catalog_backend: str, catalog_key: str
     ) -> tuple[object, object, Optional[RecoveryTransaction]]:
         """Repair a missing/corrupt phase record from business evidence only."""
 
+
         with self.transaction_store.lock(task_id):
+            self._require_current_task(task_id)
             decision = self.decision_store.load(task_id)
             plan = self.plan_store.load(task_id)
             if decision.recovery_state != "catalog_detach_pending":
@@ -374,6 +449,8 @@ class CatalogDetachService:
             decision = self.decision_store.load(transaction.task_id)
             plan = self.plan_store.load(transaction.task_id)
             if transaction.phase == "prepared":
+                self._assert_pre_state(transaction, decision, plan)
+                self._project_detached_plan(transaction, self._detached_candidate(transaction, decision), plan)
                 status = self._catalog_status(transaction)
                 if status == "intact":
                     self._archive_catalog(transaction)
@@ -386,23 +463,18 @@ class CatalogDetachService:
                 continue
 
             if transaction.phase in {"catalog_archived", "decision_detached"}:
-                detached = (
-                    decision.catalog_link_intent is None
-                    and decision.series_binding is None
-                    and decision.season_binding is None
-                    and decision.recovery_state is None
-                    and decision.execution_failure is None
-                )
-                candidate = (
-                    decision if detached else replace(
-                        decision,
-                        catalog_link_intent=None,
-                        series_binding=None,
-                        season_binding=None,
-                        recovery_state=None,
-                        execution_failure=None,
-                    )
-                )
+                self._assert_matching_archive(transaction)
+                if plan.metadata.get('recovery_nonce') == transaction.recovery_nonce:
+                    self._assert_post_state(transaction, decision, plan)
+                    transaction = replace(transaction, phase='plan_projected',
+                        prepared_plan_fingerprint=self.plan_store.fingerprint(plan),
+                        expected_decision_revision=decision.revision,
+                        decision_fingerprint=self.decision_store.fingerprint(decision))
+                    self.transaction_store.save(transaction)
+                    continue
+                self._assert_pre_state(transaction, decision, plan)
+                self._save_pre_state(transaction, decision)
+                candidate = self._detached_candidate(transaction, decision)
                 projected = self._project_detached_plan(
                     transaction, candidate, plan
                 )
@@ -474,9 +546,119 @@ class CatalogDetachService:
                 "recovery_nonce": transaction.recovery_nonce,
             }
         )
+        for key in ('asset_operation', 'completed_rebuild_observation'):
+            metadata.pop(key, None)
+        if decision.movie_version_selection is not None:
+            metadata['proposed_work_key'] = decision.movie_version_selection.to_dict()['work_key']
         return self.decision_store.project_plan(
             decision, replace(plan, metadata=metadata)
         )
+
+    def _detached_candidate(self, transaction, decision):
+        from .movie_version_selection import rebind_selection
+        selection = decision.movie_version_selection
+        if selection is not None:
+            # A new, unregistered intent, not a nullable or wildcard work key.
+            selection = rebind_selection(selection, 'work-' + transaction.recovery_nonce)
+        return replace(decision, catalog_link_intent=None, series_binding=None,
+            season_binding=None, recovery_state=None, execution_failure=None,
+            movie_version_selection=selection, asset_operation=None,
+            completed_rebuild_observation=None)
+
+    def _assert_pre_state(self, transaction, decision, plan):
+        if (decision.revision != transaction.expected_decision_revision
+                or self.decision_store.fingerprint(decision) != transaction.decision_fingerprint
+                or self.plan_store.fingerprint(plan) != transaction.old_plan_fingerprint):
+            raise RecoveryTransactionError('恢复记录与当前决定或计划已变化，请重新核查')
+
+    def _witness_path(self, transaction):
+        self.transaction_store.path_for(transaction.task_id)
+        if re.fullmatch(r'[0-9a-f]{32}', transaction.recovery_nonce) is None:
+            raise RecoveryTransactionError('恢复事务标识损坏')
+        return self._evidence_path('witness', transaction.task_id + '.' + transaction.recovery_nonce + '.json')
+
+    def _evidence_path(self, directory, filename):
+        if directory not in {'witness', 'cancelled', 'abandoned'} or Path(filename).name != filename:
+            raise RecoveryTransactionError('恢复证据路径无效')
+        path = self.transaction_store.root / directory / filename
+        if not path.resolve().is_relative_to(self.transaction_store.root.resolve()):
+            raise RecoveryTransactionError('恢复证据路径越界')
+        return path
+
+    def _save_pre_state(self, transaction, decision):
+        path = self._witness_path(transaction)
+        payload = json.dumps(decision.to_dict(), ensure_ascii=False, sort_keys=True).encode('utf-8')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if path.read_bytes() != payload:
+                raise RecoveryTransactionError('恢复前态证据已变化')
+        else:
+            with path.open('xb') as handle:
+                handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+
+    def _assert_post_state(self, transaction, decision, plan):
+        from .decision_state import DecisionState
+        from .projection_authority import (FinalPlanProjector, ProjectionAuthorityEnvelope,
+            inventory_fingerprint_for_plan, _episode_rows_from_plan)
+        original = DecisionState.from_dict(json.loads(self._witness_path(transaction).read_text('utf-8')))
+        if self.decision_store.fingerprint(original) != transaction.decision_fingerprint:
+            raise RecoveryTransactionError('恢复前态指纹不一致')
+        candidate = self._detached_candidate(transaction, original)
+        expected = replace(candidate, revision=decision.revision, updated_at=decision.updated_at)
+        if (decision.revision != original.revision + 1
+                or self.decision_store.fingerprint(expected) != self.decision_store.fingerprint(decision)):
+            raise RecoveryTransactionError('恢复提交后决定不一致')
+        old_plan = self.plan_store.load_version(transaction.task_id, transaction.old_plan_fingerprint)
+        draft = self._project_detached_plan(transaction, decision, old_plan)
+        ownership = ProjectionCommitService(self.decision_store, self.plan_store,
+            task_root=self.task_root).ownership_store.load_optional(transaction.task_id)
+        expected_plan = FinalPlanProjector.project(ProjectionAuthorityEnvelope(previous_decision=original,
+            decision=decision, draft_plan=draft, inventory_fingerprint=inventory_fingerprint_for_plan(draft),
+            episode_ownership=_episode_rows_from_plan(draft)), ownership)
+        from .generated_outputs import bind_outputs
+        expected_plan = bind_outputs(expected_plan, plan.metadata.get('generated_outputs'))
+        if self.plan_store.fingerprint(expected_plan) != self.plan_store.fingerprint(plan):
+            raise RecoveryTransactionError('恢复提交后计划不一致')
+
+    def _assert_matching_archive(self, transaction):
+        if self._catalog_status(transaction) != 'archived_with_matching_tombstone':
+            raise RecoveryTransactionError('恢复登记归档缺失、冲突或已变化，请核查恢复记录')
+
+
+    def archive_orphaned_transaction(self, task_id, *, expected_fingerprint):
+        """Explicit audit-only exit. Never restore a task or mutate media/catalog."""
+        from ..utils.utils import safe_task_path, task_record_lock
+        with self.transaction_store.lock(task_id), task_record_lock(self.task_root, task_id):
+            if safe_task_path(self.task_root, task_id).exists():
+                raise RecoveryTransactionError('原任务仍存在，请在原任务中继续恢复')
+            path = self.transaction_store.path_for(task_id)
+            archive = self._evidence_path('abandoned', f'{task_id}.{expected_fingerprint}.json')
+            if len(expected_fingerprint) != 64 or any(c not in '0123456789abcdef' for c in expected_fingerprint):
+                raise RecoveryTransactionError('恢复记录指纹无效')
+            if not path.exists():
+                if archive.is_file() and hashlib.sha256(archive.read_bytes()).hexdigest() == expected_fingerprint:
+                    return
+                raise RecoveryTransactionError('恢复记录已变化，请刷新')
+            payload = path.read_bytes()
+            if hashlib.sha256(payload).hexdigest() != expected_fingerprint:
+                raise RecoveryTransactionError('恢复记录已变化，请刷新')
+            transaction = self.transaction_store.load_optional(task_id)
+            if transaction.task_id != task_id or transaction.phase not in {'catalog_archived', 'decision_detached', 'plan_projected'}:
+                raise RecoveryTransactionError('当前恢复阶段不能安全结束')
+            archives = self._valid_tombstones(transaction.catalog_backend, transaction.catalog_key)
+            if (len(archives) != 1 or hashlib.sha256(archives[0].read_bytes()).hexdigest()
+                    != transaction.catalog_record_fingerprint):
+                raise RecoveryTransactionError('原恢复归档缺失或已变化，不能安全结束')
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            if archive.exists():
+                if archive.read_bytes() != payload:
+                    raise RecoveryTransactionError('恢复审计记录冲突')
+            else:
+                with archive.open('xb') as handle:
+                    handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+            if safe_task_path(self.task_root, task_id).exists() or path.read_bytes() != payload:
+                raise RecoveryTransactionError('恢复记录或原任务已变化，请刷新')
+            path.unlink()
 
     def _assert_projected_consistency(self, transaction, decision, plan) -> None:
         if decision.recovery_state is not None:
@@ -485,6 +667,9 @@ class CatalogDetachService:
             )
         if self.plan_store.fingerprint(plan) != transaction.prepared_plan_fingerprint:
             raise RecoveryTransactionError("恢复事务的 Plan 投影不一致")
+        if (decision.revision != transaction.expected_decision_revision
+                or self.decision_store.fingerprint(decision) != transaction.decision_fingerprint):
+            raise RecoveryTransactionError('恢复事务的决定已变化')
         expected_decision = str(
             plan.metadata.get("decision_state_fingerprint") or ""
         )
@@ -535,10 +720,11 @@ class CatalogDetachService:
         )
         current = root / f"{transaction.catalog_key}.json"
         if current.is_file():
+            if hashlib.sha256(current.read_bytes()).hexdigest() != transaction.catalog_record_fingerprint:
+                return 'changed'
             return "intact"
-        for candidate in self._valid_tombstones(
-            transaction.catalog_backend, transaction.catalog_key
-        ):
+        candidates = self._valid_tombstones(transaction.catalog_backend, transaction.catalog_key)
+        for candidate in candidates if len(candidates) == 1 else ():
             try:
                 digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
             except OSError:
@@ -577,11 +763,13 @@ class CatalogDetachService:
         try:
             if transaction.catalog_backend == "series":
                 self.series_catalog.archive_missing(
-                    transaction.catalog_key, task_root=self.task_root
+                    transaction.catalog_key, task_root=self.task_root,
+                    expected_fingerprint=transaction.catalog_record_fingerprint,
                 )
             else:
                 self.work_catalog.archive_missing(
-                    transaction.catalog_key, task_root=self.task_root
+                    transaction.catalog_key, task_root=self.task_root,
+                    expected_fingerprint=transaction.catalog_record_fingerprint,
                 )
         except (SeriesCatalogError, WorkCatalogError) as exc:
             raise RecoveryTransactionError(str(exc)) from exc

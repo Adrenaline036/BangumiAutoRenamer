@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.queue_fixture import TaskQueueManager as ControlledQueue
 
 import ast
 import asyncio
@@ -20,6 +21,11 @@ from src.rename.rename_plan import ProviderIdentity, RenamePlan, WorkIdentity
 from src.task_queue import TaskJob, TaskQueueManager
 from src.utils.utils import write_task_at
 from tests.projection_test_support import save_plan_fixture
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+    persist_provider_selection_attempt,
+)
+from tests.source_collection_fixture import admit_task
 
 
 def _selection(provider_id: str = "86670") -> dict:
@@ -29,6 +35,7 @@ def _selection(provider_id: str = "86670") -> dict:
         "provider_id": provider_id,
         "title": "向山进发 第二季",
         "poster_url": "https://lain.bgm.tv/pic/cover/l/test.jpg",
+        "platform": "TV",
     }
 
 
@@ -84,12 +91,19 @@ def _seed_authority(
             plan_store,
             _authority_plan(root, task_id, authority_selection),
         )
+    selected_is_movie = (
+        isinstance(authority_selection, dict)
+        and authority_selection.get("namespace") == "tmdb"
+        and authority_selection.get("entity_type") == "movie"
+    )
     write_task_at(tasks, task_id, {
         "uuid": task_id,
         "path": str(source),
         "workflow_status": "need_confirm",
         "preview_only": False,
         "provider_selection": {"provider_id": "old"},
+        "is_anime": True,
+        "is_movie": selected_is_movie,
     })
     return tasks, decisions, plans
 
@@ -113,48 +127,36 @@ def _commit_authority(
 
 class SelectionFailurePersistenceContracts(unittest.IsolatedAsyncioTestCase):
     async def test_worker_failure_persists_reason_and_preserves_old_authority(self):
-        async def fail(_job):
-            raise RuntimeError("无法读取季度关系")
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            task_id = "selection-failure"
-            tasks, decisions, plans = _seed_authority(root, task_id)
-            decision_path = decisions / f"{task_id}.json"
-            plan_path = plans / f"{task_id}.json"
-            decision_before = decision_path.read_bytes()
-            plan_before = plan_path.read_bytes()
-            manager = TaskQueueManager(
-                task_root=tasks,
-                decision_state_root=decisions,
-                plan_root=plans,
-                recovery_abandon_audit_root=root / "audit",
-                executor=fail,
-                test_mode=False,
-            )
-            await manager.start()
-            try:
-                await manager.enqueue_reidentify(task_id, _selection(), 0)
-                await asyncio.wait_for(manager._queue.join(), timeout=3)
-            finally:
-                await manager.stop()
-            task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-            decision_after = decision_path.read_bytes()
-            plan_after = plan_path.read_bytes()
-
-        operation = task["selection_operation"]
-        self.assertEqual("failed", operation["state"])
-        self.assertEqual("provider_unavailable", operation["failure_code"])
-        self.assertEqual({"provider_id": "old"}, task["provider_selection"])
-        self.assertEqual(decision_before, decision_after)
-        self.assertEqual(plan_before, plan_after)
+        from tests.test_default_activation_contract import DefaultActivationProducerContracts
+        harness = DefaultActivationProducerContracts('runTest')
+        async with harness.flow(movie=True, automatic=False) as flow:
+            plan, state = harness.current(flow)
+            plan_path, decision_path = flow.store.path_for(flow.task_id), flow.service.decision_state_store.path_for(flow.task_id)
+            before = (plan_path.read_bytes(), decision_path.read_bytes())
+            previous = flow.manager._read(flow.task_id).get('provider_selection')
+            async def fail(_job):
+                raise RuntimeError("无法读取季度关系")
+            flow.manager.executor = fail
+            from tests.test_provider_subject_plan_wiring_red_contract import _root_config_patch
+            from tests.test_r1_real_media_production_red_contract import _configured_renamer
+            with _root_config_patch(flow.manager.root_snapshot_source.observe().to_dict()), patch(
+                    'src.task_queue.Rename', side_effect=lambda **_: _configured_renamer(flow.root)):
+                await flow.manager.enqueue_reidentify(flow.task_id, {"namespace": "tmdb", "entity_type": "movie", "provider_id": "8181", "title": "普通电影"}, state.revision)
+                await asyncio.wait_for(flow.manager._queue.join(), timeout=12)
+            task = flow.manager._read(flow.task_id)
+            operation = current_provider_selection_context(task)
+            self.assertEqual("failed", operation["state"])
+            self.assertEqual("provider_unavailable", operation["failure_code"])
+            self.assertEqual(previous, task.get("provider_selection"))
+            self.assertEqual(before, (plan_path.read_bytes(), decision_path.read_bytes()))
+            self.assertFalse(any(e.target_path.exists() for e in plan.entries))
 
     async def test_late_failure_cannot_overwrite_newer_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task_id = "selection-race"
             tasks, decisions, plans = _seed_authority(root, task_id)
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=tasks,
                 decision_state_root=decisions,
                 plan_root=plans,
@@ -162,11 +164,11 @@ class SelectionFailurePersistenceContracts(unittest.IsolatedAsyncioTestCase):
                 test_mode=True,
             )
             current = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-            current["selection_operation"] = {
+            persist_provider_selection_attempt(current, {
                 "request_id": "new-request",
                 "state": "pending",
                 "candidate": _selection("290980"),
-            }
+            })
             write_task_at(tasks, task_id, current)
             manager._fail_reidentify(
                 TaskJob(
@@ -181,8 +183,9 @@ class SelectionFailurePersistenceContracts(unittest.IsolatedAsyncioTestCase):
             )
             task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
 
-        self.assertEqual("new-request", task["selection_operation"]["request_id"])
-        self.assertEqual("pending", task["selection_operation"]["state"])
+        operation = current_provider_selection_context(task)
+        self.assertEqual("new-request", operation["request_id"])
+        self.assertEqual("pending", operation["state"])
 
     async def test_wait_timeout_returns_pending_without_repairing_committed_authority(self):
         selection = _selection()
@@ -198,14 +201,14 @@ class SelectionFailurePersistenceContracts(unittest.IsolatedAsyncioTestCase):
                 _authority_plan(root, task_id, selection),
             )
             task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-            task["selection_operation"] = {
+            persist_provider_selection_attempt(task, {
                 "request_id": "request",
                 "state": "pending",
                 "candidate": selection,
                 "expected_decision_revision": 0,
-            }
+            })
             write_task_at(tasks, task_id, task)
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=tasks,
                 decision_state_root=decisions,
                 plan_root=plans,
@@ -237,18 +240,19 @@ class SelectionRestartAndCommitContracts(unittest.TestCase):
             tasks = root / "tasks"
             tasks.mkdir()
             for task_id, operation_state in (("pending", "pending"), ("failed", "failed")):
-                write_task_at(tasks, task_id, {
+                task = {
                     "uuid": task_id,
                     "path": str(root / task_id),
                     "workflow_status": "running",
                     "preview_only": False,
-                    "selection_operation": {
-                        "request_id": task_id,
-                        "state": operation_state,
-                        "failure_code": "selection_failed" if operation_state == "failed" else None,
-                    },
+                }
+                persist_provider_selection_attempt(task, {
+                    "request_id": task_id,
+                    "state": operation_state,
+                    "failure_code": "selection_failed" if operation_state == "failed" else None,
                 })
-            manager = TaskQueueManager(
+                write_task_at(tasks, task_id, task)
+            manager = ControlledQueue(
                 task_root=tasks,
                 decision_state_root=root / "decisions",
                 plan_root=root / "plans",
@@ -259,8 +263,12 @@ class SelectionRestartAndCommitContracts(unittest.TestCase):
             pending = json.loads((tasks / "pending.json").read_text("utf-8"))
             failed = json.loads((tasks / "failed.json").read_text("utf-8"))
 
-        self.assertEqual("interrupted", pending["selection_operation"]["state"])
-        self.assertEqual("failed", failed["selection_operation"]["state"])
+        self.assertEqual(
+            "interrupted", current_provider_selection_context(pending)["state"]
+        )
+        self.assertEqual(
+            "failed", current_provider_selection_context(failed)["state"]
+        )
 
     def test_outcome_write_failure_does_not_rollback_committed_authority(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -278,14 +286,14 @@ class SelectionRestartAndCommitContracts(unittest.TestCase):
                 _authority_plan(root, task_id, selection),
             )
             task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-            task["selection_operation"] = {
+            persist_provider_selection_attempt(task, {
                 "request_id": "request",
                 "state": "pending",
                 "candidate": selection,
                 "expected_decision_revision": 0,
-            }
+            })
             write_task_at(tasks, task_id, task)
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=tasks,
                 decision_state_root=decisions,
                 plan_root=plans,
@@ -312,7 +320,9 @@ class SelectionRestartAndCommitContracts(unittest.TestCase):
 
         self.assertEqual(decision_before, decision_after)
         self.assertEqual(plan_before, plan_after)
-        self.assertEqual("succeeded", repaired["selection_operation"]["state"])
+        self.assertEqual(
+            "succeeded", current_provider_selection_context(repaired)["state"]
+        )
 
 
 class SelectionStartupRepairContracts(unittest.IsolatedAsyncioTestCase):
@@ -330,14 +340,14 @@ class SelectionStartupRepairContracts(unittest.IsolatedAsyncioTestCase):
                 _authority_plan(root, task_id, selection),
             )
             task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-            task["selection_operation"] = {
+            persist_provider_selection_attempt(task, {
                 "request_id": "request",
                 "state": "pending",
                 "candidate": selection,
                 "expected_decision_revision": 0,
-            }
+            })
             write_task_at(tasks, task_id, task)
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=tasks,
                 decision_state_root=decisions,
                 plan_root=plans,
@@ -375,7 +385,9 @@ class SelectionStartupRepairContracts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("recover_pending", order[0])
         self.assertIn(f"repair:{task_id}", order)
         self.assertLess(order.index("recover_pending"), order.index(f"repair:{task_id}"))
-        self.assertEqual("succeeded", repaired["selection_operation"]["state"])
+        self.assertEqual(
+            "succeeded", current_provider_selection_context(repaired)["state"]
+        )
 
 
 class SelectionWriterAllowlistContracts(unittest.TestCase):
@@ -410,89 +422,89 @@ class SelectionWriterAllowlistContracts(unittest.TestCase):
 
 class SelectionAuthorityReadbackContracts(unittest.IsolatedAsyncioTestCase):
     async def test_same_provider_reselection_refreshes_poster_before_success(self):
-        old = {
-            "namespace": "tmdb", "entity_type": "movie", "provider_id": "763096",
-            "title": "向山进发 回忆的礼物", "poster_url": "https://old.invalid/poster.jpg",
-        }
-        fresh = {
-            **old,
-            "poster_url": "https://image.tmdb.org/t/p/w342/fresh.jpg",
-            "source_url": "https://www.themoviedb.org/movie/763096",
-            "snapshot_at": "2026-08-20T06:30:00+08:00",
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            task_id = "selection-poster-refresh"
-            tasks, decisions, plans = _seed_authority(
-                root, task_id, authority_selection=old
-            )
-
-            async def commit_fresh(_job):
-                _commit_authority(
-                    DecisionStateStore(decisions),
-                    PlanStore(plans),
-                    _authority_plan(root, task_id, fresh),
-                )
-
-            manager = TaskQueueManager(
-                task_root=tasks,
-                decision_state_root=decisions,
-                plan_root=plans,
-                recovery_abandon_audit_root=root / "audit",
-                executor=commit_fresh,
-                test_mode=False,
-            )
-            await manager.start()
-            try:
-                await manager.enqueue_reidentify(task_id, fresh, 0)
-                await asyncio.wait_for(manager._queue.join(), timeout=3)
-            finally:
-                await manager.stop()
-            task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-            state = DecisionStateStore(decisions).load(task_id)
-            plan = PlanStore(plans).load(task_id)
-
-        self.assertEqual("succeeded", task["selection_operation"]["state"])
-        self.assertEqual(fresh["poster_url"], state.provider_evidence[0]["poster_url"])
-        self.assertEqual(
-            fresh["poster_url"], plan.work_identity.primary_provider.poster_url
-        )
+        # R03 fallback, not an in-place poster refresh: end the unsupported
+        # unexecuted card and select the same ID on a genuinely new card.
+        from tests.test_default_activation_contract import DefaultActivationProducerContracts
+        from tests.test_provider_subject_plan_wiring_red_contract import _root_config_patch, _source_manifest
+        from tests.test_r1_real_media_production_red_contract import _configured_renamer
+        from src.rename.plan_execution import PlanExecutionError
+        harness = DefaultActivationProducerContracts('runTest')
+        async with harness.flow(movie=True) as flow:
+            old, state = harness.current(flow)
+            source_before = _source_manifest(flow.source)
+            old_bytes = (flow.store.path_for(flow.task_id).read_bytes(),
+                flow.service.decision_state_store.path_for(flow.task_id).read_bytes())
+            fresh = {**old.work_identity.primary_provider.to_dict(),
+                'poster_url': 'https://image.tmdb.org/t/p/w342/fresh.jpg',
+                'source_url': 'https://www.themoviedb.org/movie/8181',
+                'snapshot_at': '2026-09-15T00:00:00+00:00'}
+            with self.assertRaisesRegex(PlanExecutionError, '安全结束.*重新添加'):
+                await flow.manager.enqueue_reidentify(flow.task_id, fresh, state.revision)
+            self.assertEqual(old_bytes, (flow.store.path_for(flow.task_id).read_bytes(),
+                flow.service.decision_state_store.path_for(flow.task_id).read_bytes()))
+            await flow.manager.abandon_and_remove(flow.task_id,
+                record_root=flow.manager.execution_service.record_root,
+                plan_root=flow.store.root, review_root=flow.root / 'reviews')
+            self.assertFalse((flow.manager.task_root / (flow.task_id + '.json')).exists())
+            with self.assertRaises(PlanExecutionError):
+                await flow.manager.enqueue_reidentify(flow.task_id, fresh, state.revision)
+            new_id = flow.task_id + '-recreated'
+            def worker(**_):
+                renamer = _configured_renamer(flow.root)
+                lookup = renamer.search.get_movie_info
+                renamer.search.get_movie_info = lambda *_args: ('', None)
+                renamer.search.get_movie_info_by_id = lambda _id: lookup('Ordinary Movie')
+                return renamer
+            with _root_config_patch(flow.manager.root_snapshot_source.observe().to_dict()), patch(
+                    'src.task_queue.Rename', side_effect=worker):
+                await admit_task(flow.manager, flow.source, task_id=new_id, is_anime=False,
+                    is_movie=True, custom_name='Ordinary Movie')
+                await asyncio.wait_for(flow.manager._queue.join(), timeout=12)
+                initial = flow.service.decision_state_store.load(new_id)
+                self.assertFalse(initial.confirmed_work)
+                await flow.manager.enqueue_reidentify(new_id, fresh, initial.revision)
+                await asyncio.wait_for(flow.manager._queue.join(), timeout=12)
+            task = flow.manager._read(new_id)
+            plan = flow.store.load(new_id)
+            current = flow.service.decision_state_store.load(new_id)
+            self.assertEqual("succeeded", current_provider_selection_context(task)["state"], task.get("error"))
+            self.assertEqual(fresh["provider_id"], plan.work_identity.primary_provider.provider_id)
+            self.assertEqual(fresh["poster_url"], current.provider_evidence[0]["poster_url"])
+            self.assertEqual(fresh["poster_url"], plan.work_identity.primary_provider.poster_url)
+            self.assertFalse(flow.service.load_or_create(plan).approved_entry_ids)
+            self.assertEqual(source_before, _source_manifest(flow.source))
+            self.assertFalse(any(e.target_path.exists() for e in plan.entries))
+            self.assertFalse(tuple(flow.manager.execution_service.record_root.glob('*.ledger.json')))
 
     async def test_revision_advance_with_wrong_provider_is_not_success(self):
-        selected = _selection("86670")
-        wrong = _selection("290980")
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            task_id = "selection-wrong-readback"
-            tasks, decisions, plans = _seed_authority(root, task_id)
-
-            async def commit_wrong(_job):
-                _commit_authority(
-                    DecisionStateStore(decisions),
-                    PlanStore(plans),
-                    _authority_plan(root, task_id, wrong),
-                )
-
-            manager = TaskQueueManager(
-                task_root=tasks,
-                decision_state_root=decisions,
-                plan_root=plans,
-                recovery_abandon_audit_root=root / "audit",
-                executor=commit_wrong,
-                test_mode=False,
-            )
-            await manager.start()
-            try:
-                await manager.enqueue_reidentify(task_id, selected, 0)
-                await asyncio.wait_for(manager._queue.join(), timeout=3)
-            finally:
-                await manager.stop()
-            task = json.loads((tasks / f"{task_id}.json").read_text("utf-8"))
-
-        self.assertEqual("failed", task["selection_operation"]["state"])
-        self.assertNotEqual(
-            "succeeded", task["selection_operation"]["state"]
-        )
+        # Real successful first selection followed by a mismatched completion
+        # request: a later revision alone is not proof of the requested identity.
+        from dataclasses import replace
+        from tests.test_default_activation_contract import DefaultActivationProducerContracts
+        harness = DefaultActivationProducerContracts('runTest')
+        async with harness.flow(movie=True, automatic=False) as flow:
+            def protected():
+                return {str(p.relative_to(flow.root)): p.read_bytes() for p in flow.root.rglob('*')
+                        if p.is_file() and p.suffix != '.lock'}
+            complete = flow.manager._complete_reidentify
+            with patch.object(flow.manager, '_complete_reidentify', wraps=complete) as observed:
+                plan, state = await harness.selected(flow)
+            self.assertTrue(observed.call_args_list)
+            job = observed.call_args_list[-1].args[0]
+            self.assertGreater(state.revision, job.expected_revision)
+            self.assertEqual('8181', plan.work_identity.primary_provider.provider_id)
+            self.assertEqual('succeeded',
+                current_provider_selection_context(flow.manager._read(flow.task_id))['state'])
+            wrong = replace(job, provider_selection={**job.provider_selection, 'provider_id': '99999'})
+            before = protected()
+            from src.rename.plan_execution import PlanExecutionError
+            with self.assertRaisesRegex(PlanExecutionError, '保存结果与本次选择不一致'):
+                complete(wrong)
+            self.assertEqual(before, protected())
+            complete(job)
+            self.assertEqual(before, protected(), 'actual successful completion must remain idempotent')
+            self.assertFalse(flow.service.load_or_create(plan).approved_entry_ids)
+            self.assertFalse(any(e.target_path.exists() for e in plan.entries))
 
 
 if __name__ == "__main__":

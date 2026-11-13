@@ -12,6 +12,7 @@ from src.rename.plan_review import PlanReviewError, PlanReviewService, entry_id
 from src.rename.plan_execution import PlanExecutionError, PlanExecutionService
 from src.rename.execution_recovery import reconcile_catalog_update
 from src.rename.plan_store import PlanStore
+from src.rename.decision_state import DecisionStateStore
 from src.rename.plan_verifier import PlanVerifier
 from src.rename.rename_plan import PlanStatus
 from src.rename.target_routing import TargetRootSnapshot
@@ -116,7 +117,8 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
                 ),
             )
             catalog = WorkCatalog(root / "catalog")
-            catalog.register_completed(first, {"plan_fingerprint": "first"})
+            from tests.test_work_catalog import complete_ledger
+            catalog.register_completed(first, complete_ledger(first, root / "records"))
 
             source2 = root / "source-4k"
             source2.mkdir()
@@ -252,6 +254,8 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
                 task_root=task_root,
                 record_root=root / "records",
                 catalog_root=root / "catalog",
+                decision_state_root=review.decision_state_store.root,
+                recovery_transaction_root=root / "recovery_transactions",
             ).execute(revised.task_id, fingerprint)
 
             target = revised.entries[0].target_path
@@ -297,6 +301,8 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
             service = PlanExecutionService(
                 store, review, task_root=task_root,
                 record_root=root / "records", catalog_root=catalog_root,
+                decision_state_root=review.decision_state_store.root,
+                recovery_transaction_root=root / "recovery_transactions",
             )
             with patch.object(
                 service.work_catalog,
@@ -588,7 +594,7 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
             self.assertEqual(PlanStatus.NEED_CONFIRM, result.status)
             self.assertEqual([], list(result.issues))
             self.assertEqual(
-                ["Example Work (2026)-cd1.mkv", "Example Work (2026)-cd2.mkv", "Example Work (2026)-cd3.mkv"],
+                ["Example Work (2026) - 默认版本-cd1.mkv", "Example Work (2026) - 默认版本-cd2.mkv", "Example Work (2026) - 默认版本-cd3.mkv"],
                 [entry.target_path.name for entry in revised.entries],
             )
             self.assertEqual(
@@ -641,7 +647,10 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
             self.assertEqual([source / "Example Work.mkv"], [entry.source_path for entry in content])
             self.assertEqual(2, len(extras))
             self.assertTrue(all(entry.target_path.parent.name == "Extras" for entry in extras))
-            subtitles = [entry for entry in revised.entries if entry.media_kind == "subtitle"]
+            subtitles = [
+                entry for entry in revised.entries
+                if entry.media_kind == "subtitle" and entry.role != "extra_subtitle"
+            ]
             self.assertTrue(all(
                 entry.subtitle.associated_video_source_path == source / "Example Work.mkv"
                 for entry in subtitles
@@ -650,10 +659,14 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
                 entry for entry in revised.entries
                 if entry.source_path.name == "Example Work [NCOP].sc.ass"
             )
-            self.assertEqual("associated", extra_subtitle.media_kind)
+            self.assertEqual("subtitle", extra_subtitle.media_kind)
             self.assertEqual("extra_subtitle", extra_subtitle.role)
             self.assertEqual("Extras", extra_subtitle.target_path.parent.name)
-            self.assertIsNone(extra_subtitle.subtitle)
+            self.assertIsNotNone(extra_subtitle.subtitle)
+            self.assertEqual(
+                source / "SPs" / "Example Work [NCOP].mkv",
+                extra_subtitle.subtitle.associated_video_source_path,
+            )
             self.assertNotIn("target_outside_root", {issue.code for issue in result.issues})
 
     def test_one_package_can_confirm_two_movie_primary_versions(self):
@@ -722,368 +735,8 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
             self.assertEqual(2, len({entry.target_path for entry in subtitles}))
             self.assertEqual([], list(PlanVerifier().verify(revised).issues))
 
-    def test_identical_associated_asset_collision_is_frozen_as_reuse(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source, allowed, plan, store, service = self._inventory_plan_with_identity(
-                root,
-                ("Example Work [1080p].mkv", "Example Work [Fonts].7z"),
-                task_id="asset-reuse-first",
-                file_payloads={
-                    "Example Work [Fonts].7z": b"same-font-package",
-                },
-            )
-            first = service.complete_inventory_draft(
-                plan.task_id,
-                store.fingerprint(plan),
-                group_id=plan.presentation_groups[0].group_id,
-                group_kind="movie_continuous",
-                target_root=allowed / "AnimeMovies",
-                reason="首次整理",
-                root_snapshot=routing_snapshot_for(
-                    allowed / "AnimeMovies",
-                    domain="animation", group_kind="movie_continuous",
-                ),
-            )
-            for entry in first.entries:
-                entry.target_path.parent.mkdir(parents=True, exist_ok=True)
-                os.link(entry.source_path, entry.target_path)
-            reuse_ledger_rows = []
-            for entry in first.entries:
-                source_stat = entry.source_path.stat()
-                target_stat = entry.target_path.stat()
-                reuse_ledger_rows.append({
-                    "source": str(entry.source_path),
-                    "target": str(entry.target_path),
-                    "status": "created",
-                    "action": "create",
-                    "transfer_type": "hardlink",
-                    "source_device": source_stat.st_dev,
-                    "source_inode": source_stat.st_ino,
-                    "target_device": target_stat.st_dev,
-                    "target_inode": target_stat.st_ino,
-                    "target_link_count": target_stat.st_nlink,
-                })
-            WorkCatalog(root / "catalog").register_completed(
-                first,
-                {
-                    "task_id": first.task_id,
-                    "plan_fingerprint": PlanStore.fingerprint(first),
-                    "status": "completed",
-                    "entries": reuse_ledger_rows,
-                },
-            )
 
-            source2 = root / "source-second"
-            source2.mkdir()
-            (source2 / "Example Work [2160p_SDR].mkv").write_bytes(b"second-movie")
-            (source2 / "Example Work [Fonts].7z").write_bytes(b"same-font-package")
-            task2 = {
-                "uuid": "asset-reuse-second",
-                "path": str(source2),
-                "name": "Example Work",
-                "is_anime": True,
-                "movie_inventory": inventory_movie_assets(source2).to_dict(),
-                "draft_target_root": str(allowed),
-                "draft_initial_target_root": str(allowed / "Example Work"),
-                "provider_identity": {
-                    "namespace": "bangumi", "entity_type": "subject",
-                    "provider_id": "12345", "title": "Example Work", "year": 2026,
-                },
-                "proposed_work_key": "work-12345678-1234-1234-1234-333333333333",
-            }
-            draft2 = build_inventory_review_draft(task2, dry_run=False)
-            draft2 = save_plan_fixture(store, draft2)
-            second = service.complete_inventory_draft(
-                draft2.task_id,
-                store.fingerprint(draft2),
-                group_id=draft2.presentation_groups[0].group_id,
-                group_kind="movie_continuous",
-                target_root=allowed / "AnimeMovies",
-                reason="追加版本并复用字体包",
-                root_snapshot=routing_snapshot_for(
-                    allowed / "AnimeMovies",
-                    domain="animation", group_kind="movie_continuous",
-                ),
-            )
-            font = next(
-                entry for entry in second.entries if entry.source_path.suffix == ".7z"
-            )
-            self.assertIsNotNone(font.collision_resolution)
-            self.assertEqual("reuse_existing", font.collision_resolution.action)
-            self.assertEqual([], list(PlanVerifier().verify(second).issues))
 
-    def test_violet_shape_keeps_three_movie_versions_and_reuses_one_font_archive(self):
-        """Guard the rc.20/rc.21 contract with the supplied package shape."""
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source, allowed, plan, store, service = self._inventory_plan_with_identity(
-                root,
-                (
-                    "Gekijouban Violet Evergarden [Ma10p_1080p][x265_flac].mkv",
-                    "Gekijouban Violet Evergarden [Fonts].7z",
-                    "CDs/soundtrack.flac",
-                    "Scans/booklet.webp",
-                ),
-                task_id="violet-1080p",
-                file_payloads={
-                    "Gekijouban Violet Evergarden [Fonts].7z": (
-                        b"identical-violet-fonts"
-                    ),
-                },
-            )
-            font_name = "Gekijouban Violet Evergarden [Fonts].7z"
-            first = service.complete_inventory_draft(
-                plan.task_id,
-                store.fingerprint(plan),
-                group_id=plan.presentation_groups[0].group_id,
-                group_kind="movie_continuous",
-                target_root=allowed / "AnimeMovies",
-                reason="确认 1080p 正片",
-                root_snapshot=routing_snapshot_for(
-                    allowed / "AnimeMovies",
-                    domain="animation", group_kind="movie_continuous",
-                ),
-            )
-            for entry in first.entries:
-                entry.target_path.parent.mkdir(parents=True, exist_ok=True)
-                os.link(entry.source_path, entry.target_path)
-            violet_ledger_rows = []
-            for entry in first.entries:
-                source_stat = entry.source_path.stat()
-                target_stat = entry.target_path.stat()
-                violet_ledger_rows.append({
-                    "source": str(entry.source_path),
-                    "target": str(entry.target_path),
-                    "status": "created",
-                    "action": "create",
-                    "transfer_type": "hardlink",
-                    "source_device": source_stat.st_dev,
-                    "source_inode": source_stat.st_ino,
-                    "target_device": target_stat.st_dev,
-                    "target_inode": target_stat.st_ino,
-                    "target_link_count": target_stat.st_nlink,
-                })
-            WorkCatalog(root / "catalog").register_completed(
-                first,
-                {
-                    "task_id": first.task_id,
-                    "plan_fingerprint": PlanStore.fingerprint(first),
-                    "status": "completed",
-                    "entries": violet_ledger_rows,
-                },
-            )
-
-            source_4k = root / "source-violet-2160p"
-            source_4k.mkdir()
-            dovi = source_4k / (
-                "Gekijouban Violet Evergarden "
-                "[Ma10p_2160p_DoVi_P8.1][x265_flac].mkv"
-            )
-            sdr = source_4k / (
-                "Gekijouban Violet Evergarden [Ma10p_2160p_SDR][x265_flac].mkv"
-            )
-            dovi.write_bytes(b"violet-dovi")
-            sdr.write_bytes(b"violet-sdr")
-            (source_4k / font_name).write_bytes(b"identical-violet-fonts")
-            task_4k = {
-                "uuid": "violet-2160p",
-                "path": str(source_4k),
-                "name": "Example Work",
-                "is_anime": True,
-                "movie_inventory": inventory_movie_assets(source_4k).to_dict(),
-                "draft_target_root": str(allowed),
-                "draft_initial_target_root": str(allowed / "Example Work"),
-                "provider_identity": {
-                    "namespace": "bangumi",
-                    "entity_type": "subject",
-                    "provider_id": "12345",
-                    "title": "Example Work",
-                    "year": 2026,
-                },
-                "proposed_work_key": "work-12345678-1234-1234-1234-444444444444",
-            }
-            draft_4k = build_inventory_review_draft(task_4k, dry_run=False)
-            draft_4k = save_plan_fixture(store, draft_4k)
-            second = service.complete_inventory_draft(
-                draft_4k.task_id,
-                store.fingerprint(draft_4k),
-                group_id=draft_4k.presentation_groups[0].group_id,
-                group_kind="movie_continuous",
-                target_root=allowed / "AnimeMovies",
-                reason="同时确认 DoVi 和 SDR 正片",
-                root_snapshot=routing_snapshot_for(
-                    allowed / "AnimeMovies",
-                    domain="animation", group_kind="movie_continuous",
-                ),
-                primary_video_sources=(dovi, sdr),
-            )
-
-            content_targets = {
-                entry.target_path
-                for item in (first, second)
-                for entry in item.entries
-                if entry.presentation_asset is not None
-                and entry.presentation_asset.asset_role.kind == "content_version"
-            }
-            font = next(
-                entry for entry in second.entries if entry.source_path.name == font_name
-            )
-            problems = []
-            if len(content_targets) != 3:
-                problems.append(f"电影正片目标不是三个：{sorted(content_targets)}")
-            if len({target.parent for target in content_targets}) != 1:
-                problems.append("1080p、DoVi、SDR 没有进入同一个电影目录")
-            labels = {
-                entry.presentation_asset.version_descriptor.display_label
-                for item in (first, second)
-                for entry in item.entries
-                if entry.presentation_asset is not None
-                and entry.presentation_asset.asset_role.kind == "content_version"
-            }
-            if labels != {"1080p", "2160p Dolby Vision P8.1", "2160p SDR"}:
-                problems.append(f"电影版本标签不完整：{sorted(labels)}")
-            if (
-                font.collision_resolution is None
-                or font.collision_resolution.action != "reuse_existing"
-            ):
-                problems.append("两个同名字体包没有按相同内容复用")
-            first_sources = {entry.source_path for entry in first.entries}
-            if any("CDs" in path.parts for path in first_sources):
-                problems.append("电影 CDs 子树被错误纳入 Plan")
-            if any("Scans" in path.parts for path in first_sources):
-                problems.append("电影 Scans 子树被错误纳入 Plan")
-            issues = list(PlanVerifier().verify(second).issues)
-            if issues:
-                problems.extend(f"{issue.code}: {issue.message}" for issue in issues)
-            self.assertEqual([], problems, "\n".join(problems))
-
-    def test_two_preapproved_movie_versions_complete_with_registered_font_reuse(self):
-        """A compatible sibling resolves its frozen conditional action under lock."""
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            allowed = root / "library"
-            catalog_root = root / "catalog"
-            store = PlanStore(root / "plans")
-            review = PlanReviewService(store, root / "reviews", catalog_root)
-            task_root = root / "tasks"
-            task_root.mkdir()
-
-            completed_plans = []
-            source_manifests = []
-            for index, variant in enumerate(("1080p", "2160p_HDR10"), start=1):
-                source = root / f"source-{index}"
-                source.mkdir()
-                (source / f"Example Work [{variant}].mkv").write_bytes(
-                    f"movie-{variant}".encode("ascii")
-                )
-                (source / "Example Work [Fonts].7z").write_bytes(b"same-fonts")
-                source_manifests.append({
-                    path.name: path.read_bytes()
-                    for path in sorted(source.iterdir()) if path.is_file()
-                })
-                task_id = f"preapproved-{index}"
-                task = {
-                    "uuid": task_id,
-                    "path": str(source),
-                    "name": "Example Work",
-                    "is_anime": True,
-                    "movie_inventory": inventory_movie_assets(source).to_dict(),
-                    "draft_target_root": str(allowed),
-                    "draft_initial_target_root": str(allowed / "Example Work"),
-                    "provider_identity": {
-                        "namespace": "bangumi", "entity_type": "subject",
-                        "provider_id": "12345", "title": "Example Work", "year": 2026,
-                    },
-                    "proposed_work_key": (
-                        "work-12345678-1234-1234-1234-" + str(index) * 12
-                    ),
-                }
-                draft = build_inventory_review_draft(task, dry_run=False)
-                draft = save_plan_fixture(store, draft)
-                completed = review.complete_inventory_draft(
-                    task_id,
-                    store.fingerprint(draft),
-                    group_id=draft.presentation_groups[0].group_id,
-                    group_kind="movie_continuous",
-                    target_root=allowed / "AnimeMovies",
-                    reason="两个版本均在首个任务执行前完成审核",
-                    root_snapshot=routing_snapshot_for(
-                        allowed / "AnimeMovies",
-                        domain="animation", group_kind="movie_continuous",
-                    ),
-                )
-                fingerprint = store.fingerprint(completed)
-                review.approve_entries(
-                    task_id,
-                    fingerprint,
-                    tuple(entry_id(entry) for entry in completed.entries),
-                )
-                (task_root / f"{task_id}.json").write_text(json.dumps({
-                    "uuid": task_id,
-                    "workflow_status": "approved",
-                    "path": str(source),
-                }), encoding="utf-8")
-                completed_plans.append((completed, fingerprint))
-
-            service = PlanExecutionService(
-                store,
-                review,
-                task_root=task_root,
-                record_root=root / "records",
-                catalog_root=catalog_root,
-            )
-            first, first_fingerprint = completed_plans[0]
-            second, second_fingerprint = completed_plans[1]
-            self.assertEqual(
-                "completed", service.execute(first.task_id, first_fingerprint).ledger_status
-            )
-
-            second_video_target = next(
-                entry.target_path for entry in second.entries if entry.media_kind == "video"
-            )
-            appended = service.execute(second.task_id, second_fingerprint)
-            self.assertEqual("completed", appended.ledger_status)
-            self.assertTrue(second_video_target.exists())
-            persisted_second = store.load(second.task_id)
-            self.assertEqual(
-                second_fingerprint, store.fingerprint(persisted_second)
-            )
-            task_state = json.loads(
-                (task_root / f"{second.task_id}.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual("completed", task_state["workflow_status"])
-            self.assertFalse(task_state["execution_may_have_written_targets"])
-            ledger = json.loads(appended.ledger_path.read_text(encoding="utf-8"))
-            self.assertIn(
-                "reused_identical_asset",
-                [item["status"] for item in ledger["entries"]],
-            )
-            catalog = WorkCatalog(catalog_root).load(
-                first.metadata["proposed_work_key"]
-            )
-            font_assets = [
-                item for item in catalog["assets"]
-                if any(
-                    association.get("role") == "font"
-                    for association in item.get("associations", [])
-                )
-            ]
-            self.assertEqual(1, len(font_assets))
-            self.assertEqual(2, len(font_assets[0]["associations"]))
-            for (plan, _fingerprint), before in zip(
-                completed_plans, source_manifests
-            ):
-                self.assertEqual(
-                    before,
-                    {
-                        path.name: path.read_bytes()
-                        for path in sorted(plan.source_root.iterdir())
-                        if path.is_file()
-                    },
-                )
 
     def test_smart_movie_completion_refuses_to_guess_unlabeled_multiple_videos(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1161,6 +814,7 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
             "path": str(source),
             "name": title,
             "is_anime": True,
+            "season_number": 1,  # Current explicit user selection, not a legacy season_id/path guess.
             "movie_inventory": inventory_movie_assets(source).to_dict(),
             "draft_target_root": str(allowed_root),
             "draft_initial_target_root": str(initial_root),
@@ -1190,6 +844,7 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
         title: str,
         movie_id: str,
         tv_id: str,
+        dry_run: bool = True,
     ):
         source = root / "source"
         source.mkdir()
@@ -1213,11 +868,13 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
                 movie_id=movie_id,
                 tv_id=tv_id,
             ),
-            dry_run=True,
+            dry_run=dry_run,
         )
         store = PlanStore(root / "plans")
         plan = save_plan_fixture(store, plan)
-        service = PlanReviewService(store, root / "reviews")
+        service = PlanReviewService(store, root / "reviews", root / "catalog",
+            decision_state_root=root / "decision_state", task_root=root / "task",
+            provider_link_catalog_root=root / "provider_links")
 
         for group_id, kind, namespace, entity_type, provider_id, suffix in (
             ("movie-continuous", "movie_continuous", "tmdb", "movie", movie_id, "电影剪辑版"),
@@ -1296,8 +953,8 @@ class IsolatedSampleAcceptanceTests(unittest.TestCase):
                     tv_id=tv_id,
                 )
                 result = PlanVerifier().verify(plan)
-                self.assertEqual(PlanStatus.NEED_CONFIRM, result.status)
-                self.assertEqual([], list(result.issues))
+                self.assertEqual(PlanStatus.INVALID, result.status, result.issues)
+                self.assertEqual(['mixed_presentation_requires_partition'], [i.code for i in result.issues])
                 self.assertEqual(
                     {"movie-continuous", "tv-episodes"},
                     {entry.presentation_asset.presentation_group for entry in plan.entries},

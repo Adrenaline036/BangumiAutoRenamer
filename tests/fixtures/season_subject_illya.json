@@ -1,0 +1,1039 @@
+{
+  "bangumi_subjects": [
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "43951",
+      "title": "Fate/kaleid liner 魔法少女☆伊莉雅",
+      "original_title": "Fate/kaleid liner プリズマ☆イリヤ",
+      "air_date": "2013-07-12",
+      "episode_count": 10,
+      "platform": "TV",
+      "library_domain": "animation"
+    },
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "83402",
+      "title": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei!",
+      "original_title": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイ!",
+      "air_date": "2014-07-09",
+      "episode_count": 10,
+      "platform": "TV",
+      "library_domain": "animation"
+    },
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "113134",
+      "title": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei Herz!",
+      "original_title": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイヘルツ!",
+      "air_date": "2015-07-24",
+      "episode_count": 10,
+      "platform": "TV",
+      "library_domain": "animation"
+    },
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "147466",
+      "title": "Fate/kaleid liner 魔法少女☆伊莉雅 3rei!!",
+      "original_title": "Fate/kaleid liner プリズマ☆イリヤ ドライ!!",
+      "air_date": "2016-07-06",
+      "episode_count": 12,
+      "platform": "TV",
+      "library_domain": "animation"
+    },
+    {
+      "namespace": "bangumi",
+      "entity_type": "subject",
+      "provider_id": "347191",
+      "title": "Fate/kaleid liner 魔法少女☆伊莉雅 FINALE",
+      "original_title": "Fate/kaleid liner プリズマ☆イリヤ FINALE",
+      "air_date": "",
+      "episode_count": 0,
+      "platform": "TV",
+      "library_domain": "animation"
+    }
+  ],
+  "bangumi_relations": [
+    {
+      "from": "43951",
+      "to": "83402",
+      "relation": "续集"
+    },
+    {
+      "from": "83402",
+      "to": "43951",
+      "relation": "前传"
+    },
+    {
+      "from": "83402",
+      "to": "113134",
+      "relation": "续集"
+    },
+    {
+      "from": "113134",
+      "to": "83402",
+      "relation": "前传"
+    },
+    {
+      "from": "113134",
+      "to": "147466",
+      "relation": "续集"
+    },
+    {
+      "from": "147466",
+      "to": "113134",
+      "relation": "前传"
+    },
+    {
+      "from": "147466",
+      "to": "306971",
+      "relation": "续集"
+    },
+    {
+      "from": "306971",
+      "to": "147466",
+      "relation": "前传"
+    },
+    {
+      "from": "306971",
+      "to": "193373",
+      "relation": "前传"
+    },
+    {
+      "from": "306971",
+      "to": "672978",
+      "relation": "续集"
+    },
+    {
+      "from": "193373",
+      "to": "306971",
+      "relation": "续集"
+    },
+    {
+      "from": "672978",
+      "to": "306971",
+      "relation": "前传"
+    }
+  ],
+  "legacy_batch": {
+    "schema_version": 1,
+    "selected_subject_id": "43951",
+    "observed_at": "2026-10-28T10:14:35+00:00",
+    "policy_version": "subject-candidate-v1",
+    "truncated": false,
+    "boundary_complete": true,
+    "subject_observations": [
+      {
+        "bangumi_subject_id": "113134",
+        "observed_at": "2026-10-28T10:14:35+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "localized",
+            "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei Herz!",
+            "year": 2015,
+            "outcome": "no_match",
+            "truncated": false,
+            "candidates": []
+          },
+          {
+            "locale": "original",
+            "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイヘルツ!",
+            "year": 2015,
+            "outcome": "no_match",
+            "truncated": false,
+            "candidates": []
+          }
+        ],
+        "response_fingerprint": "c2ca85d9fb73253c88d4d15bee75b5b229ed2d521beca67c552b7450b229b84f"
+      },
+      {
+        "bangumi_subject_id": "147466",
+        "observed_at": "2026-10-28T10:14:35+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "localized",
+            "query": "Fate/kaleid liner 魔法少女☆伊莉雅 3rei!!",
+            "year": 2016,
+            "outcome": "no_match",
+            "truncated": false,
+            "candidates": []
+          },
+          {
+            "locale": "original",
+            "query": "Fate/kaleid liner プリズマ☆イリヤ ドライ!!",
+            "year": 2016,
+            "outcome": "no_match",
+            "truncated": false,
+            "candidates": []
+          }
+        ],
+        "response_fingerprint": "de617f5a2b6e7e5a46d63074d088f888dc3551e14ada51b66f03920a8a8dcb6f"
+      },
+      {
+        "bangumi_subject_id": "43951",
+        "observed_at": "2026-10-28T10:14:35+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "localized",
+            "query": "Fate/kaleid liner 魔法少女☆伊莉雅",
+            "year": 2013,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "63576",
+                "tmdb_tv_id": "63576",
+                "match_tier": "fuzzy",
+                "title": "魔法少女☆伊莉雅",
+                "original_title": "Fate/kaleid liner プリズマ☆イリヤ",
+                "first_air_date": "2013-07-06",
+                "score_components": {
+                  "title_exact": false,
+                  "year_compatible": true,
+                  "animation_confirmed": true,
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_reason_code": "genre_id_16_present"
+                },
+                "seasons": [
+                  {
+                    "season_number": 0,
+                    "air_date": "2013-09-27",
+                    "episode_count": 23
+                  },
+                  {
+                    "season_number": 1,
+                    "air_date": "2013-07-05",
+                    "episode_count": 10
+                  },
+                  {
+                    "season_number": 2,
+                    "air_date": "2014-07-09",
+                    "episode_count": 10
+                  },
+                  {
+                    "season_number": 3,
+                    "air_date": "2015-07-24",
+                    "episode_count": 10
+                  },
+                  {
+                    "season_number": 4,
+                    "air_date": "2016-07-06",
+                    "episode_count": 12
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "locale": "original",
+            "query": "Fate/kaleid liner プリズマ☆イリヤ",
+            "year": 2013,
+            "outcome": "ok",
+            "truncated": false,
+            "candidates": [
+              {
+                "namespace": "tmdb",
+                "entity_type": "tv",
+                "provider_id": "63576",
+                "tmdb_tv_id": "63576",
+                "match_tier": "exact",
+                "title": "魔法少女☆伊莉雅",
+                "original_title": "Fate/kaleid liner プリズマ☆イリヤ",
+                "first_air_date": "2013-07-06",
+                "score_components": {
+                  "title_exact": true,
+                  "year_compatible": true,
+                  "animation_confirmed": true,
+                  "animation_policy_version": "tmdb-animation-evidence-v1",
+                  "animation_evidence_source": "detail_and_search_genre_id",
+                  "animation_reason_code": "genre_id_16_present"
+                },
+                "seasons": [
+                  {
+                    "season_number": 0,
+                    "air_date": "2013-09-27",
+                    "episode_count": 23
+                  },
+                  {
+                    "season_number": 1,
+                    "air_date": "2013-07-05",
+                    "episode_count": 10
+                  },
+                  {
+                    "season_number": 2,
+                    "air_date": "2014-07-09",
+                    "episode_count": 10
+                  },
+                  {
+                    "season_number": 3,
+                    "air_date": "2015-07-24",
+                    "episode_count": 10
+                  },
+                  {
+                    "season_number": 4,
+                    "air_date": "2016-07-06",
+                    "episode_count": 12
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "response_fingerprint": "df40b44666b90aec18476fc1fccb389ab7d6e8de7d7fbb0b53bb1211d06b3c24"
+      },
+      {
+        "bangumi_subject_id": "83402",
+        "observed_at": "2026-10-28T10:14:35+00:00",
+        "policy_version": "subject-candidate-v1",
+        "queries": [
+          {
+            "locale": "localized",
+            "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei!",
+            "year": 2014,
+            "outcome": "no_match",
+            "truncated": false,
+            "candidates": []
+          },
+          {
+            "locale": "original",
+            "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイ!",
+            "year": 2014,
+            "outcome": "no_match",
+            "truncated": false,
+            "candidates": []
+          }
+        ],
+        "response_fingerprint": "1ca3c83a6d5e290608b2952bfe0abfbc92e264e648142a53514860a96de28ba0"
+      }
+    ],
+    "evidence_fingerprint": "a9bc9951dfe42be1dc3ceca0c43bb042c366a3d2ab4a66b9bd79849650b9d650"
+  },
+  "search_rows": [
+    {
+      "subject_id": "113134",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei Herz!",
+      "subject_year": 2015,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.86,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "113134",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei Herz!",
+      "subject_year": 2015,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.812,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "113134",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei Herz!",
+      "subject_year": 2015,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 1.422,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "113134",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイヘルツ!",
+      "subject_year": 2015,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.86,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "113134",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイヘルツ!",
+      "subject_year": 2015,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.812,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "113134",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイヘルツ!",
+      "subject_year": 2015,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 1.578,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "147466",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 3rei!!",
+      "subject_year": 2016,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.844,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "147466",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 3rei!!",
+      "subject_year": 2016,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.828,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "147466",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 3rei!!",
+      "subject_year": 2016,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 1.188,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "147466",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ドライ!!",
+      "subject_year": 2016,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.781,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "147466",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ドライ!!",
+      "subject_year": 2016,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.797,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "147466",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ドライ!!",
+      "subject_year": 2016,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 0.797,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "43951",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅",
+      "subject_year": 2013,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.766,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "43951",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅",
+      "subject_year": 2013,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.797,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "43951",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅",
+      "subject_year": 2013,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 0.765,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "43951",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ",
+      "subject_year": 2013,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.782,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "43951",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ",
+      "subject_year": 2013,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.75,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "43951",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ",
+      "subject_year": 2013,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 0.828,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "83402",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei!",
+      "subject_year": 2014,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.781,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "83402",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei!",
+      "subject_year": 2014,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.812,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "83402",
+      "locale": "localized",
+      "query": "Fate/kaleid liner 魔法少女☆伊莉雅 2wei!",
+      "subject_year": 2014,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 0.875,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "83402",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイ!",
+      "subject_year": 2014,
+      "filter_mode": "first_air_date_year",
+      "status": 200,
+      "elapsed_seconds": 0.813,
+      "total_results": 0,
+      "total_pages": 1,
+      "candidates": []
+    },
+    {
+      "subject_id": "83402",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイ!",
+      "subject_year": 2014,
+      "filter_mode": "without_year",
+      "status": 200,
+      "elapsed_seconds": 0.812,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    },
+    {
+      "subject_id": "83402",
+      "locale": "original",
+      "query": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイ!",
+      "subject_year": 2014,
+      "filter_mode": "year",
+      "status": 200,
+      "elapsed_seconds": 0.906,
+      "total_results": 1,
+      "total_pages": 1,
+      "candidates": [
+        {
+          "id": 63576,
+          "name": "魔法少女☆伊莉雅",
+          "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+          "first_air_date": "2013-07-06",
+          "genre_ids": [
+            16,
+            18,
+            10759,
+            10765,
+            35
+          ]
+        }
+      ]
+    }
+  ],
+  "tv_detail": {
+    "status": 200,
+    "elapsed_seconds": 0.61,
+    "id": 63576,
+    "name": "魔法少女☆伊莉雅",
+    "original_name": "Fate/kaleid liner プリズマ☆イリヤ",
+    "first_air_date": "2013-07-06",
+    "genres": [
+      {
+        "id": 16,
+        "name": "动画"
+      },
+      {
+        "id": 18,
+        "name": "剧情"
+      },
+      {
+        "id": 10759,
+        "name": "动作冒险"
+      },
+      {
+        "id": 10765,
+        "name": "Sci-Fi & Fantasy"
+      },
+      {
+        "id": 35,
+        "name": "喜剧"
+      }
+    ],
+    "number_of_seasons": 4,
+    "seasons": [
+      {
+        "id": 69444,
+        "name": "特别篇",
+        "air_date": "2013-09-27",
+        "episode_count": 23,
+        "season_number": 0
+      },
+      {
+        "id": 69443,
+        "name": "魔法少女☆伊莉雅",
+        "air_date": "2013-07-05",
+        "episode_count": 10,
+        "season_number": 1
+      },
+      {
+        "id": 93305,
+        "name": "魔法少女☆伊莉雅 2wei!",
+        "air_date": "2014-07-09",
+        "episode_count": 10,
+        "season_number": 2
+      },
+      {
+        "id": 93306,
+        "name": "魔法少女☆伊莉雅 2wei Herz!",
+        "air_date": "2015-07-24",
+        "episode_count": 10,
+        "season_number": 3
+      },
+      {
+        "id": 93307,
+        "name": "魔法少女☆伊莉雅 3rei!!",
+        "air_date": "2016-07-06",
+        "episode_count": 12,
+        "season_number": 4
+      }
+    ]
+  },
+  "aliases": [
+    {
+      "iso_3166_1": "CN",
+      "title": "魔法少女伊莉雅",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "CN",
+      "title": "命运 魔法少女☆伊莉雅",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "CN",
+      "title": "Fate／kaleid liner 魔法少女☆伊莉雅 3rei!!",
+      "type": "第四季"
+    },
+    {
+      "iso_3166_1": "CN",
+      "title": "Fate／kaleid liner 魔法少女☆伊莉雅 2wei!",
+      "type": "第二季"
+    },
+    {
+      "iso_3166_1": "CN",
+      "title": "Fate／kaleid liner 魔法少女☆伊莉雅 2wei Herz!",
+      "type": "第三季"
+    },
+    {
+      "iso_3166_1": "CN",
+      "title": "魔法少女☆伊莉雅",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "DE",
+      "title": "Fate/kaleid liner Prisma Illya 2wei Herz!",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "DE",
+      "title": "Fate/kaleid liner Prisma Illya 3rei!",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "DE",
+      "title": "Fate/kaleid liner Prisma Illya",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "DE",
+      "title": "Fate/kaleid liner Prisma Illya 2wei!",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "DE",
+      "title": "Fate - Kaleid Liner Prisma Illya",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "FR",
+      "title": "Fate/kaleid liner Prisma Illya",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "FR",
+      "title": "Fate kaleid liner Prisma Illya",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner プリズマ☆イリヤ ツヴァイ ヘルツ！",
+      "type": "third series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner Prisma Illya 2wei!",
+      "type": "second series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner プリズマ☆イリヤ",
+      "type": "second series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner プリズマ☆イリヤ 2wei Herz!",
+      "type": "third series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner Prisma Illya 2wei Herz!",
+      "type": "third series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner プリズマ☆イリヤ ドライ!!",
+      "type": "fourth series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner プリズマ☆イリヤ 2wei!",
+      "type": "second series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner Prisma Illya 3rei!",
+      "type": "fourth series title"
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate⁄kaleid Liner プラズマ☆イリヤ",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "JP",
+      "title": "Fate/kaleid liner Prisma Illya",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "KR",
+      "title": "Fate kaleid liner 프리즈마☆이리야",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "KR",
+      "title": "Fatekaleid liner 프리즈마☆이리야",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "US",
+      "title": "Fatekaleid liner PRISMA ILLYA Licht Nameless Girl",
+      "type": ""
+    },
+    {
+      "iso_3166_1": "US",
+      "title": "Fate/kaleid liner Prisma☆Illya",
+      "type": ""
+    }
+  ]
+}

@@ -105,7 +105,7 @@ class TransSafetyTests(unittest.TestCase):
             source.write_bytes(b"media")
             records.mkdir()
 
-            def fake_link(src, dst):
+            def fake_link(src, dst, **kwargs):
                 Path(dst).write_bytes(Path(src).read_bytes())
 
             with (
@@ -114,7 +114,7 @@ class TransSafetyTests(unittest.TestCase):
             ):
                 result = Trans({source: target}, "inode-fail").trans_file()
 
-            self.assertIn("inode", result.casefold())
+            self.assertIn("身份", result)
             self.assertFalse(target.exists())
 
     @patch("src.rename.trans.cm.get_config", return_value="链接")
@@ -132,12 +132,12 @@ class TransSafetyTests(unittest.TestCase):
             real_link = os.link
             calls = 0
 
-            def fail_second(src, dst):
+            def fail_second(src, dst, **kwargs):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("second failed")
-                real_link(src, dst)
+                real_link(src, dst, **kwargs)
 
             with (
                 patch("src.rename.trans.RECORD_PATH", records),
@@ -173,34 +173,15 @@ class TransSafetyTests(unittest.TestCase):
             self.assertIn("已存在", result)
             self.assertEqual(target.read_bytes(), b"keep")
 
-    @patch("src.rename.trans.cm.get_config", return_value="复制")
-    def test_partial_current_copy_is_removed_when_copy_raises(self, _config):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source = root / "source.mkv"
-            target = root / "output" / "target.mkv"
-            records = root / "records"
-            source.write_bytes(b"complete source")
-            records.mkdir()
-
-            def partial_copy(_source, destination):
-                Path(destination).write_bytes(b"partial")
-                raise OSError("copy interrupted")
-
-            with (
-                patch("src.rename.trans.RECORD_PATH", records),
-                patch(
-                    "src.rename.trans.shutil.copy2", side_effect=partial_copy
-                ),
-            ):
-                result = Trans({source: target}, "partial-copy").trans_file()
-
-            self.assertIn("copy interrupted", result)
-            # Ownership cannot be proven when the transfer primitive raises.
-            # Preserve the partial/foreign path for manual reconciliation
-            # instead of risking deletion of another executor's target.
-            self.assertTrue(target.exists())
-            self.assertTrue(source.exists())
+    def test_copy_and_move_modes_reject_before_media(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'source.mkv';source.write_bytes(b'source')
+            for index,mode in enumerate(('复制','剪切')):
+                target=root/'target'/mode/'target.mkv'
+                result=Trans({source:target},'unsupported-'+str(index),mode=mode,dry_run=False,record_root=root/'records').trans_file()
+                self.assertIn('硬链接',result)
+                self.assertFalse(target.exists())
+                self.assertEqual(source.read_bytes(),b'source')
 
     @patch("src.rename.trans.cm.get_config", return_value="链接")
     def test_failed_link_does_not_delete_foreign_target(self, _config):
@@ -212,7 +193,7 @@ class TransSafetyTests(unittest.TestCase):
             source.write_bytes(b"source")
             records.mkdir()
 
-            def foreign_race(_source, destination):
+            def foreign_race(_source, destination, **kwargs):
                 Path(destination).write_bytes(b"foreign")
                 raise FileExistsError("foreign target won")
 

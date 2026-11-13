@@ -13,7 +13,10 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Iterable, Mapping, Optional
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional
+
+if TYPE_CHECKING:
+    from .rename_plan import RenamePlan
 
 
 ROOT_KEYS = (
@@ -219,6 +222,29 @@ def inspect_frozen_target_routing(
                 target,
             ))
     return FrozenTargetRouting(snapshot, resolved), tuple(problems)
+
+
+def inspect_plan_target_routing(
+    plan: RenamePlan,
+) -> tuple[Optional[FrozenTargetRouting], tuple[TargetRoutingProblem, ...]]:
+    """Adapt a frozen inventory Plan to the shared routing predicate.
+
+    Inventory Plans name the library root separately from the canonical work
+    directory. Legacy work-root Plans must not be reinterpreted by this adapter.
+    """
+    group_kinds = {
+        group.kind for group in plan.presentation_groups
+        if group.kind in {"movie_continuous", "tv_episodes"}
+    }
+    return inspect_frozen_target_routing(
+        root_snapshot=plan.metadata.get("target_root_snapshot"),
+        root_config_fingerprint=plan.metadata.get("target_root_config_fingerprint"),
+        domain=plan.work_identity.domain if plan.work_identity is not None else "",
+        group_kind=next(iter(group_kinds)) if len(group_kinds) == 1 else "",
+        target_root=plan.metadata.get("target_root"),
+        canonical_work_root=plan.metadata.get("canonical_work_root"),
+        target_paths=(entry.target_path for entry in plan.entries),
+    )
 
 
 def snapshot_from_config_manager(config_manager: object) -> TargetRootSnapshot:

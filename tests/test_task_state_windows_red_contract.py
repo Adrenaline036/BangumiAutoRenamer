@@ -16,16 +16,37 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import src.utils.utils as task_utils
 from src.pages import data_table_page
 from src.rename.plan_execution import PlanExecutionError
 from src.task_queue import TaskQueueManager
 import tests.test_plan_execution as plan_execution_fixture
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+    persist_provider_selection_attempt,
+)
+from tests.source_collection_fixture import admit_task
 
 
 FINGERPRINT = "a" * 64
+
+
+def _isolated_queue(*, task_root, **kwargs):
+    """Actual queue, with every configurable store inside this owned fixture."""
+    state_root = task_root / 'isolated-state'
+    return TaskQueueManager(task_root=task_root, plan_root=state_root / 'plans',
+        decision_state_root=state_root / 'decisions', batch_scope_root=state_root / 'task_batch_scope',
+        provider_link_catalog_root=state_root / 'provider_links',
+        recovery_abandon_audit_root=state_root / 'abandon', **kwargs)
+
+
+def _write_queue_source(root: Path, name: str) -> Path:
+    path = root / "sources" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"queue-source")
+    return path
 
 
 def _sharing_error(winerror: int) -> PermissionError:
@@ -36,25 +57,39 @@ def _sharing_error(winerror: int) -> PermissionError:
 
 def _write_approved_task(root: Path, task_id: str) -> Path:
     path = root / f"{task_id}.json"
+    task = {
+        "uuid": task_id,
+        "path": "synthetic/source",
+        "workflow_status": "approved",
+        "completed_at": None,
+    }
+    persist_provider_selection_attempt(task, {
+        "state": "succeeded",
+        "result_decision_revision": 1,
+    })
     path.write_text(
-        json.dumps(
-            {
-                "uuid": task_id,
-                "path": "synthetic/source",
-                "workflow_status": "approved",
-                "completed_at": None,
-                "selection_operation": {
-                    "state": "succeeded",
-                    "result_decision_revision": 1,
-                },
-            }
-        ),
+        json.dumps(task),
         encoding="utf-8",
     )
     return path
 
 
 class _UiStub:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def set_visibility(self, value):
+        self.visible = bool(value)
+
+    def set_text(self, value):
+        self.text = value
+
+    def enable(self):
+        self.enabled = True
+
+    def disable(self):
+        self.enabled = False
+
     def classes(self, *_args, **_kwargs):
         return self
 
@@ -349,7 +384,11 @@ class TaskStateWindowsSyncRedContracts(unittest.TestCase):
             self.assertTrue(
                 transfer_snapshots[0].get("execution_requires_manual_check")
             )
-            self.assertEqual("completed", final_task.get("execution_phase"))
+            # Media finished; this synthetic MKV has no inspectable attachment
+            # evidence. The silent worker has stopped, not remained in flight.
+            self.assertEqual("font_failed", final_task.get("execution_phase"))
+            self.assertEqual("completed", final_task.get("execution_status"))
+            self.assertTrue(final_task.get("font_error"))
             self.assertFalse(final_task.get("execution_requires_manual_check"))
 
     def test_conditional_execution_update_preserves_fields_and_rejects_drift(self):
@@ -360,11 +399,11 @@ class TaskStateWindowsSyncRedContracts(unittest.TestCase):
             )
             task_path = task_root / f"{plan.task_id}.json"
             initial = json.loads(task_path.read_text("utf-8"))
-            initial["selection_operation"] = {
+            persist_provider_selection_attempt(initial, {
                 "state": "succeeded",
                 "result_decision_revision": 1,
                 "marker": "old",
-            }
+            })
             task_path.write_text(json.dumps(initial), encoding="utf-8")
 
             read_happened = threading.Event()
@@ -394,30 +433,30 @@ class TaskStateWindowsSyncRedContracts(unittest.TestCase):
             thread = threading.Thread(target=stale_writer, name="stale-task-writer")
             thread.start()
             if read_happened.wait(timeout=0.2):
+                replacement = {}
+                persist_provider_selection_attempt(replacement, {
+                    "state": "succeeded",
+                    "result_decision_revision": 2,
+                    "marker": "new",
+                })
                 task_utils.merge_task_at(
                     task_root,
                     plan.task_id,
-                    {
-                        "selection_operation": {
-                            "state": "succeeded",
-                            "result_decision_revision": 2,
-                            "marker": "new",
-                        }
-                    },
+                    {"review_operation": replacement["review_operation"]},
                 )
                 continue_write.set()
             else:
                 thread.join(timeout=1)
+                replacement = {}
+                persist_provider_selection_attempt(replacement, {
+                    "state": "succeeded",
+                    "result_decision_revision": 2,
+                    "marker": "new",
+                })
                 task_utils.merge_task_at(
                     task_root,
                     plan.task_id,
-                    {
-                        "selection_operation": {
-                            "state": "succeeded",
-                            "result_decision_revision": 2,
-                            "marker": "new",
-                        }
-                    },
+                    {"review_operation": replacement["review_operation"]},
                 )
             thread.join(timeout=1)
             continue_write.set()
@@ -461,8 +500,9 @@ class TaskStateWindowsSyncRedContracts(unittest.TestCase):
                 drift_rejected = True
 
             self.assertEqual([], writer_error)
-            self.assertEqual("new", preserved["selection_operation"]["marker"])
-            self.assertEqual(2, preserved["selection_operation"]["result_decision_revision"])
+            preserved_operation = current_provider_selection_context(preserved)
+            self.assertEqual("new", preserved_operation["marker"])
+            self.assertEqual(2, preserved_operation["result_decision_revision"])
             self.assertTrue(drift_rejected, "fingerprint drift was overwritten")
             self.assertEqual([], calls, "transfer ran after request fingerprint drift")
 
@@ -488,24 +528,34 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
         class FakeExecutionService:
             @staticmethod
             def validate_approved(_task_id, _fingerprint):
-                return None
+                return SimpleNamespace(
+                    execution_policy=SimpleNamespace(dry_run=False)
+                )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir) / 'tasks'
+            root.mkdir()
             locked_path = _write_approved_task(root, "locked-approved")
             _write_approved_task(root, "safe-approved")
-            manager = TaskQueueManager(
+            manager = _isolated_queue(
                 task_root=root,
                 executor=normal_executor,
                 approved_executor=approved_executor,
                 execution_service=FakeExecutionService(),
-                test_mode=False,
+
             )
             worker_error = None
+            # This worker fault fixture admits fresh sources only. Supply the
+            # read-only completed-asset inventory context now required by admission.
+            manager.execution_service.rebuild_service = SimpleNamespace(
+                tasks=root, plans=manager.plan_store)
+            manager.execution_service.review_service = None
             reader = None
             try:
                 await manager.start()
-                await manager.enqueue(Path("synthetic/blocker"), task_id="blocker")
+                await admit_task(manager,
+                    _write_queue_source(root, "blocker.mkv"), task_id="blocker"
+                )
                 await asyncio.wait_for(blocker_started.wait(), timeout=1)
                 await manager.enqueue_approved("locked-approved", FINGERPRINT)
                 reader = locked_path.open("r", encoding="utf-8")
@@ -542,21 +592,24 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
         class FakeExecutionService:
             @staticmethod
             def validate_approved(_task_id, _fingerprint):
-                return None
+                return SimpleNamespace(
+                    execution_policy=SimpleNamespace(dry_run=False)
+                )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir) / 'tasks'
+            root.mkdir()
             approved_path = _write_approved_task(root, "approved-existing")
             approved_before = approved_path.read_bytes()
-            manager = TaskQueueManager(
+            manager = _isolated_queue(
                 task_root=root,
                 execution_service=FakeExecutionService(),
-                test_mode=False,
+
             )
             await manager.start()
             approved_put_snapshots: list[dict] = []
 
-            async def fail_approved_put(_job):
+            def fail_approved_put(_job):
                 approved_put_snapshots.append(
                     json.loads(approved_path.read_text("utf-8"))
                 )
@@ -564,8 +617,8 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(
                 manager._queue,
-                "put",
-                new=AsyncMock(side_effect=fail_approved_put),
+                "put_nowait",
+                new=Mock(side_effect=fail_approved_put),
             ):
                 with self.assertRaises(RuntimeError):
                     await manager.enqueue_approved("approved-existing", FINGERPRINT)
@@ -575,16 +628,17 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
 
             fresh_root = root / "fresh"
             fresh_root.mkdir()
-            fresh_manager = TaskQueueManager(task_root=fresh_root, test_mode=False)
+            fresh_manager = _isolated_queue(task_root=fresh_root)
             await fresh_manager.start()
             with patch.object(
                 fresh_manager._queue,
-                "put",
-                new=AsyncMock(side_effect=RuntimeError("queue put failed")),
+                "put_nowait",
+                new=Mock(side_effect=RuntimeError("queue put failed")),
             ):
                 with self.assertRaises(RuntimeError):
-                    await fresh_manager.enqueue(
-                        Path("synthetic/new"), task_id="new-admission"
+                    await admit_task(fresh_manager,
+                        _write_queue_source(fresh_root, "new.mkv"),
+                        task_id="new-admission",
                     )
             fresh_pending = list(fresh_manager._pending)
             fresh_task_exists = (fresh_root / "new-admission.json").exists()
@@ -596,15 +650,15 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 write_failure_root, "write-failure-approved"
             )
             write_failure_before = write_failure_path.read_bytes()
-            write_failure_manager = TaskQueueManager(
+            write_failure_manager = _isolated_queue(
                 task_root=write_failure_root,
                 execution_service=FakeExecutionService(),
-                test_mode=False,
+
             )
             await write_failure_manager.start()
             existing_write_error = None
             with patch(
-                "src.task_queue.write_task_at",
+                "src.utils.utils._atomic_write_task_at",
                 side_effect=_sharing_error(5),
             ):
                 try:
@@ -623,9 +677,9 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
 
             new_write_root = root / "write-failure-new"
             new_write_root.mkdir()
-            new_write_manager = TaskQueueManager(
+            new_write_manager = _isolated_queue(
                 task_root=new_write_root,
-                test_mode=False,
+
             )
             await new_write_manager.start()
             new_write_error = None
@@ -634,8 +688,9 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 side_effect=_sharing_error(32),
             ):
                 try:
-                    await new_write_manager.enqueue(
-                        Path("synthetic/new-write"), task_id="new-write-failure"
+                    await admit_task(new_write_manager,
+                        _write_queue_source(new_write_root, "new-write.mkv"),
+                        task_id="new-write-failure",
                     )
                 except PermissionError as exc:
                     new_write_error = exc
@@ -658,11 +713,11 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 refresh_approved_root, "refresh-failure-approved"
             )
             refresh_approved_before = refresh_approved_path.read_bytes()
-            refresh_approved_manager = TaskQueueManager(
+            refresh_approved_manager = _isolated_queue(
                 task_root=refresh_approved_root,
                 approved_executor=refresh_executor,
                 execution_service=FakeExecutionService(),
-                test_mode=False,
+
             )
             await refresh_approved_manager.start()
             with patch.object(
@@ -684,10 +739,10 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
 
             refresh_new_root = root / "refresh-failure-new"
             refresh_new_root.mkdir()
-            refresh_new_manager = TaskQueueManager(
+            refresh_new_manager = _isolated_queue(
                 task_root=refresh_new_root,
                 approved_executor=refresh_executor,
-                test_mode=False,
+
             )
             await refresh_new_manager.start()
             with patch.object(
@@ -696,8 +751,8 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 side_effect=_sharing_error(32),
             ):
                 with self.assertRaises(PermissionError):
-                    await refresh_new_manager.enqueue(
-                        Path("synthetic/refresh-new"),
+                    await admit_task(refresh_new_manager,
+                        _write_queue_source(refresh_new_root, "refresh-new.mkv"),
                         task_id="refresh-failure-new",
                     )
             refresh_new_pending = list(refresh_new_manager._pending)
@@ -720,11 +775,11 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
             async def restarted_executor(job):
                 restarted_jobs.append(job.task_id)
 
-            restart_manager = TaskQueueManager(
+            restart_manager = _isolated_queue(
                 task_root=restart_root,
                 approved_executor=restarted_executor,
                 execution_service=FakeExecutionService(),
-                test_mode=False,
+
             )
             await restart_manager.start()
             await asyncio.sleep(0)
@@ -798,7 +853,8 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
             executed.append(job.task_id)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir) / 'tasks'
+            root.mkdir()
             tasks = {
                 "preparing": {
                     "uuid": "preparing",
@@ -833,10 +889,10 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                     json.dumps(payload), encoding="utf-8"
                 )
 
-            manager = TaskQueueManager(
+            manager = _isolated_queue(
                 task_root=root,
                 approved_executor=approved_executor,
-                test_mode=False,
+
             )
             await manager.start()
             await asyncio.sleep(0)
@@ -890,6 +946,7 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
             "execution_phase": "failed_before_media",
             "execution_requested_fingerprint": FINGERPRINT,
             "execution_requires_manual_check": False,
+            "execution_may_have_written_targets": False,
             "movie_inventory_reason": "MULTIPLE_VIDEO_FILES_REQUIRE_LAYOUT_CLASSIFICATION",
             "error": "internal storage failure",
         }
@@ -914,12 +971,13 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 return_value=None,
             ),
             patch.object(data_table_page, "_path_tree_button"),
-            patch.object(data_table_page.ui, "card", return_value=_UiStub()),
-            patch.object(data_table_page.ui, "row", return_value=_UiStub()),
-            patch.object(data_table_page.ui, "column", return_value=_UiStub()),
-            patch.object(data_table_page.ui, "badge", side_effect=record_text),
-            patch.object(data_table_page.ui, "label", side_effect=record_text),
-            patch.object(data_table_page.ui, "button", side_effect=record_button),
+            patch.object(data_table_page, "ui", widgets := SimpleNamespace(
+                card=_UiStub, row=_UiStub, column=_UiStub, badge=record_text,
+                label=record_text, button=record_button, dialog=_DialogStub,
+                linear_progress=_UiStub,
+            )),
+            patch("src.pages.queue_confirmation.ui", widgets),
+            patch("src.pages.queue_confirmation.dialog_card", _UiStub),
             patch.object(
                 data_table_page.task_queue,
                 "enqueue_approved",
@@ -927,7 +985,7 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
             ) as enqueue_approved,
             patch.object(
                 data_table_page.task_queue,
-                "enqueue",
+                "enqueue_batch",
                 new=AsyncMock(),
             ) as enqueue,
             patch.object(data_table_page, "notify"),
@@ -936,6 +994,7 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
             patch.object(data_table_page._history_tasks, "refresh"),
         ):
             data_table_page._task_card(task)
+            card_buttons = list(rendered_buttons)
             retry_actions = [
                 (callback, button)
                 for label, callback, button in rendered_buttons
@@ -945,6 +1004,11 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 result = retry_actions[0][0]()
                 if inspect.isawaitable(result):
                     await result
+                enqueue_approved.assert_not_awaited()
+                confirm_actions = [callback for label, callback, _ in rendered_buttons
+                                   if label == '确认入队']
+                self.assertEqual(1, len(confirm_actions))
+                await confirm_actions[0]()
 
         negative_cases = {
             "boundary": {
@@ -1055,6 +1119,7 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                 "load_execution_recovery",
                 return_value=dialog_snapshot,
             ),
+            patch.object(data_table_page, "dialog_card", _UiStub),
             patch.object(data_table_page.ui, "dialog", return_value=_DialogStub()),
             patch.object(data_table_page.ui, "card", return_value=_UiStub()),
             patch.object(data_table_page.ui, "column", return_value=_UiStub()),
@@ -1076,9 +1141,13 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
             @classmethod
             def validate_approved(cls, task_id, fingerprint):
                 cls.validation_calls.append((task_id, fingerprint))
+                return SimpleNamespace(
+                    execution_policy=SimpleNamespace(dry_run=False)
+                )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            backend_root = Path(temp_dir)
+            backend_root = Path(temp_dir) / 'tasks'
+            backend_root.mkdir()
             backend_path = _write_approved_task(backend_root, "backend-retry")
             backend_task = json.loads(backend_path.read_text("utf-8"))
             backend_task.update(
@@ -1089,14 +1158,15 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
                     "execution_requested_fingerprint": FINGERPRINT,
                     "execution_requires_manual_check": False,
                     "error": "structured pre-media failure",
+                    "execution_may_have_written_targets": False,
                 }
             )
             backend_path.write_text(json.dumps(backend_task), encoding="utf-8")
-            backend_manager = TaskQueueManager(
+            backend_manager = _isolated_queue(
                 task_root=backend_root,
                 approved_executor=approved_executor,
                 execution_service=FakeExecutionService(),
-                test_mode=False,
+
             )
             backend_error = None
             try:
@@ -1115,7 +1185,7 @@ class TaskStateWindowsAsyncRedContracts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(retry_actions))
         self.assertEqual(
             ["重新执行"],
-            [label for label, _callback, _button in rendered_buttons],
+            [label for label, _callback, _button in card_buttons],
         )
         enqueue_approved.assert_awaited_once_with(task["uuid"], FINGERPRINT)
         enqueue.assert_not_awaited()

@@ -6,6 +6,7 @@ no provider, browser, media target, Catalog or ledger is touched.
 """
 
 from __future__ import annotations
+from tests.queue_fixture import TaskQueueManager as ControlledQueue
 
 import ast
 from dataclasses import replace
@@ -228,6 +229,8 @@ class PhaseCFullEntryMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = _simple_plan(root, "phase-c-catalog-tamper")
+            plan = replace(plan, metadata={**plan.metadata,
+                'series_key': 'series-11111111-1111-1111-1111-111111111111'})
             _decision, projected = module.ProjectionCommitService(
                 DecisionStateStore(root / "decision_state"),
                 PlanStore(root / "plan"),
@@ -312,7 +315,7 @@ class PhaseCTaskTerminalStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 self.assertEqual("pending", pending["status"])
-                manager = TaskQueueManager(
+                manager = ControlledQueue(
                     task_root=task_root,
                     decision_state_root=decision_root,
                     plan_root=plan_root,
@@ -383,7 +386,7 @@ class PhaseCTaskTerminalStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 "completed", read_task_at(task_root, task_id)["workflow_status"]
             )
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=task_root,
                 decision_state_root=decision_root,
                 plan_root=plan_root,

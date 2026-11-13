@@ -1,0 +1,99 @@
+{
+  "schema_version": "r24-provider-special-eligibility-red/v1",
+  "incident": {
+    "error_id": "ERR-20260901-014",
+    "source_shape": "sanitized-r9-s2-mixed-season-extras",
+    "season_number": 2,
+    "provider": {
+      "namespace": "tmdb",
+      "entity_type": "tv",
+      "provider_id": "83121",
+      "title": "Kaguya-sama: Love Is War",
+      "year": 2019
+    },
+    "season_zero_rows": [
+      {
+        "id": 4340224,
+        "episode_number": 1,
+        "name": "Opening Preview",
+        "air_date": "2022-12-10",
+        "runtime": 24
+      },
+      {
+        "id": 4340225,
+        "episode_number": 2,
+        "name": "Narrative OVA",
+        "air_date": "2022-12-24",
+        "runtime": 24
+      },
+      {
+        "id": 4340226,
+        "episode_number": 3,
+        "name": "Narrative Special",
+        "air_date": "2023-01-01",
+        "runtime": 24
+      },
+      {
+        "id": 4340227,
+        "episode_number": 4,
+        "name": "Another Official Special",
+        "air_date": "2023-02-01",
+        "runtime": 24
+      }
+    ],
+    "main": {
+      "relative_path": "Kaguya S02E01.mkv",
+      "expected_local_role": "main_episode"
+    },
+    "clear_extras": [
+      {
+        "relative_path": "SPs/Kaguya [CM01].mkv",
+        "expected_local_role": "disc_extra"
+      },
+      {
+        "relative_path": "SPs/Kaguya [PV01].mkv",
+        "expected_local_role": "disc_extra"
+      },
+      {
+        "relative_path": "SPs/Kaguya [Menu01].mkv",
+        "expected_local_role": "disc_extra"
+      },
+      {
+        "relative_path": "SPs/Kaguya [NCOP].mkv",
+        "expected_local_role": "disc_extra"
+      },
+      {
+        "relative_path": "SPs/Kaguya [NCED].mkv",
+        "expected_local_role": "disc_extra"
+      }
+    ],
+    "eligible_specials": [
+      {
+        "relative_path": "SPs/Kaguya OVA 01.mkv",
+        "expected_local_role": "episode_like_bonus"
+      },
+      {
+        "relative_path": "SPs/Kaguya S00E02.mkv",
+        "expected_local_role": "provider_special"
+      }
+    ],
+    "legacy_conflict": {
+      "relative_path": "SPs/World Premiere Digest.mkv",
+      "expected_local_role": "disc_extra",
+      "supersedes_test": "test_special_review_contract_is_tri_state_and_keeps_world_premiere_extra"
+    },
+    "expected": {
+      "clear_extra_count": 5,
+      "eligible_special_count": 2,
+      "season_zero_candidate_rows_per_eligible_file": 4,
+      "provider_special_issue_count": 2,
+      "clear_extra_candidate_count": 0,
+      "clear_extra_issue_count": 0,
+      "clear_extra_target_suffix": "Season 02/Extras",
+      "typed_role_projection_required": true,
+      "mixed_batch_sibling_promotion_allowed": false,
+      "season_zero_presence_grants_eligibility": false,
+      "disconnect_issue_code": "provider_special_eligibility_unavailable"
+    }
+  }
+}

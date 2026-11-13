@@ -19,8 +19,9 @@ from typing import Iterable, Mapping, Optional
 from .task_batch_scope import TaskSourceScope
 
 
-TV_PLANNING_AUTHORITY_SCHEMA_VERSION = 1
-TV_PLANNING_AUTHORITY_POLICY_VERSION = "tv-planning-authority-v1"
+
+TV_PLANNING_AUTHORITY_SCHEMA_VERSION = 2
+TV_PLANNING_AUTHORITY_POLICY_VERSION = "tv-planning-authority-v2"
 
 TV_PLANNING_AUTHORITY_CONSUMERS = (
     "decision_store",
@@ -37,6 +38,7 @@ TV_PLANNING_AUTHORITY_CONSUMERS = (
 
 TV_PLANNING_BUILDER_CALLSITE_ALLOWLIST = (
     "src/pages/plan_review_page.py:cohort_confirmation",
+    "src/rename/process.py:provider_selection",
 )
 
 
@@ -44,15 +46,23 @@ class TVPlanningAuthorityError(RuntimeError):
     """Frozen TV facts are missing, contradictory, stale or out of scope."""
 
 
+def _json_value(item):
+    if isinstance(item, Mapping):
+        return {str(k): _json_value(v) for k, v in item.items()}
+    if isinstance(item, (list, tuple)):
+        return [_json_value(v) for v in item]
+    return item
+
+
 def _detached_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
     return MappingProxyType(
-        json.loads(json.dumps(dict(value), ensure_ascii=False, sort_keys=True))
+        json.loads(json.dumps(_json_value(value), ensure_ascii=False, sort_keys=True))
     )
 
 
 def _canonical_sha256(value: object, *, domain: str) -> str:
     encoded = json.dumps(
-        {"domain": domain, "value": value},
+        {"domain": domain, "value": _json_value(value)},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -149,6 +159,8 @@ class TVPlanningAuthorityInput:
 
 @dataclass(frozen=True)
 class TVPlanningAuthority:
+    CURRENT_SCHEMA_VERSION = TV_PLANNING_AUTHORITY_SCHEMA_VERSION
+
     schema_version: int
     policy_version: str
     fingerprint: str
@@ -156,13 +168,13 @@ class TVPlanningAuthority:
     decision_revision: int
     observation_refs: tuple[str, ...]
     work_identity: Mapping[str, object]
+    metadata_provider_identities: tuple[Mapping[str, object], ...]
     naming_authority: Mapping[str, object]
     season_assignments: Mapping[str, int]
     selected_season_number: Optional[int]
     episode_range_ownership: tuple[Mapping[str, object], ...]
     file_decisions: Mapping[str, Mapping[str, object]]
     non_regular_file_decisions: Mapping[str, Mapping[str, object]]
-    associated_asset_manifest: Mapping[str, object]
     derived_provenance: Mapping[str, object]
 
     def _body(self) -> dict[str, object]:
@@ -173,6 +185,9 @@ class TVPlanningAuthority:
             "decision_revision": self.decision_revision,
             "observation_refs": list(self.observation_refs),
             "work_identity": dict(self.work_identity),
+            "metadata_provider_identities": [
+                dict(item) for item in self.metadata_provider_identities
+            ],
             "naming_authority": dict(self.naming_authority),
             "season_assignments": dict(self.season_assignments),
             "selected_season_number": self.selected_season_number,
@@ -186,7 +201,6 @@ class TVPlanningAuthority:
                 str(key): dict(value)
                 for key, value in self.non_regular_file_decisions.items()
             },
-            "associated_asset_manifest": dict(self.associated_asset_manifest),
             "derived_provenance": dict(self.derived_provenance),
         }
 
@@ -197,9 +211,11 @@ class TVPlanningAuthority:
     def from_mapping(cls, value: Mapping[str, object]) -> "TVPlanningAuthority":
         if not isinstance(value, Mapping):
             raise TVPlanningAuthorityError("TV authority 必须是对象")
-        if int(value.get("schema_version", 0)) != TV_PLANNING_AUTHORITY_SCHEMA_VERSION:
+        schema_version = int(value.get("schema_version", 0))
+        if schema_version != TV_PLANNING_AUTHORITY_SCHEMA_VERSION:
             raise TVPlanningAuthorityError("TV authority schema_version 不受支持")
-        if str(value.get("policy_version") or "") != TV_PLANNING_AUTHORITY_POLICY_VERSION:
+        expected_policy = TV_PLANNING_AUTHORITY_POLICY_VERSION
+        if str(value.get("policy_version") or "") != expected_policy:
             raise TVPlanningAuthorityError("TV authority policy_version 不受支持")
         scope_value = value.get("task_source_scope")
         if not isinstance(scope_value, Mapping):
@@ -230,14 +246,24 @@ class TVPlanningAuthority:
         assignments_value = value.get("season_assignments", {})
         if not isinstance(assignments_value, Mapping):
             raise TVPlanningAuthorityError("TV authority season assignments 格式无效")
+        metadata_identities_value = value.get("metadata_provider_identities", ())
+        if not isinstance(metadata_identities_value, (list, tuple)) or not all(
+            isinstance(item, Mapping) for item in metadata_identities_value
+        ):
+            raise TVPlanningAuthorityError(
+                "TV authority metadata provider identities 格式无效"
+            )
         authority = cls(
-            schema_version=TV_PLANNING_AUTHORITY_SCHEMA_VERSION,
-            policy_version=TV_PLANNING_AUTHORITY_POLICY_VERSION,
+            schema_version=schema_version,
+            policy_version=expected_policy,
             fingerprint=str(value.get("fingerprint") or ""),
             task_source_scope=TaskSourceScope.from_mapping(scope_value),
             decision_revision=int(value.get("decision_revision", 0)),
             observation_refs=tuple(str(item) for item in refs_value),
             work_identity=mapping("work_identity"),
+            metadata_provider_identities=tuple(
+                _detached_mapping(item) for item in metadata_identities_value
+            ),
             naming_authority=mapping("naming_authority"),
             season_assignments=MappingProxyType(
                 {str(key): int(number) for key, number in assignments_value.items()}
@@ -253,15 +279,17 @@ class TVPlanningAuthority:
             non_regular_file_decisions=mapping_of_mappings(
                 "non_regular_file_decisions"
             ),
-            associated_asset_manifest=mapping("associated_asset_manifest"),
             derived_provenance=mapping("derived_provenance"),
         )
-        expected = _canonical_sha256(
-            authority._body(), domain="bar.tv-planning-authority"
-        )
+        fingerprint_body = authority._body()
+        expected = _canonical_sha256(fingerprint_body, domain="bar.tv-planning-authority")
         if authority.fingerprint != expected:
             raise TVPlanningAuthorityError("TV authority fingerprint 不匹配")
         return authority
+
+
+
+
 
 
 @dataclass(frozen=True)
@@ -298,6 +326,15 @@ class TVPlanningAuthorityBuilder:
         *,
         observation_refs: Iterable[str] = (),
     ) -> TVPlanningAuthority:
+        return self._project(authority_input, observation_refs=observation_refs)
+
+    @staticmethod
+    def _project(
+        authority_input: TVPlanningAuthorityInput,
+        *,
+        observation_refs: Iterable[str] = (),
+    ) -> TVPlanningAuthority:
+        """Single pure kernel, also binding consumed results to frozen inputs."""
         if authority_input.task_source_scope.media_domain != "tv":
             raise TVPlanningAuthorityError("TV Builder 拒绝处理 movie 输入")
         observations = authority_input.observations.to_dict()
@@ -317,14 +354,15 @@ class TVPlanningAuthorityBuilder:
             decisions,
             tmdb_tv_id=tmdb_tv_id,
         )
+        metadata_provider_identities = _resolve_metadata_provider_identities(
+            decisions,
+            primary=work_identity["primary_provider"],
+        )
         season_assignments = _resolve_season_assignments(provider_rows, decisions)
         selected_season = season_assignments.get(selected_subject_id)
         episode_ranges = _resolve_episode_ranges(source_segments)
         file_decisions = _resolve_file_decisions(source_paths, selected_season)
         non_regular_decisions = _resolve_non_regular_files(non_regular_files)
-        asset_manifest = _resolve_associated_asset_manifest(
-            observations.get("font_archive"),
-        )
         observation_fingerprints = tuple(
             str(row.get("evidence_fingerprint"))
             for row in provider_rows
@@ -351,13 +389,13 @@ class TVPlanningAuthorityBuilder:
             "decision_revision": authority_input.user_decisions.decision_revision,
             "observation_refs": list(refs),
             "work_identity": work_identity,
+            "metadata_provider_identities": metadata_provider_identities,
             "naming_authority": naming_authority,
             "season_assignments": season_assignments,
             "selected_season_number": selected_season,
             "episode_range_ownership": episode_ranges,
             "file_decisions": file_decisions,
             "non_regular_file_decisions": non_regular_decisions,
-            "associated_asset_manifest": asset_manifest,
             "derived_provenance": derived_provenance,
         }
         fingerprint = _canonical_sha256(body, domain="bar.tv-planning-authority")
@@ -391,8 +429,11 @@ def _resolve_identity_and_naming(
             ):
                 identity = ("tmdb", "tv", str(row["provider_id"]))
                 break
-    if identity is None or identity[:2] != ("tmdb", "tv"):
-        raise TVPlanningAuthorityError("TV work identity 缺少唯一TMDB TV证据")
+    if identity is None or identity[:2] not in {
+        ("tmdb", "tv"),
+        ("bangumi", "subject"),
+    }:
+        raise TVPlanningAuthorityError("TV work identity 缺少可信动画剧集证据")
     primary = {
         "namespace": identity[0],
         "entity_type": identity[1],
@@ -414,6 +455,46 @@ def _resolve_identity_and_naming(
             "decision_revision": int(decisions.get("decision_revision", 0)),
         }
     return {"primary_provider": primary}, naming
+
+
+def _resolve_metadata_provider_identities(
+    decisions: Mapping[str, object],
+    *,
+    primary: Mapping[str, object],
+) -> list[dict[str, object]]:
+    raw = decisions.get("metadata_provider_identities", ())
+    if not isinstance(raw, (list, tuple)):
+        raise TVPlanningAuthorityError("关联资料身份格式无效")
+    primary_key = tuple(
+        str(primary.get(field) or "")
+        for field in ("namespace", "entity_type", "provider_id")
+    )
+    result: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise TVPlanningAuthorityError("关联资料身份必须是对象")
+        key = tuple(
+            str(item.get(field) or "").strip()
+            for field in ("namespace", "entity_type", "provider_id")
+        )
+        if (
+            not all(key)
+            or key == primary_key
+            or key in seen
+            or str(item.get("status") or "confirmed") != "confirmed"
+        ):
+            raise TVPlanningAuthorityError("关联资料身份不完整、重复或与主身份冲突")
+        if key[0] != "tmdb" or key[1] not in {"tv", "movie"}:
+            raise TVPlanningAuthorityError("TV authority 只接受 TMDB 资料关联")
+        seen.add(key)
+        result.append({
+            "namespace": key[0],
+            "entity_type": key[1],
+            "provider_id": key[2],
+            "status": "confirmed",
+        })
+    return result
 
 
 def _resolve_season_assignments(
@@ -494,44 +575,8 @@ def _resolve_non_regular_files(
     return result
 
 
-def _resolve_associated_asset_manifest(
-    value: object,
-) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        return {"schema_version": 1, "scope": "series", "entries": []}
-    source = str(value.get("source") or "")
-    # A series-scope font authority can be supplied by a sibling season task.
-    # Its own content identity/provenance is frozen independently from the
-    # current season's media TaskSourceScope, so membership is not inferred
-    # from the media source list here.
-    if not source:
-        raise TVPlanningAuthorityError("TV font archive 缺少冻结来源")
-    title = str(value.get("series_title") or "").strip()
-    year = int(value.get("series_year", 0))
-    content_sha256 = str(value.get("content_sha256") or "").casefold()
-    if not title or year < 1 or not _fingerprint_like(content_sha256):
-        raise TVPlanningAuthorityError("TV font archive authority 不完整")
-    suffix = Path(source).suffix.casefold()
-    if suffix not in {".7z", ".zip"}:
-        raise TVPlanningAuthorityError("TV font archive 只支持7z/zip")
-    target_name = f"{title} ({year}) [Fonts]{suffix}"
-    return {
-        "schema_version": 1,
-        "scope": "series",
-        "series_key": _canonical_sha256(
-            {"title": title, "year": year}, domain="bar.tv-font-series"
-        ),
-        "entries": [{
-            "source": source,
-            "target_name": target_name,
-            "size": int(value.get("size", 0)),
-            "content_sha256": content_sha256,
-            "content_key": _canonical_sha256(
-                {"size": int(value.get("size", 0)), "sha256": content_sha256},
-                domain="bar.associated-asset-content",
-            ),
-        }],
-    }
+
+
 
 
 class ObservationBlobStore:

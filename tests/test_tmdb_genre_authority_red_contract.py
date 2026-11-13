@@ -33,6 +33,9 @@ from src.rename.provider_search import (
     SOURCE_TMDB_TV,
 )
 from src.rename.rename_plan import ProviderIdentity
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 
 def _load_classifier(case: unittest.TestCase):
@@ -300,62 +303,35 @@ class TMDBGenreObservationAdapterRedContracts(unittest.TestCase):
 
 
 class TMDBGenreTriStateCallSiteRedContracts(unittest.TestCase):
-    def test_auto_batch_and_legacy_tv_movie_never_downgrade_unknown_to_false(self):
+    def test_auto_batch_never_downgrades_unknown_to_false(self):
         info = _conflicting_info()
 
         batch_renamer = object.__new__(Rename)
         batch_result = batch_renamer._task_type_from_provider_batch(
-            _provider_batch(info), is_anime=None
+            _provider_batch(info), is_anime=None, is_movie=False
         )
-        self.assertIsInstance(batch_result, tuple)
-        self.assertIsNone(batch_result[2], "provider batch guessed general-domain False")
+        self.assertIsInstance(batch_result, str)
+        self.assertIn("不能确定", batch_result)
+        self.assertIn("请手动确认作品类型", batch_result)
 
-        tv_renamer = object.__new__(Rename)
-        tv_renamer.search = Mock()
-        tv_renamer._search_title_candidates = Mock(
-            return_value=("本地化作品", dict(info), None)
-        )
-        tv_result = tv_renamer.check_task_type(
-            "legacy-tv", "本地化作品 S01", 2020, Path("episode.mkv"),
-            is_anime=None, is_movie=False,
-        )
-        self.assertIsInstance(tv_result, tuple)
-        self.assertIsNone(tv_result[2], "legacy TV guessed general-domain False")
-
-        movie_info = {
-            **dict(info),
-            "title": info["name"],
-            "release_date": info["first_air_date"],
-        }
-        movie_renamer = object.__new__(Rename)
-        movie_renamer.search = Mock()
-        movie_renamer._search_title_candidates = Mock(
-            return_value=("本地化作品", movie_info, None)
-        )
-        movie_result = movie_renamer.check_task_type(
-            "legacy-movie", "本地化作品", 2020, Path("movie.mkv"),
-            is_anime=None, is_movie=True,
-        )
-        self.assertIsInstance(movie_result, tuple)
-        self.assertIsNone(movie_result[2], "legacy Movie guessed general-domain False")
-
-    def test_explicit_animation_and_general_authority_remain_higher_than_genres(self):
+    def test_direct_tmdb_tv_gate_uses_explicit_library_domain(self):
         info = _conflicting_info()
         renamer = object.__new__(Rename)
-        self.assertIs(
-            True,
-            renamer._task_type_from_provider_batch(
-                _provider_batch(info), is_anime=True
-            )[2],
-        )
-        self.assertIs(
-            False,
-            renamer._task_type_from_provider_batch(
-                _provider_batch(info), is_anime=False
-            )[2],
-        )
+        for explicit_domain in (True, False):
+            result = renamer._task_type_from_provider_batch(
+                _provider_batch(info),
+                is_anime=explicit_domain,
+                is_movie=False,
+            )
+            if explicit_domain:
+                self.assertIsInstance(result, str)
+                self.assertIn('也可手动选择 TMDB', result)
+            else:
+                self.assertIsInstance(result, tuple)
+                self.assertFalse(result[2])
+                self.assertFalse(result[3])
 
-    def test_direct_tmdb_keeps_explicit_domain_and_verified_link_authority(self):
+    def test_legacy_tmdb_tv_does_not_crosswalk_or_bypass_current_content_contract(self):
         def run_case(
             label: str,
             *,
@@ -406,15 +382,18 @@ class TMDBGenreTriStateCallSiteRedContracts(unittest.TestCase):
                         root / "series_catalog",
                     ),
                 ):
-                    renamer._process(
+                    result = renamer._process(
                         source,
                         _is_anime=explicit_is_anime,
                         _is_movie=False,
                         _tuuid=task_id,
                         provider_selection=selection,
                     )
-                    plan = PlanStore(plan_root).load(task_id)
-            return plan, link_lookup
+                self.assertFalse((plan_root / f"{task_id}.json").exists())
+            self.assertIsInstance(result, str)
+            self.assertNotIn("动画剧集的 TMDB 条目仅作元数据参考", result)
+            self.assertIn('冻结的任务来源范围' if explicit_is_anime is True else '请先确认放入动画库还是影视库', result)
+            link_lookup.assert_not_called()
 
         numeric_animation = {
             **_conflicting_info(4242),
@@ -435,42 +414,36 @@ class TMDBGenreTriStateCallSiteRedContracts(unittest.TestCase):
             "verified_provider_link",
         )
 
-        explicit_plan, _ = run_case(
+        run_case(
             "explicit-animation",
             info=numeric_non_animation,
             explicit_is_anime=True,
         )
-        animation_domain_plan, _ = run_case(
+        run_case(
             "domain-animation",
             info=numeric_non_animation,
             selection_domain="animation",
         )
-        general_plan, general_lookup = run_case(
+        run_case(
             "domain-general",
             info=numeric_animation,
             selection_domain="general",
         )
-        linked_plan, _ = run_case(
+        run_case(
             "verified-link",
             info=numeric_non_animation,
             linked_identity=verified_link,
         )
-        unknown_plan, _ = run_case("unknown-conflict", info=conflict)
+        run_case("unknown-conflict", info=conflict)
 
-        self.assertEqual("animation", explicit_plan.work_identity.domain)
-        self.assertEqual("animation", animation_domain_plan.work_identity.domain)
-        self.assertEqual("general", general_plan.work_identity.domain)
-        general_lookup.assert_not_called()
-        self.assertEqual("animation", linked_plan.work_identity.domain)
-        self.assertIn(verified_link, linked_plan.linked_provider_identities)
-        self.assertEqual("unknown", unknown_plan.work_identity.domain)
-
-    def test_six_logical_genre_shapes_share_five_classifier_calls(self):
+    def test_current_paths_share_three_classifier_calls(self):
         source = Path(process_module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
+        from src.rename import automatic_recognition
+        automatic_tree = ast.parse(Path(automatic_recognition.__file__).read_text(encoding='utf-8'))
         classifier_calls = [
             node
-            for node in ast.walk(tree)
+            for module_tree in (tree, automatic_tree) for node in ast.walk(module_tree)
             if isinstance(node, ast.Call)
             and (
                 (
@@ -484,9 +457,9 @@ class TMDBGenreTriStateCallSiteRedContracts(unittest.TestCase):
             )
         ]
         self.assertEqual(
-            5,
+            3,
             len(classifier_calls),
-            "six logical TMDB genre shapes must use five shared classifier calls",
+            "current TMDB paths must use three shared classifier calls",
         )
         observation_function = next(
             node
@@ -572,7 +545,7 @@ class TMDBGenreProductionEntryRedContracts(unittest.IsolatedAsyncioTestCase):
                 )
 
             problems = harness._real_path_problems(result)
-            selection = result.task.get("selection_operation") or {}
+            selection = current_provider_selection_context(result.task)
             if selection.get("state") != "succeeded":
                 problems.append(
                     f"provider selection state is {selection.get('state')!r}"
@@ -583,8 +556,13 @@ class TMDBGenreProductionEntryRedContracts(unittest.IsolatedAsyncioTestCase):
                 primary.namespace,
                 primary.entity_type,
                 primary.provider_id,
-            ) != ("tmdb", "tv", "53918"):
-                problems.append("live-shaped entry did not freeze TMDB TV #53918")
+            ) != ("bangumi", "subject", "41658"):
+                problems.append("live-shaped entry did not freeze Bangumi #41658")
+            if ("tmdb", "tv", "53918") not in {
+                (item.namespace, item.entity_type, item.provider_id)
+                for item in result.plan.linked_provider_identities
+            }:
+                problems.append("live-shaped entry lost TMDB TV #53918 metadata")
             expected_root = root / "library" / "Anime" / "向山进发 (2013)"
             if Path(str(result.plan.metadata.get("canonical_work_root") or "")) != expected_root:
                 problems.append("live-shaped entry did not reach the Chinese canonical root")
@@ -700,7 +678,7 @@ class TMDBGenreProductionEntryRedContracts(unittest.IsolatedAsyncioTestCase):
                     library_root=root / "library",
                 )
 
-        selection = result.task.get("selection_operation") or {}
+        selection = current_provider_selection_context(result.task)
         problems = harness._real_path_problems(result)
         if selection.get("state") != "failed":
             problems.append(

@@ -37,6 +37,10 @@ from src.rename.target_routing import (
     TargetRootSnapshot,
     resolve_target_root,
 )
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+    persist_provider_selection_attempt,
+)
 
 
 def _snapshot(flow_root: Path) -> TargetRootSnapshot:
@@ -140,27 +144,6 @@ def _rebase_target_root(plan, target_root: Path):
     )
 
 
-def _bind_preview_to_snapshot(task: dict, snapshot: TargetRootSnapshot) -> dict:
-    revised = deepcopy(task)
-    operation = revised["selection_operation"]
-    preview = operation["provider_subject_cohort_preview"]
-    request = dict(preview["request"])
-    request.update({
-        "schema_version": 3,
-        "target_root_config_fingerprint": snapshot.fingerprint,
-        "resolved_target_root": str(snapshot.anime_path),
-    })
-    fingerprint = provider_subject_cohort_request_fingerprint(request)
-    preview.update({
-        "schema_version": 3,
-        "request": request,
-        "request_fingerprint": fingerprint,
-        "target_root_config_fingerprint": snapshot.fingerprint,
-        "resolved_target_root": str(snapshot.anime_path),
-    })
-    return revised
-
-
 class RoutingCompletionApiRedContracts(unittest.TestCase):
     def test_complete_inventory_snapshot_is_a_required_keyword(self):
         parameter = inspect.signature(
@@ -256,18 +239,16 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
                 Path(directory), "yama"
             )
             task = c1_fixture._load_task(result)
-            frozen = TargetRootSnapshot.from_dict(task["draft_root_snapshot"])
-            self.assertIsNone(task.get("is_anime"))
+            from src.rename.pending_tv_selection import review_target_snapshot
+            roots, fingerprint = review_target_snapshot(task)
+            frozen = TargetRootSnapshot.from_dict(roots)
             self.assertEqual(snapshot.to_dict(), frozen.to_dict())
             self.assertEqual(
                 snapshot.fingerprint,
-                task.get("draft_root_config_fingerprint"),
+                fingerprint,
             )
             self.assertEqual(4, len(set(frozen.to_dict().values())))
-            self.assertEqual(
-                str(snapshot.bangumi_path),
-                task["draft_suggested_roots"]["tv_episodes"],
-            )
+            self.assertEqual(snapshot.anime_path, resolve_target_root("animation", "tv_episodes", frozen))
             self.assertFalse(result.business_json)
             self.assertTrue(result.source_unchanged)
 
@@ -276,7 +257,7 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
     ) -> list[str]:
         result, snapshot = await _run_auto_boundary_incident(root, work)
         task = c1_fixture._load_task(result)
-        operation = task.get("selection_operation") or {}
+        operation = current_provider_selection_context(task)
         preview = operation.get("provider_subject_cohort_preview") or {}
         request = preview.get("request") or {}
         expected_root = resolve_target_root(
@@ -296,6 +277,8 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
             problems.append(f"{work}: preview fingerprint does not cover routing")
 
         dialog = c1_fixture._boundary_dialog(result, task=task)
+        proof = dialog.task_decision.pending_tv_selection
+        protected = c1_fixture._protected_boundary_files(result)
         capture = c1_fixture.special_fixture._CaptureUi()
         capture.card = capture.column
         notices: list[tuple[str, object]] = []
@@ -313,9 +296,7 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
             _configured_roots(snapshot),
             c1_fixture._boundary_patches(result, notices),
         ):
-            PlanReviewDialog._apply_provider_subject_boundary_inline(
-                dialog, True, revision, evidence, edge
-            )
+            await c1_fixture._dispatch_boundary(dialog)
         completed = PlanStore(result.plans).load(result.task_id)
         metadata = completed.metadata
         canonical = Path(str(metadata.get("canonical_work_root") or ""))
@@ -342,19 +323,13 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
             problems.append(f"{work}: Plan did not persist the preview snapshot")
         if metadata.get("target_root_config_fingerprint") != snapshot.fingerprint:
             problems.append(f"{work}: Plan root fingerprint forked from preview")
-        receipt = metadata.get(
-            "provider_subject_boundary_selection_receipt"
-        ) or {}
-        if receipt.get("schema_version") != 3:
-            problems.append(f"{work}: receipt schema is not routing-aware v3")
-        if receipt.get("target_root_config_fingerprint") != snapshot.fingerprint:
-            problems.append(f"{work}: receipt omitted frozen root fingerprint")
-        if receipt.get("resolved_target_root") != str(expected_root):
-            problems.append(f"{work}: receipt did not bind the Anime root")
-        if receipt.get("request_fingerprint") != preview.get(
-            "request_fingerprint"
-        ):
-            problems.append(f"{work}: preview and receipt routing fingerprints forked")
+        from src.rename.tv_boundary_completion import receipt_fingerprint
+        receipt = metadata.get("tv_boundary_completion_receipt") or {}
+        self.assertEqual(1, receipt.get("schema_version"))
+        self.assertEqual(proof.fingerprint, receipt.get("pending_fingerprint"))
+        self.assertEqual(preview.get("request_fingerprint"), receipt.get("request_fingerprint"))
+        self.assertEqual(64, len(receipt_fingerprint(completed)))
+        self.assertEqual(protected, c1_fixture._protected_boundary_files(result))
         return problems
 
     async def test_yama_cohort_preview_and_plan_route_to_anime(self):
@@ -375,21 +350,15 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result, snapshot = await _run_auto_boundary_incident(root, "yama")
-            task = _bind_preview_to_snapshot(
-                c1_fixture._load_task(result), snapshot
-            )
-            task_path = result.tasks / f"{result.task_id}.json"
-            task_path.write_text(
-                json.dumps(task, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            task = c1_fixture._load_task(result)
             dialog = c1_fixture._boundary_dialog(result, task=task)
-            revision, evidence, edge = c1_fixture._operation_arguments(task)
             before = c1_fixture._authority_bytes(result)
             changed = TargetRootSnapshot.capture({
                 **snapshot.to_dict(),
                 "anime_path": root / "changed-after-preview" / "Anime",
             })
+            from src.rename.initial_movie_completion import RootSnapshotSource
+            dialog.review_service.root_snapshot_source = RootSnapshotSource(lambda: changed)
             notices: list[tuple[str, object]] = []
             with (
                 _configured_roots(changed),
@@ -399,16 +368,14 @@ class RoutingProductionCallbackRedContracts(unittest.IsolatedAsyncioTestCase):
                     root_snapshot=changed.to_dict(),
                 ),
             ):
-                PlanReviewDialog._apply_provider_subject_boundary_inline(
-                    dialog, True, revision, evidence, edge
-                )
+                await c1_fixture._dispatch_boundary(dialog)
             self.assertEqual(
                 before,
                 c1_fixture._authority_bytes(result),
                 "a callback frozen under an old root snapshot changed authority",
             )
             self.assertTrue(
-                any("路径配置" in message or "页面内容已经更新" in message
+                any("配置已变化" in message or "刷新" in message
                     for message, _kind in notices),
                 "root drift did not produce a stable operator-visible refresh action",
             )

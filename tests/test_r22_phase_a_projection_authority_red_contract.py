@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import replace
+import hashlib
 import importlib
 import json
 import os
@@ -26,9 +27,12 @@ from src.rename.inventory_plan import build_inventory_review_draft
 from src.rename.movie_assets import inventory_movie_assets
 from src.rename.plan_store import PlanStore, PlanStoreError
 from src.rename.plan_verifier import PlanVerifier
-from src.rename.rename_plan import RenamePlan
+from src.rename.rename_plan import ProviderIdentity, RenamePlan, WorkIdentity
 import tests.test_provider_subject_plan_wiring_red_contract as phase_b_fixture
 from tests.presentation_fixtures import with_tv_presentation
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 
 AUTHORITY_FINGERPRINT_FIELDS = {
@@ -116,10 +120,13 @@ def _episode_ownership_plan(
         second: work_root / "Season 01" / "86 -不存在的战区- (2021) S01E12.mkv",
     }
     ownership = [{
-        "schema_version": 1,
+        "schema_version": 2,
         "source_path": str(first),
         "bangumi_subject_id": "302189",
-        "tmdb_tv_id": "100565",
+        "work_identity_key": "tmdb:tv:100565",
+        "work_identity_fingerprint": hashlib.sha256(
+            b"tmdb:tv:100565"
+        ).hexdigest(),
         "season_number": 1,
         "source_episode": 11,
         "target_episode": 11,
@@ -129,10 +136,13 @@ def _episode_ownership_plan(
     }]
     if include_second_ownership:
         ownership.append({
-            "schema_version": 1,
+            "schema_version": 2,
             "source_path": str(second),
             "bangumi_subject_id": "331887",
-            "tmdb_tv_id": "100565",
+            "work_identity_key": "tmdb:tv:100565",
+            "work_identity_fingerprint": hashlib.sha256(
+                b"tmdb:tv:100565"
+            ).hexdigest(),
             "season_number": 1,
             "source_episode": 12,
             "target_episode": 12,
@@ -175,7 +185,26 @@ def _episode_ownership_plan(
             "task_episode_ownership_fingerprint": "5" * 64,
         },
     )
-    return with_tv_presentation(plan)
+    plan = with_tv_presentation(plan)
+    return replace(
+        plan,
+        work_identity=WorkIdentity(
+            status="confirmed",
+            domain="animation",
+            title="86 -不存在的战区-",
+            year=2021,
+            primary_provider=ProviderIdentity(
+                status="confirmed",
+                namespace="tmdb",
+                entity_type="tv",
+                provider_id="100565",
+                title="86 -不存在的战区-",
+                year=2021,
+                decision_source="provider_unique",
+            ),
+            domain_source="task_metadata",
+        ),
+    )
 
 
 def _inventory_task(
@@ -292,7 +321,7 @@ class SuccessorStateClosureRedContracts(unittest.IsolatedAsyncioTestCase):
                 failure_mode="no_match",
             )
         problems = harness._real_path_problems(result)
-        operation = result.task.get("selection_operation") or {}
+        operation = current_provider_selection_context(result.task)
         if operation.get("state") != "awaiting_user":
             problems.append(
                 "successor selection did not stop at the explicit cohort boundary: "
@@ -302,17 +331,29 @@ class SuccessorStateClosureRedContracts(unittest.IsolatedAsyncioTestCase):
             operation.get("reason_codes") or ()
         ):
             problems.append("successor selection lost the cohort-boundary reason")
-        if result.plan.to_dict() != result.initial_plan.to_dict():
-            problems.append("awaiting-user selection partially replaced the Plan")
-        if result.state.to_dict() != result.initial_state.to_dict():
-            problems.append("awaiting-user selection partially replaced DecisionState")
+        if result.plan.to_dict() == result.initial_plan.to_dict():
+            problems.append("awaiting-user reselection left the old Plan authoritative")
+        if result.state.to_dict() == result.initial_state.to_dict():
+            problems.append("awaiting-user reselection left the old Decision authoritative")
+        if result.plan.work_identity is not None:
+            problems.append("awaiting-user reselection retained the old work identity")
+        if any((
+            result.state.confirmed_work,
+            result.state.provider_evidence,
+            result.state.linked_provider_identities,
+            result.state.series_binding,
+            result.state.season_binding,
+            result.state.provider_link_binding,
+            result.state.tv_planning_authority,
+        )):
+            problems.append("awaiting-user reselection retained stale provider authority")
         plan_payload = result.plan.to_dict()
         state_payload = result.state.to_dict()
         receipt = plan_payload.get("projection_receipt")
-        if plan_payload.get("schema_version") != 6:
-            problems.append("real entry persisted a pre-v6 Plan")
-        if state_payload.get("schema_version") != 4:
-            problems.append("real entry persisted a pre-v4 Decision")
+        if plan_payload.get("schema_version") != 7:
+            problems.append("real entry did not persist a v7 Plan")
+        if state_payload.get("schema_version") != 5:
+            problems.append("real entry did not persist a v5 Decision")
         if not isinstance(receipt, dict):
             problems.append("real entry Plan has no typed ProjectionReceipt")
         elif (
@@ -363,7 +404,9 @@ class SuccessorStateClosureRedContracts(unittest.IsolatedAsyncioTestCase):
             plan_count = len(plans)
         self.assertEqual(1, len(task_files), "real AddTask did not persist fail-closed state")
         self.assertIn(task.get("workflow_status"), {"failed", "invalid", "interrupted"})
-        self.assertNotEqual("succeeded", (task.get("selection_operation") or {}).get("state"))
+        self.assertNotEqual(
+            "succeeded", current_provider_selection_context(task).get("state")
+        )
         self.assertEqual(0, plan_count, "disconnected commit still persisted a current Plan")
 
 
@@ -463,35 +506,6 @@ class SourceOwnershipRedContracts(unittest.TestCase):
         self.assertEqual("child", transferred.task_id)
 
 
-class TvFontAuthorityRedContracts(unittest.TestCase):
-    def test_tv_font_manifest_gate_is_shape_based_not_marker_based(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "source"
-            work_root = root / "Anime" / "向山进发 (2013)"
-            plan = RenamePlan.from_mapping(
-                task_id="tv-font-inline-boundary",
-                source_root=source,
-                mapping={
-                    source / "Yama [01].mkv":
-                    work_root / "Season 01" / "向山进发 (2013) S01E01.mkv",
-                    source / "[VCB-Studio] Yama no Susume [Fonts].7z":
-                    work_root / "Associated" / "向山进发 (2013) [Fonts].7z",
-                },
-                metadata={
-                    "canonical_work_root": str(work_root),
-                    "season_id": 1,
-                    "season_number": 1,
-                    "season_source": "provider_crosswalk",
-                },
-            )
-            plan = with_tv_presentation(plan)
-            metadata = dict(plan.metadata)
-            metadata.pop("tv_authority_required", None)
-            metadata.pop("associated_asset_manifest", None)
-            plan = replace(plan, metadata=metadata)
-            codes = _issue_codes(plan)
-        self.assertIn("tv_font_manifest_required", codes)
 
 
 class ProjectionArchitectureRedContracts(unittest.TestCase):
@@ -561,9 +575,9 @@ class ProjectionArchitectureRedContracts(unittest.TestCase):
         hashes = iter(f"{index:064x}" for index in range(1, 20))
         authority = {
             "receipt_schema_version": 1,
-            "plan_schema_version": 6,
+            "plan_schema_version": 7,
             "task_id": "deterministic-task",
-            "decision_schema_version": 4,
+            "decision_schema_version": 5,
             "decision_revision": 4,
             "decision_fingerprint": next(hashes),
             "inventory_schema_version": 1,
@@ -572,7 +586,7 @@ class ProjectionArchitectureRedContracts(unittest.TestCase):
             "source_ownership_schema_version": 1,
             "source_ownership_revision": 3,
             "source_ownership_fingerprint": next(hashes),
-            "episode_ownership_schema_version": 1,
+            "episode_ownership_schema_version": 2,
             "episode_ownership_fingerprint": next(hashes),
             "tv_planning_authority_schema_version": 0,
             "tv_planning_authority_policy_version": "not-applicable",

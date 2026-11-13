@@ -21,11 +21,11 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, Optional
 
 from .decision_state import DecisionState, DecisionStateStore
-from .file_lock import FileLockBusyError, advisory_file_lock
-from .font_archive_contract import is_supported_font_archive
+from .file_lock import FileLockBusyError
+
 from .physical_identity import (
     PhysicalIdentityUnavailable,
-    canonical_location_key,
+    location_key_from_resolved,
     canonical_physical_key,
 )
 from .plan_store import PlanStore
@@ -38,9 +38,16 @@ from .rename_plan import (
     RenamePlan,
     WorkIdentity,
 )
+from .successor_authority import (
+    CohortAuthority,
+    CohortAuthorityDraft,
+    CohortAuthorityStore,
+    SuccessorAuthorityError,
+    successor_authority_root,
+)
 from .tv_planning_authority import TVPlanningAuthority
-from .utils import is_font_archive
 from ..utils.utils import (
+    read_task_at,
     replace_task_record_at_if_sha256,
     restore_task_record_at_if_sha256,
     task_record_serialized_sha256,
@@ -74,7 +81,6 @@ AUTHORITY_FINGERPRINT_FIELDS = frozenset({
     "season_binding_fingerprint",
     "target_routing_fingerprint",
     "naming_policy_fingerprint",
-    "font_policy_fingerprint",
     "subtitle_policy_fingerprint",
     "execution_policy_fingerprint",
     "policy_bundle_version",
@@ -92,6 +98,12 @@ CORRELATION_ONLY_FIELDS = frozenset({
     "season_binding_id",
     "cohort_decision_id",
 })
+
+OPTIONAL_AUTHORITY_FIELDS = frozenset({'generated_outputs_fingerprint', 'tv_boundary_completion_receipt_fingerprint', 'pending_tv_selection_fingerprint', 'initial_source_basis_fingerprint', 'content_policy', 'completed_rebuild_fingerprint', 'asset_operation_fingerprint',
+                                      'current_tv_refresh_fingerprint', 'work_affiliation_fingerprint',
+                                      'initial_movie_selection_result_fingerprint',
+                                      'automatic_recognition_origin_fingerprint', 'automatic_recognition_fingerprint',
+                                      'automatic_search_policy_fingerprint'})
 
 PROJECTION_COMMIT_PHASES = (
     "prepared",
@@ -116,13 +128,13 @@ TV_AUTHORITY_FIELD_RESPONSIBILITY = MappingProxyType({
     "decision_revision": "receipt_fingerprint",
     "observation_refs": "decision_ui_only",
     "work_identity": "decision_ui_only",
+    "metadata_provider_identities": "decision_ui_only",
     "naming_authority": "decision_ui_only",
     "season_assignments": "decision_ui_only",
     "selected_season_number": "typed_plan_transform",
     "episode_range_ownership": "decision_ui_only",
     "file_decisions": "decision_ui_only",
     "non_regular_file_decisions": "decision_ui_only",
-    "associated_asset_manifest": "typed_plan_transform",
     "derived_provenance": "forbidden_from_plan",
 })
 _TV_AUTHORITY_RESPONSIBILITIES = frozenset({
@@ -228,190 +240,12 @@ def _lexical_path_key(path: Path | str) -> str:
     return os.path.normcase(os.path.abspath(os.path.normpath(str(path)))).casefold()
 
 
-def _is_tv_font_plan_entry(entry) -> bool:
-    return is_font_archive(entry.source_path) or (
-        entry.role == "font"
-        and entry.media_kind == "associated"
-        and is_supported_font_archive(entry.source_path)
-    )
 
 
-def _validate_projected_tv_font_manifest(
-    manifest: Mapping[str, object],
-    plan: RenamePlan,
-) -> None:
-    """Validate the typed Plan shape without reading current media state."""
-
-    if manifest.get("schema_version") != 1:
-        raise ProjectionAuthorityError("TV font Plan manifest schema is invalid")
-    rows = manifest.get("assets")
-    if not isinstance(rows, (list, tuple)):
-        raise ProjectionAuthorityError("TV font Plan manifest assets are invalid")
-    metadata = plan.metadata
-    canonical_root = str(metadata.get("canonical_work_root") or "")
-    season_number = metadata.get("season_number")
-    if not canonical_root or not isinstance(season_number, int) or isinstance(
-        season_number, bool
-    ):
-        raise ProjectionAuthorityError(
-            "TV font Plan manifest has no canonical work/season authority"
-        )
-    associated_root = Path(canonical_root) / "Associated"
-    font_entries = {
-        (_lexical_path_key(entry.source_path), _lexical_path_key(entry.target_path)):
-            entry
-        for entry in plan.entries
-        if _is_tv_font_plan_entry(entry)
-    }
-    if len(font_entries) != sum(
-        1 for entry in plan.entries if _is_tv_font_plan_entry(entry)
-    ):
-        raise ProjectionAuthorityError("TV font Plan entries are duplicated")
-    seen = set()
-    for row in rows:
-        if not isinstance(row, Mapping):
-            raise ProjectionAuthorityError("TV font Plan manifest row is invalid")
-        source = Path(str(row.get("source_path") or ""))
-        target = Path(str(row.get("target_path") or ""))
-        pair = (_lexical_path_key(source), _lexical_path_key(target))
-        size = row.get("source_size")
-        digest = str(row.get("source_sha256") or "").casefold()
-        if (
-            row.get("role") != "fonts"
-            or row.get("scope") != "series"
-            or row.get("season_number") != season_number
-            or not isinstance(size, int)
-            or isinstance(size, bool)
-            or size < 0
-            or _HEX64.fullmatch(digest) is None
-            or pair not in font_entries
-            or pair in seen
-            or _lexical_path_key(target.parent)
-            != _lexical_path_key(associated_root)
-        ):
-            raise ProjectionAuthorityError(
-                "TV font Plan manifest does not match canonical Plan entries"
-            )
-        seen.add(pair)
-    if seen != set(font_entries):
-        raise ProjectionAuthorityError(
-            "TV font Plan manifest does not cover every canonical font entry"
-        )
 
 
-def _project_tv_associated_asset_manifest(
-    authority: TVPlanningAuthority,
-    plan: RenamePlan,
-) -> tuple[tuple[PlanEntry, ...], dict[str, object]]:
-    """Transform Decision-owned font identity into the one Plan consumer shape."""
 
-    _assert_tv_authority_responsibility_table()
-    source_manifest = authority.associated_asset_manifest
-    if (
-        not isinstance(source_manifest, Mapping)
-        or source_manifest.get("schema_version") != 1
-        or source_manifest.get("scope") != "series"
-    ):
-        raise ProjectionAuthorityError("TV font authority manifest is invalid")
-    rows = source_manifest.get("entries")
-    if not isinstance(rows, (list, tuple)):
-        raise ProjectionAuthorityError("TV font authority entries are invalid")
-    series_key = str(source_manifest.get("series_key") or "")
-    if rows and not series_key:
-        raise ProjectionAuthorityError("TV font authority series identity is absent")
-    season_number = plan.metadata.get("season_number")
-    if (
-        not isinstance(season_number, int)
-        or isinstance(season_number, bool)
-        or authority.selected_season_number != season_number
-    ):
-        raise ProjectionAuthorityError("TV font authority season identity is stale")
 
-    canonical_root = str(plan.metadata.get("canonical_work_root") or "")
-    if not canonical_root:
-        raise ProjectionAuthorityError("TV font authority has no canonical work root")
-    associated_root = Path(canonical_root) / "Associated"
-    plan_by_source = {}
-    for index, entry in enumerate(plan.entries):
-        source_key = _lexical_path_key(entry.source_path)
-        if source_key in plan_by_source:
-            raise ProjectionAuthorityError("TV Plan source identity is duplicated")
-        plan_by_source[source_key] = (index, entry)
-
-    projected_rows = []
-    seen_sources = set()
-    canonical_entries = list(plan.entries)
-    for row in rows:
-        if not isinstance(row, Mapping):
-            raise ProjectionAuthorityError("TV font authority row is invalid")
-        source = Path(str(row.get("source") or ""))
-        target_name = str(row.get("target_name") or "")
-        size = row.get("size")
-        digest = str(row.get("content_sha256") or "").casefold()
-        content_key = str(row.get("content_key") or "").casefold()
-        source_key = _lexical_path_key(source)
-        indexed_entry = plan_by_source.get(source_key)
-        index, entry = indexed_entry if indexed_entry is not None else (-1, None)
-        if (
-            not str(source)
-            or not target_name
-            or Path(target_name).name != target_name
-            or "/" in target_name
-            or "\\" in target_name
-            or not isinstance(size, int)
-            or isinstance(size, bool)
-            or size < 0
-            or _HEX64.fullmatch(digest) is None
-            or _HEX64.fullmatch(content_key) is None
-            or entry is None
-            or source_key in seen_sources
-            or entry.media_kind != "associated"
-            or not is_supported_font_archive(entry.source_path)
-            or _lexical_path_key(entry.target_path.parent)
-            != _lexical_path_key(associated_root)
-        ):
-            raise ProjectionAuthorityError(
-                "TV font authority does not match canonical Plan entries"
-            )
-        seen_sources.add(source_key)
-        canonical_entry = replace(
-            entry,
-            target_path=associated_root / target_name,
-            media_kind="associated",
-            role="font",
-        )
-        canonical_entries[index] = canonical_entry
-        projected_rows.append({
-            "role": "fonts",
-            "scope": "series",
-            "season_number": season_number,
-            "source_path": str(canonical_entry.source_path),
-            "target_path": str(canonical_entry.target_path),
-            "source_size": size,
-            "source_sha256": digest,
-        })
-    unowned_fonts = {
-        _lexical_path_key(entry.source_path)
-        for entry in plan.entries
-        if _is_tv_font_plan_entry(entry)
-    } - seen_sources
-    if unowned_fonts:
-        raise ProjectionAuthorityError(
-            "TV font authority does not cover every canonical font entry"
-        )
-    manifest = {
-        "schema_version": 1,
-        "assets": sorted(
-            projected_rows,
-            key=lambda row: (
-                _lexical_path_key(row["source_path"]),
-                _lexical_path_key(row["target_path"]),
-            ),
-        ),
-    }
-    canonical_plan = replace(plan, entries=tuple(canonical_entries))
-    _validate_projected_tv_font_manifest(manifest, canonical_plan)
-    return tuple(canonical_entries), manifest
 
 
 def _without_correlation(value: object) -> object:
@@ -431,7 +265,7 @@ def canonical_authority_fingerprint(authority: Mapping[str, object]) -> str:
 
     if not isinstance(authority, Mapping):
         raise ProjectionAuthorityError("projection authority must be an object")
-    unknown = set(authority) - AUTHORITY_FINGERPRINT_FIELDS - CORRELATION_ONLY_FIELDS
+    unknown = set(authority) - AUTHORITY_FINGERPRINT_FIELDS - OPTIONAL_AUTHORITY_FIELDS - CORRELATION_ONLY_FIELDS
     missing = AUTHORITY_FINGERPRINT_FIELDS - set(authority)
     if unknown or missing:
         raise ProjectionAuthorityError(
@@ -440,7 +274,7 @@ def canonical_authority_fingerprint(authority: Mapping[str, object]) -> str:
         )
     frozen = {
         field: _without_correlation(authority[field])
-        for field in sorted(AUTHORITY_FINGERPRINT_FIELDS)
+        for field in sorted(AUTHORITY_FINGERPRINT_FIELDS | (OPTIONAL_AUTHORITY_FIELDS & set(authority)))
     }
     return _fingerprint(frozen, domain="bar.projection-authority")
 
@@ -450,7 +284,7 @@ def build_projection_receipt(
 ) -> ProjectionReceipt:
     frozen = {
         field: _without_correlation(authority[field])
-        for field in sorted(AUTHORITY_FINGERPRINT_FIELDS)
+        for field in sorted(AUTHORITY_FINGERPRINT_FIELDS | OPTIONAL_AUTHORITY_FIELDS)
         if field in authority
     }
     fingerprint = canonical_authority_fingerprint(authority)
@@ -471,21 +305,24 @@ def validate_projection_receipt(receipt: ProjectionReceipt) -> None:
 class TaskEpisodeOwnership:
     source_path: Path
     bangumi_subject_id: str
-    tmdb_tv_id: str
+    work_identity_key: str
+    work_identity_fingerprint: str
     season_number: int
     source_episode: int
     target_episode: int
     range_authority_id: str
     evidence_fingerprint: str
     decision_source: str
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
         if (
-            self.schema_version != 1
+            self.schema_version != 2
             or not self.bangumi_subject_id
-            or not self.tmdb_tv_id
+            or not self.work_identity_key
+            or self.work_identity_fingerprint
+            != hashlib.sha256(self.work_identity_key.encode("utf-8")).hexdigest()
             or self.season_number < 0
             or self.source_episode < 1
             or self.target_episode < 1
@@ -500,7 +337,8 @@ class TaskEpisodeOwnership:
             "schema_version": self.schema_version,
             "source_path": str(self.source_path),
             "bangumi_subject_id": self.bangumi_subject_id,
-            "tmdb_tv_id": self.tmdb_tv_id,
+            "work_identity_key": self.work_identity_key,
+            "work_identity_fingerprint": self.work_identity_fingerprint,
             "season_number": self.season_number,
             "source_episode": self.source_episode,
             "target_episode": self.target_episode,
@@ -511,17 +349,31 @@ class TaskEpisodeOwnership:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "TaskEpisodeOwnership":
+        version = int(value.get("schema_version", 0))
+        if version == 1:
+            tmdb_tv_id = str(value.get("tmdb_tv_id") or "")
+            work_identity_key = f"tmdb:tv:{tmdb_tv_id}" if tmdb_tv_id else ""
+            work_identity_fingerprint = (
+                hashlib.sha256(work_identity_key.encode("utf-8")).hexdigest()
+                if work_identity_key else ""
+            )
+        else:
+            work_identity_key = str(value.get("work_identity_key") or "")
+            work_identity_fingerprint = str(
+                value.get("work_identity_fingerprint") or ""
+            )
         return cls(
             source_path=Path(str(value.get("source_path") or "")),
             bangumi_subject_id=str(value.get("bangumi_subject_id") or ""),
-            tmdb_tv_id=str(value.get("tmdb_tv_id") or ""),
+            work_identity_key=work_identity_key,
+            work_identity_fingerprint=work_identity_fingerprint,
             season_number=int(value.get("season_number", -1)),
             source_episode=int(value.get("source_episode", 0)),
             target_episode=int(value.get("target_episode", 0)),
             range_authority_id=str(value.get("range_authority_id") or ""),
             evidence_fingerprint=str(value.get("evidence_fingerprint") or ""),
             decision_source=str(value.get("decision_source") or ""),
-            schema_version=int(value.get("schema_version", 0)),
+            schema_version=2,
         )
 
 
@@ -547,7 +399,7 @@ class SourceIdentity:
             raise ProjectionAuthorityError("source physical identity/inode 不可用") from exc
         return cls(
             source_path=source,
-            location_key=canonical_location_key(source),
+            location_key=location_key_from_resolved(source),
             physical_key=physical_key,
             size=stat_result.st_size,
             mtime_ns=stat_result.st_mtime_ns,
@@ -629,6 +481,14 @@ class SourceOwnershipStore:
     def __init__(self, root: Path):
         self.root = Path(root)
 
+    def _lock_resource(self):
+        from .file_lock import LockResource
+        return LockResource(self, self.root / '.ownership.lock', 'source_ownership')
+
+    def _mutation_lock(self, *, owner=None):
+        from .file_lock import serialized_resource_guard
+        return serialized_resource_guard(self._lock_resource(), owner=owner)
+
     def _path(self, task_id: str) -> Path:
         if re.fullmatch(r"[A-Za-z0-9._-]+", task_id) is None:
             raise ProjectionAuthorityError("unsafe source ownership task id")
@@ -656,8 +516,7 @@ class SourceOwnershipStore:
     ) -> SourceOwnershipRecord:
         rows = tuple(identities)
         self.root.mkdir(parents=True, exist_ok=True)
-        with advisory_file_lock(
-            self.root / ".ownership.lock",
+        with self._mutation_lock(
             owner={"kind": "source_ownership", "task_id": task_id},
         ):
             existing = self.load_optional(task_id)
@@ -675,22 +534,8 @@ class SourceOwnershipStore:
                     raise SourceOwnershipConflict(
                         "task revision already owns a different source set"
                     )
-            location_keys = {item.location_key for item in rows}
-            physical_keys = {item.physical_key for item in rows}
-            for path in self.root.glob("*.json"):
-                if path.stem == task_id:
-                    continue
-                other = self.load_optional(path.stem)
-                if other is None or other.state != "active":
-                    continue
-                if location_keys.intersection(
-                    item.location_key for item in other.identities
-                ) or physical_keys.intersection(
-                    item.physical_key for item in other.identities
-                ):
-                    raise SourceOwnershipConflict(
-                        f"source is already owned by task {other.task_id}"
-                    )
+            if type(self.observe_conflicts((task_id,), rows)) is not tuple:
+                raise SourceOwnershipConflict('source ownership conflict check disconnected')
             record = SourceOwnershipRecord(
                 task_id=task_id,
                 revision=(existing.revision + 1 if existing is not None else 0),
@@ -700,6 +545,27 @@ class SourceOwnershipStore:
             )
             self._write(record)
             return record
+
+    def observe_conflicts(self, excluded_task_ids, identities):
+        """One read-only location/physical conflict check for all claim paths."""
+        excluded = frozenset(excluded_task_ids)
+        for identifier in excluded:
+            self._path(identifier)
+        rows = tuple(identities)
+        location_keys = {item.location_key for item in rows}
+        physical_keys = {item.physical_key for item in rows}
+        observed = []
+        for path in self.root.glob('*.json'):
+            if path.stem in excluded:
+                continue
+            other = self.load_optional(path.stem)
+            if other is None:
+                continue
+            observed.append(other)
+            if other.state == 'active' and (location_keys.intersection(item.location_key for item in other.identities)
+                    or physical_keys.intersection(item.physical_key for item in other.identities)):
+                raise SourceOwnershipConflict(f'source is already owned by task {other.task_id}')
+        return tuple(observed)
 
     def preview_claim(
         self,
@@ -728,6 +594,19 @@ class SourceOwnershipStore:
             identities=rows,
         )
 
+    def partition(
+        self,
+        *,
+        parent_task_id: str,
+        expected_parent_fingerprint: str,
+        child_task_id: str,
+        selected_location_keys: Iterable[str],
+        partition_fingerprint: str,
+        parent_inventory_fingerprint: str,
+    ) -> tuple[SourceOwnershipRecord, SourceOwnershipRecord]:
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise ProjectionAuthorityError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
+
     def restore_exact(
         self,
         current: SourceOwnershipRecord,
@@ -735,8 +614,7 @@ class SourceOwnershipStore:
     ) -> None:
         """Undo one exact ownership revision after the projection fails."""
 
-        with advisory_file_lock(
-            self.root / ".ownership.lock",
+        with self._mutation_lock(
             owner={"kind": "source_ownership_rollback", "task_id": current.task_id},
         ):
             stored = self.load_optional(current.task_id)
@@ -752,8 +630,7 @@ class SourceOwnershipStore:
     def retire(
         self, *, task_id: str, expected_revision: int, reason: str
     ) -> SourceOwnershipRecord:
-        with advisory_file_lock(
-            self.root / ".ownership.lock",
+        with self._mutation_lock(
             owner={"kind": "source_ownership_retire", "task_id": task_id},
         ):
             current = self.load_optional(task_id)
@@ -788,12 +665,46 @@ class SourceOwnershipStore:
 
 
 @dataclass(frozen=True)
+class InventoryReplayGuard:
+    """The observations and prior authority used to prepare a TV retry."""
+
+    decision_fingerprint: str
+    plan_fingerprint: str
+    source_root: Path
+    inventory_fingerprint: str
+    source_identities: tuple[SourceIdentity, ...]
+
+    def validate(self, previous, current, plan, identities):
+        if (previous is None or current is None or plan is None
+                or DecisionStateStore.fingerprint(previous) != self.decision_fingerprint
+                or DecisionStateStore.fingerprint(current) != self.decision_fingerprint
+                or PlanStore.fingerprint(plan) != self.plan_fingerprint):
+            raise ProjectionAuthorityError('重试期间整理选择已变化，请刷新后重试')
+        expected = {replace(i, inventory_fingerprint='') for i in self.source_identities}
+        actual = {replace(i, inventory_fingerprint='') for i in identities}
+        from .movie_assets import inventory_movie_assets
+        if actual != expected or inventory_movie_assets(self.source_root).fingerprint != self.inventory_fingerprint:
+            raise ProjectionAuthorityError('重试期间源文件已变化，请重新核查来源')
+
+
+@dataclass(frozen=True)
 class ProjectionAuthorityEnvelope:
     previous_decision: Optional[DecisionState]
     decision: DecisionState
     draft_plan: RenamePlan
     inventory_fingerprint: str
     episode_ownership: tuple[TaskEpisodeOwnership, ...] = ()
+    cohort_authority: Optional[CohortAuthorityDraft] = None
+    inventory_replay_guard: Optional[InventoryReplayGuard] = None
+    media_archive: Optional[object] = None
+    movie_change: Optional[object] = None
+    initial_movie_selection: Optional[object] = None
+    initial_movie_completion: Optional[object] = None
+    initial_tv_completion: Optional[object] = None
+    pending_tv_selection: Optional[object] = None
+    automatic_recognition: Optional[object] = None
+    content_correction: Optional[object] = None
+    initial_default: Optional[object] = None
 
 
 TaskTerminalBuilder = Callable[
@@ -892,8 +803,19 @@ class RecognitionDecisionInput:
     season_number: Optional[int] = None
     season_source: str = "unset"
     layout_mode: Optional[str] = None
+    # Set only by the fresh observation adapter. Empty string pins no record;
+    # None preserves callers that already use their own current-state guard.
+    expected_previous_fingerprint: Optional[str] = None
+    initial_movie_request: Optional[object] = None
+    automatic_recognition: Optional[object] = None
 
     def candidate(self, previous: Optional[DecisionState]) -> DecisionState:
+        if previous is not None and previous.task_id != self.task_id:
+            raise ProjectionAuthorityError('recognition and Decision task ids differ')
+        if self.expected_previous_fingerprint is not None:
+            actual = DecisionStateStore.fingerprint(previous) if previous is not None else ''
+            if self.expected_previous_fingerprint != actual:
+                raise ProjectionAuthorityError('recognition observation is stale: 当前记录已变化')
         if self.work_identity.status != "confirmed":
             raise ProjectionAuthorityError("recognition work identity is not confirmed")
         primary = self.work_identity.primary_provider.to_dict()
@@ -918,11 +840,9 @@ class RecognitionDecisionInput:
         if self.season_number is not None and self.season_source not in {
             "unset", "legacy_placeholder"
         }:
-            season_binding = {
-                "season_binding_id": f"season-binding-{uuid.uuid4()}",
-                "season_number": int(self.season_number),
-                "decision_source": self.season_source,
-            }
+            from .season_identity import confirmed_season_binding
+            season_binding = confirmed_season_binding(primary, int(self.season_number),
+                self.season_source, previous=previous)
         base = previous or DecisionState(task_id=self.task_id)
         changes: dict[str, object] = {
             "confirmed_work": self.work_identity.to_dict(),
@@ -938,6 +858,10 @@ class RecognitionDecisionInput:
         }
         if identity_changed:
             changes.update({
+                "movie_version_selection": None,
+                "tv_planning_authority": None,
+                "completed_rebuild_observation": None,
+                "asset_operation": None,
                 "series_binding": None,
                 "manual_role_decisions": {},
                 "provider_special_decisions": {},
@@ -968,6 +892,45 @@ class UnresolvedRecognitionInput:
         return DecisionState(task_id=self.task_id)
 
 
+@dataclass(frozen=True)
+class ProviderReselectionPendingInput:
+    """Typed authority reset for a selection that still needs cohort review."""
+
+    task_id: str
+    expected_revision: int
+
+    def candidate(self, previous: Optional[DecisionState]) -> DecisionState:
+        if (
+            previous is None
+            or previous.task_id != self.task_id
+            or previous.revision != self.expected_revision
+        ):
+            raise ProjectionAuthorityError("provider reselection authority is stale")
+        return replace(
+            previous,
+            movie_version_selection=None,
+            confirmed_work={},
+            provider_evidence=(),
+            linked_provider_identities=(),
+            series_binding=None,
+            season_binding=None,
+            library_domain=None,
+            layout_mode=None,
+            manual_role_decisions={},
+            provider_special_decisions={},
+            catalog_link_intent=None,
+            recovery_state=None,
+            execution_failure=None,
+            provider_link_binding=None,
+            source_episode_projection=None,
+            source_episode_projection_decision=None,
+            provider_subject_boundary_decisions={},
+            tv_planning_authority=None,
+            completed_rebuild_observation=None,
+            asset_operation=None,
+        )
+
+
 class FinalPlanProjector:
     """Pure projection from one typed envelope to an immutable receipted Plan."""
 
@@ -980,6 +943,18 @@ class FinalPlanProjector:
         draft = DecisionStateStore.project_plan(state, envelope.draft_plan)
         episode_rows = tuple(envelope.episode_ownership)
         metadata = dict(draft.metadata)
+        metadata.pop('generated_outputs', None)
+        if metadata.get('asset_operation') is not None and state.asset_operation is None:
+            raise ProjectionAuthorityError('资产操作权威已断开')
+        metadata.pop('asset_operation', None)
+        if state.asset_operation is not None:
+            metadata['asset_operation'] = state.asset_operation.to_dict()
+        if metadata.get('completed_rebuild_observation') is not None and state.completed_rebuild_observation is None:
+            raise ProjectionAuthorityError('重建权威已断开，不能按普通计划重新签发')
+        # Derived authority never survives clearing/replacing its Decision producer.
+        metadata.pop('completed_rebuild_observation', None)
+        if state.completed_rebuild_observation is not None:
+            metadata['completed_rebuild_observation'] = state.completed_rebuild_observation.to_dict()
         if episode_rows:
             metadata["task_episode_ownership"] = [
                 item.to_dict() for item in episode_rows
@@ -999,15 +974,6 @@ class FinalPlanProjector:
         metadata["tv_planning_authority_required"] = (
             state.tv_planning_authority is not None
         )
-        if state.tv_planning_authority is not None:
-            manifest_plan = replace(draft, metadata=metadata)
-            canonical_entries, associated_manifest = (
-                _project_tv_associated_asset_manifest(
-                    state.tv_planning_authority, manifest_plan
-                )
-            )
-            draft = replace(draft, entries=canonical_entries)
-            metadata["associated_asset_manifest"] = associated_manifest
         projected = replace(draft, metadata=metadata, projection_receipt=None)
         entries = [entry.to_dict() for entry in projected.entries]
         authority = {
@@ -1023,7 +989,7 @@ class FinalPlanProjector:
             "source_ownership_schema_version": ownership.schema_version,
             "source_ownership_revision": ownership.revision,
             "source_ownership_fingerprint": ownership.fingerprint,
-            "episode_ownership_schema_version": 1,
+            "episode_ownership_schema_version": 2,
             "episode_ownership_fingerprint": episode_fingerprint,
             **tv_fields,
             "work_identity_fingerprint": _fingerprint(
@@ -1053,10 +1019,6 @@ class FinalPlanProjector:
                 },
                 domain="bar.naming-policy",
             ),
-            "font_policy_fingerprint": _fingerprint(
-                metadata.get("associated_asset_manifest", ()),
-                domain="bar.font-policy",
-            ),
             "subtitle_policy_fingerprint": _fingerprint(
                 [rule.to_dict() for rule in projected.subtitle_override_rules],
                 domain="bar.subtitle-policy",
@@ -1072,6 +1034,34 @@ class FinalPlanProjector:
                 entries, domain="bar.plan-entry-set"
             ),
         }
+        if state.completed_rebuild_observation is not None:
+            authority['completed_rebuild_fingerprint'] = state.completed_rebuild_observation.fingerprint
+        if state.content_policy is not None:
+            authority['content_policy'] = state.content_policy.value
+        from .work_affiliation import authority_fingerprint as affiliation_fingerprint
+        affiliated = affiliation_fingerprint(projected)
+        if affiliated is not None:
+            authority['work_affiliation_fingerprint'] = affiliated
+        if state.initial_source_basis is not None:
+            authority['initial_source_basis_fingerprint'] = state.initial_source_basis.fingerprint
+        if state.pending_tv_selection is not None:
+            authority['pending_tv_selection_fingerprint'] = state.pending_tv_selection.fingerprint
+        from .tv_boundary_completion import receipt_fingerprint
+        boundary_receipt = receipt_fingerprint(projected)
+        if boundary_receipt is not None:
+            authority['tv_boundary_completion_receipt_fingerprint'] = boundary_receipt
+        if state.asset_operation is not None:
+            authority['asset_operation_fingerprint'] = state.asset_operation.fingerprint
+        from .initial_movie_selection import selection_result_fingerprint
+        selection_result = selection_result_fingerprint(projected)
+        if selection_result is not None:
+            authority['initial_movie_selection_result_fingerprint'] = selection_result
+        from .automatic_recognition import metadata_fingerprints
+        authority.update({key: value for key, value in metadata_fingerprints(projected).items() if value is not None})
+        from .current_tv_refresh import marker_fingerprint
+        refresh_fingerprint = marker_fingerprint(projected)
+        if refresh_fingerprint is not None:
+            authority['current_tv_refresh_fingerprint'] = refresh_fingerprint
         receipt = build_projection_receipt(authority)
         metadata["projection_receipt_fingerprint"] = receipt.fingerprint
         return replace(projected, metadata=metadata, projection_receipt=receipt)
@@ -1083,30 +1073,35 @@ class FinalPlanProjector:
         if current.task_id != draft.task_id or current.projection_receipt is None:
             raise ProjectionAuthorityError("revision has no current receipt authority")
         validate_projection_receipt(current.projection_receipt)
+        from .current_tv_refresh import require_marker_inheritance
+        if require_marker_inheritance(current, draft) is not True:
+            raise ProjectionAuthorityError('Plan-only刷新标记继承校验已断开')
+        from .pending_tv_selection import metadata_fingerprint as pending_fingerprint
+        if pending_fingerprint(current) is not None or pending_fingerprint(draft) is not None:
+            raise ProjectionAuthorityError('季度关系待确认期间不能进行Plan-only修订')
+        from .tv_boundary_completion import receipt_fingerprint
+        if receipt_fingerprint(current) != receipt_fingerprint(draft):
+            raise ProjectionAuthorityError('Plan-only修订不能替换季度完成凭据')
+        from .initial_movie_selection import selection_result_fingerprint
+        if selection_result_fingerprint(current) != selection_result_fingerprint(draft):
+            raise ProjectionAuthorityError('Plan-only revision不能替换首次作品选择结果')
+        from .automatic_recognition import metadata_fingerprints
+        if metadata_fingerprints(current) != metadata_fingerprints(draft):
+            raise ProjectionAuthorityError('Plan-only revision不能替换原自动作业或资料观察')
+        if current.metadata.get('content_policy') != draft.metadata.get('content_policy'):
+            raise ProjectionAuthorityError('Plan-only revision不能更换整理策略 policy')
+        if _thaw(current.metadata.get('initial_source_basis')) != _thaw(draft.metadata.get('initial_source_basis')):
+            raise ProjectionAuthorityError('Plan-only revision不能更换来源 basis')
+        from .content_selection import validate_plan_content
+        if _thaw(current.metadata.get('content_selection')) != _thaw(draft.metadata.get('content_selection')):
+            raise ProjectionAuthorityError('Plan-only revision不能更换内容选择')
+        validate_plan_content(draft)
+        if _thaw(current.metadata.get('asset_operation')) != _thaw(draft.metadata.get('asset_operation')):
+            raise ProjectionAuthorityError('Plan-only revision不能更换资产操作')
+        if _thaw(current.metadata.get('completed_rebuild_observation')) != _thaw(draft.metadata.get('completed_rebuild_observation')):
+            raise ProjectionAuthorityError('Plan-only revision cannot replace rebuild authority')
         authority = dict(current.projection_receipt.authority)
         metadata = dict(draft.metadata)
-        current_tv_authority = (
-            int(authority["tv_planning_authority_schema_version"]) > 0
-        )
-        if current_tv_authority:
-            current_manifest = current.metadata.get("associated_asset_manifest")
-            if not isinstance(current_manifest, Mapping):
-                raise ProjectionAuthorityError(
-                    "current TV Plan has no typed associated asset manifest"
-                )
-            draft_manifest = metadata.get("associated_asset_manifest")
-            if (
-                draft_manifest is not None
-                and _thaw(draft_manifest) != _thaw(current_manifest)
-            ):
-                raise ProjectionAuthorityError(
-                    "Plan-only revision cannot replace TV font authority"
-                )
-            metadata["associated_asset_manifest"] = _thaw(current_manifest)
-            _validate_projected_tv_font_manifest(
-                metadata["associated_asset_manifest"],
-                replace(draft, metadata=metadata),
-            )
         authority.update({
             "target_routing_fingerprint": _fingerprint(
                 [str(entry.target_path) for entry in draft.entries],
@@ -1121,10 +1116,6 @@ class FinalPlanProjector:
                     )
                 },
                 domain="bar.naming-policy",
-            ),
-            "font_policy_fingerprint": _fingerprint(
-                metadata.get("associated_asset_manifest", ()),
-                domain="bar.font-policy",
             ),
             "subtitle_policy_fingerprint": _fingerprint(
                 [rule.to_dict() for rule in draft.subtitle_override_rules],
@@ -1155,18 +1146,63 @@ class FinalPlanProjector:
         receipt = build_projection_receipt(authority)
         metadata["projection_authority_required"] = True
         metadata["projection_receipt_fingerprint"] = receipt.fingerprint
-        return replace(draft, metadata=metadata, projection_receipt=receipt)
+        from .generated_outputs import bind_outputs
+        return bind_outputs(replace(draft, metadata=metadata, projection_receipt=receipt),
+                            current.metadata.get('generated_outputs'))
 
 
 def validate_plan_projection_receipt(plan: RenamePlan) -> None:
     """Recompute every Plan-owned receipt field and reject post-signing drift."""
+    from .content_selection import validate_plan_content
+    try:
+        validate_plan_content(plan)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ProjectionAuthorityError(str(exc)) from exc
 
     receipt = plan.projection_receipt
     if receipt is None:
         raise ProjectionAuthorityError("Plan has no ProjectionReceipt")
     validate_projection_receipt(receipt)
     authority = dict(receipt.authority)
+    from .generated_outputs import validate_manifest, FIELD
+    if authority.get(FIELD) != validate_manifest(plan):
+        raise ProjectionAuthorityError('生成文件与投影凭据不一致')
+    from .current_tv_refresh import marker_fingerprint
+    if authority.get('current_tv_refresh_fingerprint') != marker_fingerprint(plan):
+        raise ProjectionAuthorityError('原作品刷新标记与实际投影凭据不一致')
+    from .initial_movie_selection import selection_result_fingerprint
+    if authority.get('initial_movie_selection_result_fingerprint') != selection_result_fingerprint(plan):
+        raise ProjectionAuthorityError('首次作品选择结果与投影凭据不一致')
+    from .automatic_recognition import metadata_fingerprints
+    if any(authority.get(key) != value for key, value in metadata_fingerprints(plan).items()):
+        raise ProjectionAuthorityError('自动作业或资料观察与投影凭据不一致')
+    if authority.get('content_policy') != plan.metadata.get('content_policy'):
+        raise ProjectionAuthorityError('整理策略 policy 与投影凭据不一致')
+    from .work_affiliation import authority_fingerprint as affiliation_fingerprint
+    if authority.get('work_affiliation_fingerprint') != affiliation_fingerprint(plan):
+        raise ProjectionAuthorityError('作品归属决定与投影凭据不一致')
+    raw_basis = plan.metadata.get('initial_source_basis')
+    from .pending_tv_selection import metadata_fingerprint as pending_fingerprint
+    if authority.get('pending_tv_selection_fingerprint') != pending_fingerprint(plan):
+        raise ProjectionAuthorityError('季度待确认依据与投影凭据不一致')
+    from .tv_boundary_completion import receipt_fingerprint
+    if authority.get('tv_boundary_completion_receipt_fingerprint') != receipt_fingerprint(plan):
+        raise ProjectionAuthorityError('季度完成凭据与投影凭据不一致')
+    basis = plan.initial_source_basis if raw_basis is not None else None
+    if authority.get('initial_source_basis_fingerprint') != (basis.fingerprint if basis else None):
+        raise ProjectionAuthorityError('来源 basis 与投影凭据不一致')
     metadata = dict(plan.metadata)
+    from .asset_operation import AssetOperation
+    raw_operation = metadata.get('asset_operation')
+    operation_fp = AssetOperation.from_mapping(raw_operation).fingerprint if raw_operation is not None else None
+    if authority.get('asset_operation_fingerprint') != operation_fp:
+        raise ProjectionAuthorityError('资产操作与投影凭据不一致')
+    from .rebuild_observation import CompletedRebuildObservation
+    raw_rebuild = metadata.get('completed_rebuild_observation')
+    rebuild_fp = (CompletedRebuildObservation.from_mapping(_thaw(raw_rebuild)).fingerprint
+                  if raw_rebuild is not None else None)
+    if authority.get('completed_rebuild_fingerprint') != rebuild_fp:
+        raise ProjectionAuthorityError('重建观察与投影凭据不一致')
     expected = {
         "plan_schema_version": PLAN_SCHEMA_VERSION,
         "task_id": plan.task_id,
@@ -1208,10 +1244,6 @@ def validate_plan_projection_receipt(plan: RenamePlan) -> None:
             },
             domain="bar.naming-policy",
         ),
-        "font_policy_fingerprint": _fingerprint(
-            metadata.get("associated_asset_manifest", ()),
-            domain="bar.font-policy",
-        ),
         "subtitle_policy_fingerprint": _fingerprint(
             [rule.to_dict() for rule in plan.subtitle_override_rules],
             domain="bar.subtitle-policy",
@@ -1228,6 +1260,9 @@ def validate_plan_projection_receipt(plan: RenamePlan) -> None:
             domain="bar.plan-entry-set",
         ),
     }
+    if 'series_binding_snapshot' in metadata:
+        expected['series_binding_fingerprint'] = _fingerprint(
+            _without_correlation(metadata['series_binding_snapshot']), domain='bar.series-binding')
     mismatched = sorted(
         key for key, value in expected.items()
         if authority.get(key) != value
@@ -1247,26 +1282,47 @@ PhaseHook = Callable[[str], None]
 class ProjectionCommitService:
     """Commit Decision, ownership and receipted Plan behind one journal."""
 
+    def reset_recognition(self, manager, prepared):
+        from .recognition_reset import commit
+        return commit(self, manager, prepared)
+
     def __init__(
         self,
         state_store: DecisionStateStore,
         plan_store: PlanStore,
         *,
         ownership_store: Optional[SourceOwnershipStore] = None,
+        cohort_authority_store: Optional[CohortAuthorityStore] = None,
         journal_root: Optional[Path] = None,
         task_root: Optional[Path] = None,
         _phase_hook: Optional[PhaseHook] = None,
+        media_archive_context=None,
+        movie_change_context=None,
+        initial_movie_completion_context=None,
+        initial_tv_completion_context=None,
+        pending_tv_selection_context=None,
     ) -> None:
         self.state_store = state_store
         self.plan_store = plan_store
         self.ownership_store = ownership_store or SourceOwnershipStore(
             plan_store.root.parent / "source_ownership"
         )
+        self.cohort_authority_store = (
+            cohort_authority_store
+            or CohortAuthorityStore(successor_authority_root(state_store.root))
+        )
         self.journal_root = Path(
             journal_root or (plan_store.root.parent / "projection_journal")
         )
         self.task_root = Path(task_root or (plan_store.root.parent / "task"))
         self._phase_hook = _phase_hook
+        self.media_archive_context = media_archive_context
+        self.movie_change_context = movie_change_context
+        self.initial_movie_completion_context = initial_movie_completion_context
+        self.initial_movie_completion_terminal = None
+        self.initial_tv_completion_context = initial_tv_completion_context
+        self.pending_tv_selection_context = pending_tv_selection_context
+        self.initial_tv_completion_terminal = None
 
     def commit(
         self,
@@ -1274,31 +1330,118 @@ class ProjectionCommitService:
         *,
         task_terminal: Optional[TaskTerminalMutation] = None,
     ) -> tuple[DecisionState, RenamePlan]:
-        with self._transaction_lock(envelope.decision.task_id):
-            return self._commit_locked(envelope, task_terminal=task_terminal)
+        from contextlib import nullcontext
+        outer_lock = nullcontext()
+        if any(value is not None for value in (envelope.initial_tv_completion,
+                self.initial_tv_completion_context, envelope.movie_change, self.movie_change_context, envelope.initial_movie_selection)):
+            raise ProjectionAuthorityError('TV、电影修订与首次作品选择必须通过公共命令入口')
+        if envelope.initial_movie_completion is not None or self.initial_movie_completion_context is not None:
+            from .initial_movie_completion import InitialMovieCompletionIntent, InitialMovieCompletionContext
+            if (type(envelope.initial_movie_completion) is not InitialMovieCompletionIntent
+                    or type(self.initial_movie_completion_context) is not InitialMovieCompletionContext
+                    or envelope.initial_movie_completion.task_id != envelope.decision.task_id
+                    or envelope.movie_change is not None or self.movie_change_context is not None
+                    or envelope.initial_movie_selection is not None
+                    or envelope.media_archive is not None or self.media_archive_context is not None):
+                raise ProjectionAuthorityError('首次电影完成缺少双传输或混入其它事务')
+            self.initial_movie_completion_terminal = task_terminal
+            outer_lock = self.initial_movie_completion_context.publication_lock(self, envelope.initial_movie_completion)
+        with outer_lock:
+            with self._transaction_lock(envelope.decision.task_id):
+                return self._commit_locked(envelope, task_terminal=task_terminal)
 
     def _commit_locked(
         self,
         envelope: ProjectionAuthorityEnvelope,
         *,
         task_terminal: Optional[TaskTerminalMutation],
+        partition_decision=None,
     ) -> tuple[DecisionState, RenamePlan]:
+        from .single_subject import require_single_subject_plan
+        require_single_subject_plan(envelope.draft_plan, envelope.decision)
+        if envelope.cohort_authority is not None:
+            raise ProjectionAuthorityError('合包功能已退役，不能发布旧合包决定')
+        if partition_decision is not None:
+            raise ProjectionAuthorityError('旧二分拆卡已停用，请使用“调整计划范围”。')
+        from .content_policy import bind_commit
+        envelope = bind_commit(self, envelope)
         previous = envelope.previous_decision
         expected_revision = previous.revision if previous is not None else -1
-        previous_plan = self._load_optional_plan(envelope.decision.task_id)
+        publication = getattr(self, '_public_revision', None)
+        previous_plan = publication.current if publication is not None else self._load_optional_plan(envelope.decision.task_id)
+        from .current_tv_refresh import validate_envelope as validate_tv_refresh
+        self._current_tv_refresh_request = validate_tv_refresh(self, envelope, previous_plan)
+        from .pending_tv_selection import validate_commit as validate_pending_tv
+        pending_tv_publication = validate_pending_tv(self, envelope, task_terminal)
+        from .tv_boundary_completion import receipt_fingerprint
+        if (previous_plan is not None and (envelope.initial_tv_completion is None
+                or envelope.initial_tv_completion.inputs.mode != 'boundary')
+                and receipt_fingerprint(previous_plan) != receipt_fingerprint(envelope.draft_plan)):
+            raise ProjectionAuthorityError('只有完整季度确认可产生完成凭据，其余事务必须继承')
+        from .automatic_recognition import validate_commit as validate_automatic_commit
+        automatic_publication = validate_automatic_commit(self, envelope, task_terminal)
+        from .content_correction import validate_commit as validate_content_correction
+        correction_result = validate_content_correction(self, envelope, task_terminal)
+        from .initial_movie_selection import selection_result_fingerprint
+        if (envelope.initial_movie_selection is None
+                and selection_result_fingerprint(previous_plan) != selection_result_fingerprint(envelope.draft_plan)):
+            raise ProjectionAuthorityError('仅实际首次作品交接可产生选择结果，普通修订必须原样继承')
+        from .content_choice import validate_commit as validate_content_commit
+        validate_content_commit(self, envelope, automatic_publication=automatic_publication,
+                                correction_result=correction_result, pending_tv_publication=pending_tv_publication, current_plan=previous_plan)
         written: Optional[DecisionState] = None
         ownership: Optional[SourceOwnershipRecord] = None
+        prepared_authority: Optional[CohortAuthority] = None
+        previous_cohort_authority: Optional[CohortAuthority] = None
         previous_ownership = self.ownership_store.load_optional(
             envelope.decision.task_id
         )
         identities = self._freeze_source_identities(
             envelope.draft_plan.expected_sources,
             inventory_fingerprint=envelope.inventory_fingerprint,
+            scope=self._stored_source_scope(envelope.decision.task_id),
         )
+        replay_guard = envelope.inventory_replay_guard
+        if envelope.draft_plan.metadata.get('inventory_retry_guard_required') and replay_guard is None:
+            raise ProjectionAuthorityError('库存重试缺少冻结提交守卫')
+        if replay_guard is not None:
+            replay_guard.validate(previous, self.state_store.load_optional(envelope.decision.task_id),
+                                  previous_plan, identities)
+            metadata = dict(envelope.draft_plan.metadata)
+            metadata.pop('inventory_retry_guard_required', None)
+            envelope = replace(envelope, draft_plan=replace(envelope.draft_plan, metadata=metadata))
+        from .asset_operation import freeze_movie_operation
+        material_plan = (envelope.draft_plan if publication is not None else
+                         DecisionStateStore.project_plan(envelope.decision, envelope.draft_plan))
+        envelope = replace(envelope, decision=freeze_movie_operation(envelope.decision,
+            material_plan, self.plan_store.root.parent))
         prepared_decision = self.state_store.prepare_save(
             envelope.decision,
             expected_revision=expected_revision,
         )
+        if envelope.cohort_authority is not None:
+            try:
+                prepared_authority, previous_cohort_authority = (
+                    self.cohort_authority_store.preview(
+                        envelope.cohort_authority,
+                        prepared_decision,
+                    )
+                )
+            except SuccessorAuthorityError as exc:
+                raise ProjectionAuthorityError(
+                    f"successor authority preparation failed: {exc.reason_code}"
+                ) from exc
+        from .media_archive import archive_required, validate_archive_commit
+        archive = validate_archive_commit(self, envelope, task_terminal)
+        if archive is None and (envelope.media_archive is not None or archive_required(envelope, task_terminal)):
+            raise ProjectionAuthorityError('媒体历史提交校验已断开')
+        if archive is not None:
+            archive.publish(self.media_archive_context)
+            self._checkpoint('media_history_archived')
+            # Archival is observable I/O. Recheck the same shared evidence
+            # before journalling a new epoch, including completed source reentry.
+            if validate_archive_commit(self, envelope, task_terminal) != archive:
+                raise ProjectionAuthorityError('归档后的媒体历史核查已断开或变化')
         self._prepare_journal(
             envelope.decision.task_id,
             authority_input_fingerprint=_fingerprint(
@@ -1308,6 +1451,10 @@ class ProjectionCommitService:
                     "episode_ownership": [
                         item.to_dict() for item in envelope.episode_ownership
                     ],
+                    "cohort_authority": (
+                        envelope.cohort_authority.to_dict()
+                        if envelope.cohort_authority is not None else None
+                    ),
                 },
                 domain="bar.projection-commit-input",
             ),
@@ -1326,6 +1473,8 @@ class ProjectionCommitService:
             previous_decision=previous,
             previous_plan=previous_plan,
             previous_ownership=previous_ownership,
+            previous_cohort_authority=previous_cohort_authority,
+            intended_cohort_authority=prepared_authority,
             task_terminal=task_terminal,
         )
         self._write_journal(
@@ -1335,7 +1484,11 @@ class ProjectionCommitService:
             extra={
                 "current_decision_fingerprint": self.state_store.fingerprint(
                     prepared_decision
-                )
+                ),
+                "current_tv_refresh_request": (self._current_tv_refresh_request.fingerprint
+                    if self._current_tv_refresh_request is not None else None),
+                "current_tv_refresh_parent": (self._current_tv_refresh_request.to_dict()['parent_plan_fingerprint']
+                    if self._current_tv_refresh_request is not None else None),
             },
         )
         try:
@@ -1352,9 +1505,43 @@ class ProjectionCommitService:
                 extra={
                     "current_decision_fingerprint": self.state_store.fingerprint(
                         written
-                    )
+                    ),
+                    **(
+                        {
+                            "current_cohort_authority_id": (
+                                prepared_authority.authority_id
+                            ),
+                            "current_cohort_authority_fingerprint": (
+                                prepared_authority.authority_fingerprint
+                            ),
+                        }
+                        if prepared_authority is not None else {}
+                    ),
                 },
             )
+            if prepared_authority is not None:
+                expected_previous_fingerprint = (
+                    previous_cohort_authority.authority_fingerprint
+                    if previous_cohort_authority is not None else ""
+                )
+                try:
+                    published = self.cohort_authority_store.publish_prepared(
+                        prepared_authority,
+                        expected_previous_fingerprint=(
+                            expected_previous_fingerprint
+                        ),
+                    )
+                except SuccessorAuthorityError as exc:
+                    raise ProjectionAuthorityError(
+                        f"successor authority publish failed: {exc.reason_code}"
+                    ) from exc
+                if (
+                    published.authority_fingerprint
+                    != prepared_authority.authority_fingerprint
+                ):
+                    raise ProjectionAuthorityError(
+                        "successor authority publish fingerprint drifted"
+                    )
             self._checkpoint("decision_written")
             intended_ownership = self.ownership_store.preview_claim(
                 task_id=written.task_id,
@@ -1390,6 +1577,8 @@ class ProjectionCommitService:
             )
             self._checkpoint("ownership_claimed")
             plan = FinalPlanProjector.project(envelope, ownership)
+            from .generated_outputs import seal_outputs
+            plan = seal_outputs(plan)
             self._write_journal(
                 written.task_id,
                 "ownership_claimed",
@@ -1476,6 +1665,17 @@ class ProjectionCommitService:
             )
         return outcomes
 
+    def commit_source_partition_revision(
+        self,
+        decision: DecisionState,
+        draft_plan: RenamePlan,
+        *,
+        before_plan_save: Callable[[RenamePlan], None],
+        partition_decision=None,
+    ) -> tuple[DecisionState, RenamePlan]:
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise ProjectionAuthorityError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
+
     def commit_revision(
         self,
         decision: DecisionState,
@@ -1501,8 +1701,12 @@ class ProjectionCommitService:
         if decision.task_id != draft_plan.task_id:
             raise ProjectionAuthorityError("Decision and Plan task ids differ")
         current = self.state_store.load(decision.task_id)
+        if current.pending_tv_selection is not None:
+            raise ProjectionAuthorityError('季度关系待确认期间不能进行Plan-only修订')
         if self.state_store.fingerprint(current) != self.state_store.fingerprint(decision):
             raise ProjectionAuthorityError("Decision changed before Plan revision")
+        if current.content_policy is not None and current.initial_source_basis is None:
+            raise ProjectionAuthorityError('来源 basis 首次安装需要完整Decision与Plan重新生成')
         previous_plan = None
         try:
             previous_plan = self.plan_store.load(draft_plan.task_id)
@@ -1516,11 +1720,20 @@ class ProjectionCommitService:
             inventory_fingerprint=inventory_fingerprint,
             episode_ownership=_episode_rows_from_plan(draft_plan),
         )
+        from .current_tv_refresh import validate_envelope as validate_tv_refresh
+        self._current_tv_refresh_request = validate_tv_refresh(self, envelope, previous_plan)
+        from .content_choice import validate_commit as validate_content_commit
+        from .content_selection import validate_plan_content
+        from .content_policy import bind_commit
+        envelope = bind_commit(self, envelope)
+        validate_content_commit(self, envelope)
+        validate_plan_content(draft_plan, current)
         ownership = None
         previous_ownership = self.ownership_store.load_optional(decision.task_id)
         identities = self._freeze_source_identities(
             draft_plan.expected_sources,
             inventory_fingerprint=inventory_fingerprint,
+            scope=self._stored_source_scope(decision.task_id),
         )
         self._prepare_journal(
             decision.task_id,
@@ -1549,6 +1762,8 @@ class ProjectionCommitService:
             previous_decision=current,
             previous_plan=previous_plan,
             previous_ownership=previous_ownership,
+            previous_cohort_authority=None,
+            intended_cohort_authority=None,
             task_terminal=task_terminal,
         )
         try:
@@ -1587,6 +1802,8 @@ class ProjectionCommitService:
             )
             self._checkpoint("ownership_claimed")
             projected = FinalPlanProjector.project(envelope, ownership)
+            from .generated_outputs import seal_outputs
+            projected = seal_outputs(projected)
             self._write_journal(
                 decision.task_id,
                 "ownership_claimed",
@@ -1645,12 +1862,30 @@ class ProjectionCommitService:
         if self._phase_hook is not None:
             self._phase_hook(phase)
 
+    def _stored_source_scope(self, task_id):
+        from .task_batch_scope import TaskSourceScope
+        task = read_task_at(self.task_root, task_id)
+        raw = task.get('task_source_scope')
+        scope = TaskSourceScope.from_mapping(raw) if raw is not None else None
+        if scope is not None and scope.task_id != task_id:
+            raise ProjectionAuthorityError('持久来源清单不属于当前任务')
+        return scope
+
     @staticmethod
     def _freeze_source_identities(
         paths: Iterable[Path],
         *,
         inventory_fingerprint: str,
+        scope=None,
     ) -> tuple[SourceIdentity, ...]:
+        if scope is not None:
+            available = {Path(row.source_path): row for row in scope.source_identities}
+            try:
+                return tuple(SourceIdentity(Path(row.source_path), row.location_key, row.physical_key,
+                    row.size, row.mtime_ns, inventory_fingerprint)
+                    for path in paths for row in (available[Path(path)],))
+            except KeyError as exc:
+                raise ProjectionAuthorityError('计划来源越出持久清单') from exc
         identities = []
         for path in paths:
             try:
@@ -1666,19 +1901,27 @@ class ProjectionCommitService:
                 ) from exc
         return tuple(identities)
 
+    def _lock_resource(self, task_id):
+        from .file_lock import LockResource
+        from ..utils.utils import safe_task_path
+        safe_task_path(self.task_root, task_id)
+        return LockResource(self, self.journal_root / f'.{task_id}.projection.lock', f'projection_commit:{task_id}')
+
     @contextmanager
     def _transaction_lock(self, task_id: str):
-        self.journal_root.mkdir(parents=True, exist_ok=True)
-        try:
-            with advisory_file_lock(
-                self.journal_root / f".{task_id}.projection.lock",
-                owner={"kind": "projection_commit", "task_id": task_id},
-            ):
-                yield
-        except FileLockBusyError as exc:
-            raise ProjectionAuthorityError(
-                "projection transaction is already active"
-            ) from exc
+        from contextlib import ExitStack
+        from .file_lock import resource_guard
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(resource_guard(
+                    self._lock_resource(task_id),
+                    owner={"kind": "projection_commit", "task_id": task_id},
+                ))
+            except FileLockBusyError as exc:
+                raise ProjectionAuthorityError(
+                    "projection transaction is already active"
+                ) from exc
+            yield
 
     def _load_optional_plan(self, task_id: str) -> Optional[RenamePlan]:
         path = self.plan_store.path_for(task_id)
@@ -1693,8 +1936,13 @@ class ProjectionCommitService:
         previous_decision: Optional[DecisionState],
         previous_plan: Optional[RenamePlan],
         previous_ownership: Optional[SourceOwnershipRecord],
+        previous_cohort_authority: Optional[CohortAuthority],
+        intended_cohort_authority: Optional[CohortAuthority],
         task_terminal: Optional[TaskTerminalMutation],
     ) -> None:
+        existing = self._read_journal(task_id)
+        if existing and existing.get('status') not in {'completed', 'failed_closed'}:
+            raise ProjectionAuthorityError('projection transaction is pending; 请先解决原事务恢复冲突')
         if task_terminal is not None:
             if task_terminal.task_id != task_id:
                 raise ProjectionAuthorityError("task terminal mutation task id differs")
@@ -1702,6 +1950,10 @@ class ProjectionCommitService:
                 strict=False
             ):
                 raise ProjectionAuthorityError("task terminal mutation root differs")
+            actual_bytes, _task, actual_fingerprint = task_record_snapshot_at(self.task_root, task_id)
+            if (actual_bytes != task_terminal.previous_bytes
+                    or actual_fingerprint != task_terminal.expected_sha256):
+                raise ProjectionAuthorityError('任务在事务首写前已变化，保留后来记录并重新生成计划')
         attempt_id = uuid.uuid4().hex
         backup_root = self.journal_root / "backups"
         backup_path = backup_root / f"{task_id}.{attempt_id}.rollback.json"
@@ -1717,6 +1969,14 @@ class ProjectionCommitService:
             "previous_ownership": (
                 previous_ownership.to_dict()
                 if previous_ownership is not None else None
+            ),
+            "previous_cohort_authority": (
+                previous_cohort_authority.to_dict()
+                if previous_cohort_authority is not None else None
+            ),
+            "intended_cohort_authority_id": (
+                intended_cohort_authority.authority_id
+                if intended_cohort_authority is not None else None
             ),
             "previous_task_bytes_b64": (
                 base64.b64encode(task_terminal.previous_bytes).decode("ascii")
@@ -1768,6 +2028,11 @@ class ProjectionCommitService:
             ) from exc
         if not isinstance(payload, Mapping) or payload.get("task_id") != task_id:
             raise ProjectionAuthorityError("projection rollback payload is invalid")
+
+        # A later task edit must not strand this transaction's published
+        # cross-task authority. Restore only our exact cohort publication first;
+        # a newer legitimate authority is still preserved and stops recovery.
+        self._rollback_cohort_authority(journal, payload)
 
         expected_task = str(journal.get("current_task_sha256") or "")
         if expected_task:
@@ -1888,6 +2153,24 @@ class ProjectionCommitService:
                     "DecisionState changed before projection recovery"
                 )
 
+    def _rollback_cohort_authority(self, journal, payload):
+        previous_raw = payload.get('previous_cohort_authority')
+        previous = CohortAuthority.from_dict(previous_raw) if isinstance(previous_raw, Mapping) else None
+        expected = str(journal.get('current_cohort_authority_fingerprint') or '')
+        authority_id = str(journal.get('current_cohort_authority_id') or payload.get('intended_cohort_authority_id') or '')
+        if not expected:
+            return
+        try:
+            current = self.cohort_authority_store.load_optional(authority_id)
+            actual = current.authority_fingerprint if current is not None else ''
+            before = previous.authority_fingerprint if previous is not None else ''
+            if actual == expected:
+                self.cohort_authority_store.restore_exact(current, previous)
+            elif actual != before:
+                raise ProjectionAuthorityError('successor authority changed before projection recovery')
+        except SuccessorAuthorityError as exc:
+            raise ProjectionAuthorityError('successor authority rollback failed') from exc
+
     def _save_plan(self, plan: RenamePlan) -> None:
         """The sole production call site for the storage primitive."""
 
@@ -1902,6 +2185,18 @@ class ProjectionCommitService:
         if mutation is None:
             return ""
         payload = mutation.render(decision, plan)
+        from .current_tv_refresh import validate_terminal as validate_tv_refresh_terminal
+        validate_tv_refresh_terminal(self, mutation.previous_payload, payload, decision, plan)
+        from .pending_tv_selection import validate_terminal as validate_pending_terminal
+        validate_pending_terminal(mutation.previous_payload, payload, decision, plan)
+        from .tv_boundary_completion import validate_terminal as validate_boundary_terminal
+        validate_boundary_terminal(mutation.previous_payload, payload, decision, plan)
+        if self.initial_tv_completion_context is not None:
+            binding = decision.season_binding or {}
+            if (any(type(payload.get(key)) is not int or payload[key] != binding.get('season_number')
+                    for key in ('season_id', 'season_number'))
+                    or payload.get('season_source') != binding.get('decision_source')):
+                raise ProjectionAuthorityError('TV任务终态季度与本次已裁决季度不一致')
         predicted_sha256 = task_record_serialized_sha256(payload)
         # Persist the intended post-write hash before the CAS.  Recovery can
         # therefore distinguish "write never happened" from "write happened
@@ -2001,6 +2296,15 @@ def _episode_rows_from_plan(plan: RenamePlan) -> tuple[TaskEpisodeOwnership, ...
     )
 
 
+def project_source_partition_revision(
+    decision: DecisionState,
+    draft_plan: RenamePlan,
+    ownership: SourceOwnershipRecord,
+) -> RenamePlan:
+    """Retired pure builder; cannot issue a legacy partition projection."""
+    raise ProjectionAuthorityError('旧二分拆卡已停用，请使用“调整计划范围”。')
+
+
 def commit_projected_plan(
     state_store: DecisionStateStore,
     plan_store: PlanStore,
@@ -2009,6 +2313,18 @@ def commit_projected_plan(
     candidate: DecisionState,
     draft_plan: RenamePlan,
     task_terminal: Optional[TaskTerminalMutation] = None,
+    cohort_authority: Optional[CohortAuthorityDraft] = None,
+    inventory_replay_guard: Optional[InventoryReplayGuard] = None,
+    media_archive=None,
+    media_archive_context=None,
+    initial_movie_selection=None,
+    initial_movie_completion=None,
+    initial_movie_completion_context=None,
+    pending_tv_selection=None,
+    pending_tv_selection_context=None,
+    automatic_recognition=None,
+    content_correction=None,
+    initial_default=None,
 ) -> tuple[DecisionState, RenamePlan]:
     envelope = ProjectionAuthorityEnvelope(
         previous_decision=previous,
@@ -2016,22 +2332,39 @@ def commit_projected_plan(
         draft_plan=draft_plan,
         inventory_fingerprint=inventory_fingerprint_for_plan(draft_plan),
         episode_ownership=_episode_rows_from_plan(draft_plan),
+        cohort_authority=cohort_authority,
+        inventory_replay_guard=inventory_replay_guard,
+        media_archive=media_archive,
+        initial_movie_selection=initial_movie_selection,
+        initial_movie_completion=initial_movie_completion,
+        pending_tv_selection=pending_tv_selection,
+        automatic_recognition=automatic_recognition,
+        content_correction=content_correction,
+        initial_default=initial_default,
     )
     return ProjectionCommitService(
         state_store,
         plan_store,
         task_root=(task_terminal.task_root if task_terminal is not None else None),
+        media_archive_context=media_archive_context,
+        initial_movie_completion_context=initial_movie_completion_context,
+        pending_tv_selection_context=pending_tv_selection_context,
     ).commit(envelope, task_terminal=task_terminal)
 
 
 def commit_recognition_projection(
     state_store: DecisionStateStore,
     plan_store: PlanStore,
-    recognition: RecognitionDecisionInput | UnresolvedRecognitionInput,
+    recognition: (
+        RecognitionDecisionInput
+        | UnresolvedRecognitionInput
+        | ProviderReselectionPendingInput
+    ),
     draft_plan: RenamePlan,
     *,
     state_transform: Optional[Callable[[DecisionState], DecisionState]] = None,
     task_terminal: Optional[TaskTerminalMutation] = None,
+    inventory_replay_guard: Optional[InventoryReplayGuard] = None,
 ) -> tuple[DecisionState, RenamePlan]:
     """Commit explicit recognition authority without deriving it from a Plan."""
 
@@ -2049,6 +2382,26 @@ def commit_recognition_projection(
         previous=previous,
         candidate=candidate,
         draft_plan=draft_plan,
+        task_terminal=task_terminal,
+        inventory_replay_guard=inventory_replay_guard,
+    )
+
+
+def commit_provider_reselection_pending(
+    state_store: DecisionStateStore,
+    plan_store: PlanStore,
+    reselection: ProviderReselectionPendingInput,
+    draft_plan: RenamePlan,
+    *,
+    task_terminal: TaskTerminalMutation,
+) -> tuple[DecisionState, RenamePlan]:
+    """Atomically supersede old work authority with an unresolved fresh Plan."""
+
+    return commit_recognition_projection(
+        state_store,
+        plan_store,
+        reselection,
+        draft_plan,
         task_terminal=task_terminal,
     )
 

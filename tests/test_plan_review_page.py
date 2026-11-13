@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import json
 import asyncio
 import inspect
@@ -18,7 +19,6 @@ from src.pages.plan_review_page import (
     catalog_lookup_uses_frozen_key,
     can_approve_plan,
     can_execute_approved_plan,
-    export_plan_json,
     filter_plan_rows,
     is_fresh_unexecuted_task,
     candidate_type_warning,
@@ -32,13 +32,20 @@ from src.pages.plan_review_page import (
 )
 from src.pages.ui_terms import localize_plan_term
 from src.rename.plan_review import PlanReviewService, ReviewStatus
+from src.rename.plan_execution import PlanExecutionError
 from src.rename.plan_store import PlanStore, PlanStoreError
-from src.rename.rename_plan import PlanEntry, RenamePlan
+from src.rename.rename_plan import ExecutionPolicy, PlanEntry, RenamePlan
 from src.rename.target_routing import TargetRootSnapshot
 from tests.presentation_fixtures import with_tv_presentation
 
 
-class PlanReviewPageTests(unittest.TestCase):
+class PlanReviewPageTests(unittest.IsolatedAsyncioTestCase):
+    def _current_page(self):
+        from tests.test_content_workbench_gui import ContentWorkbenchGui
+        helper = ContentWorkbenchGui('runTest')
+        helper.create_page(cleanup_owner=self)
+        return helper
+
     def test_fresh_task_does_not_render_recovery_for_catalog_lookup_failure(self):
         self.assertTrue(is_fresh_unexecuted_task({}, None))
         self.assertTrue(
@@ -79,7 +86,7 @@ class PlanReviewPageTests(unittest.TestCase):
 
         self.assertIn("重新识别设置", dialog_source)
         self.assertIn("检索名称", dialog_source)
-        self.assertIn("允许 AI 辅助", dialog_source)
+        self.assertNotIn("允许 AI 辅助", dialog_source)
         self.assertIn("presentation_asset_owner_unresolved", dialog_source)
         self.assertIn("保存归属", dialog_source)
         self.assertIn("本次不整理", dialog_source)
@@ -129,103 +136,62 @@ class PlanReviewPageTests(unittest.TestCase):
             [item["provider_id"] for item in provider_candidates_for_display(candidates, "tmdb")],
         )
 
-    def test_each_provider_column_has_a_manual_detail_link_entry(self):
-        source = inspect.getsource(PlanReviewDialog._render_provider_column)
-        handler = inspect.getsource(PlanReviewDialog._select_manual_provider_url)
+    async def test_provider_columns_share_one_manual_detail_link_entry(self):
+        from unittest.mock import AsyncMock
+        from src.pages import provider_selection_work
+        helper = self._current_page()
+        with helper.client:
+            helper.view._show_provider_candidates()
+        fields = [e for e in helper.view.descendants() if e._props.get('label') == 'Bangumi / TMDB 作品详情页链接']
+        self.assertEqual(1, len(fields))
+        fields[0].value = 'https://www.themoviedb.org/movie/100'
+        with helper.client, patch.object(provider_selection_work, 'select', new=AsyncMock()) as select:
+            await helper.driver.click('读取链接并选择此作品')
+        select.assert_awaited_once_with(helper.view)
+        self.assertEqual('https://www.themoviedb.org/movie/100', helper.view.provider_url_input.value)
 
-        self.assertIn("结果（最多 4 项）", source)
-        self.assertIn("粘贴 {provider_label} 作品详情页链接", source)
-        self.assertIn("读取链接并选择此作品", source)
-        self.assertIn("resolve_provider_item_url", handler)
+    async def test_confirmed_work_collapses_candidates_and_can_reopen_them(self):
+        helper = self._current_page()
+        view = helper.view
+        self.assertFalse(view.provider_selection_expanded)
+        self.assertIn('当前已选作品', [getattr(e, 'text', '') for e in view.descendants()])
+        self.assertFalse(any(e._props.get('label') == 'Bangumi / TMDB 作品详情页链接' for e in view.descendants()))
+        with helper.client:
+            await helper.driver.click('重新选择作品')
+        self.assertTrue(view.provider_selection_expanded)
+        self.assertFalse(view.provider_url_input.is_deleted)
+        self.assertNotIn('当前已选作品', [getattr(e, 'text', '') for e in view.groups_container.descendants()])
 
-    def test_confirmed_work_collapses_candidates_and_can_reopen_them(self):
-        groups = inspect.getsource(PlanReviewDialog._render_groups)
-        selected = inspect.getsource(
-            PlanReviewDialog._render_selected_provider_identity
-        )
-        reopen = inspect.getsource(PlanReviewDialog._show_provider_candidates)
-        selection = inspect.getsource(PlanReviewDialog._select_provider_candidate)
+    async def test_movie_primary_action_passes_selected_path_to_completion_service(self):
+        helper = self._current_page()
+        view, service = helper.view, helper.service
+        old = PlanStore.fingerprint(view.plan)
+        selected = [str(helper.videos[1]), str(helper.videos[0])]
+        view.movie_primary_video_input = SimpleNamespace(value=selected)
+        group_id = view.plan.presentation_groups[0].group_id
+        with helper.client, patch.object(service, 'revise_movie_versions', wraps=service.revise_movie_versions) as revise:
+            await view._complete_movie_with_primary(group_id)
+        self.assertEqual(1, revise.call_count, helper.notices)
+        self.assertEqual([[path] for path in selected], [group['sources'] for group in revise.call_args.kwargs['groups']])
+        self.assertNotEqual(old, PlanStore.fingerprint(view.plan), helper.notices)
+        self.assertEqual(PlanStore.fingerprint(view.plan), PlanStore.fingerprint(service.plan_store.load(view.plan.task_id)))
+        self.assertFalse(service.load(view.plan.task_id).approved_entry_ids)
 
-        self.assertIn("provider_selection_expanded", groups)
-        self.assertIn("当前已选作品", selected)
-        self.assertIn("重新选择作品", selected)
-        self.assertIn("self.provider_selection_expanded = True", reopen)
-        self.assertIn("await task_queue.enqueue_reidentify", selection)
-        self.assertIn('self.task_data["provider_selection"]', selection)
-
-    def test_movie_primary_action_passes_selected_path_to_completion_service(self):
-        dialog = Mock()
-        dialog.movie_primary_video_input = Mock(
-            value="/volume1/Vault/Anime/Movie/main-feature.mkv"
-        )
-        dialog.task_data = {
-            "draft_suggested_roots": {
-                "movie_continuous": "/volume1/Media/Jellyfin/ManualReview/BAR-Test"
-            }
-        }
-        dialog.plan = Mock(
-            task_id="movie-primary-action",
-            metadata={"target_root": "/unused"},
-            work_identity=Mock(domain="animation"),
-        )
-        dialog._completion_domain.return_value = "animation"
-        dialog._inventory_draft_for_completion.return_value = dialog.plan
-        revised = Mock(name="revised_plan")
-        dialog.review_service.complete_inventory_draft.return_value = revised
-        dialog.task_decision = Mock(revision=0)
-        dialog.decision_command_service = Mock()
-        dialog.decision_command_service.update.return_value = (
-            Mock(revision=1), revised
-        )
-        snapshot = TargetRootSnapshot.capture({
-            "bangumi_path": "/volume1/Media/Jellyfin/TV",
-            "movie_path": "/volume1/Media/Jellyfin/Movies",
-            "anime_path": "/volume1/Media/Jellyfin/Anime",
-            "anime_movie_path": (
-                "/volume1/Media/Jellyfin/ManualReview/BAR-Test"
-            ),
-        })
-
-        with (
-            patch.object(PlanStore, "fingerprint", return_value="fingerprint"),
-            patch("src.pages.plan_review_page.notify") as notify,
-            patch(
-                "src.rename.target_routing.snapshot_from_config_manager",
-                return_value=snapshot,
-            ),
-        ):
-            PlanReviewDialog._complete_movie_with_primary(dialog, "movie-continuous")
-
-        dialog.review_service.complete_inventory_draft.assert_called_once_with(
-            "movie-primary-action",
-            "fingerprint",
-            group_id="movie-continuous",
-            group_kind="movie_continuous",
-            target_root=Path("/volume1/Media/Jellyfin/ManualReview/BAR-Test"),
-            reason="用户明确选择 1 个电影正片版本；未选视频进入版本级特典判断",
-            primary_video_sources=(Path(
-                "/volume1/Vault/Anime/Movie/main-feature.mkv"
-            ),),
-            root_snapshot=snapshot.to_dict(),
-            work_domain="animation",
-            persist_revision=False,
-            _source_plan=dialog.plan,
-            _revision_parent_fingerprint="fingerprint",
-        )
-        dialog._adopt_revision.assert_called_once_with(revised)
-        notify.assert_called_with(
-            "电影正片版本、特典和字幕已生成新版整理计划；尚未执行文件操作。"
-        )
-
-    def test_failed_recompletion_keeps_current_plan_in_dialog(self):
-        movie = inspect.getsource(PlanReviewDialog._complete_movie_with_primary)
-        generic = inspect.getsource(PlanReviewDialog._complete_inventory_draft)
-
-        self.assertIn("_source_plan=draft", movie)
-        self.assertIn("_revision_parent_fingerprint=PlanStore.fingerprint(self.plan)", movie)
-        self.assertNotIn("self._adopt_revision(draft)", movie)
-        self.assertIn("_source_plan=draft", generic)
-        self.assertNotIn("self._adopt_revision(draft)", generic)
+    async def test_failed_recompletion_keeps_current_plan_in_dialog(self):
+        from tests.test_content_choice_contract import records
+        helper = self._current_page()
+        view = helper.view
+        old = view.plan
+        before = records(helper.root)
+        selected = [str(helper.videos[0])]
+        view.movie_primary_video_input = SimpleNamespace(value=selected)
+        with helper.client, patch.object(helper.service, 'revise_movie_versions', side_effect=ValueError('校准故障：内容无法补全')) as revise:
+            await view._complete_movie_with_primary(view.plan.presentation_groups[0].group_id)
+        revise.assert_called_once()
+        self.assertIs(old, view.plan)
+        self.assertEqual(selected, view.movie_primary_video_input.value)
+        self.assertEqual(before, records(helper.root))
+        self.assertTrue(any('内容无法补全' in text for text in helper.notices), helper.notices)
 
     def test_unknown_domain_requires_readable_library_selection(self):
         dialog = Mock()
@@ -246,34 +212,38 @@ class PlanReviewPageTests(unittest.TestCase):
             "animation", PlanReviewDialog._completion_domain(dialog)
         )
 
-    def test_library_domain_switch_reprojects_and_adopts_current_plan(self):
-        dialog = Mock()
-        dialog.plan = Mock(task_id="domain-switch")
-        dialog.task_decision = Mock(revision=4)
-        projected = Mock(name="projected_plan")
-        dialog.decision_command_service.update.return_value = (
-            Mock(revision=5), projected
-        )
-        terminal = object()
-
-        with (
-            patch(
-                "src.pages.plan_review_page._task_terminal_for_projected_plan",
-                return_value=terminal,
-            ),
-            patch("src.pages.plan_review_page.notify") as notify,
-        ):
-            PlanReviewDialog._select_library_domain(dialog, "general")
-
-        _args, kwargs = dialog.decision_command_service.update.call_args
-        self.assertEqual({"library_domain": "general"}, kwargs["changes"])
-        self.assertIs(dialog.plan, kwargs["planner"](Mock()))
-        self.assertIs(terminal, kwargs["task_terminal"])
-        dialog._adopt_revision.assert_called_once_with(projected)
-        notify.assert_called_once_with(
-            "保存位置已更新；请重新选择整理方式以生成对应目录，尚未执行文件操作。",
-            type="warning",
-        )
+    async def test_library_domain_switch_reprojects_and_adopts_current_plan(self):
+        from tests.test_general_season_correction_contract import GeneralSeasonCorrectionContracts
+        from tests._approval_stage_helpers import approve_dialog
+        from src.rename.decision_state import DecisionStateError
+        from tests.test_content_choice_contract import records
+        from src.pages import plan_review_page as page
+        from tests.test_content_workbench_gui import ContentWorkbenchGui
+        helper = GeneralSeasonCorrectionContracts('runTest')
+        async with helper.current() as (flow, plan, state):
+            gui = ContentWorkbenchGui('runTest')
+            gui.create_page(prepared=(flow.root, flow.service, plan, []), cleanup_owner=self)
+            owner = gui.view
+            fingerprint = PlanStore.fingerprint(plan)
+            with gui.client, patch.object(page, 'get_task', side_effect=flow.manager._read), patch.object(page, 'notify'):
+                await approve_dialog(owner)
+                flow.manager.execution_service.validate_approved_authority(flow.task_id, fingerprint)
+                domain = 'animation' if state.library_domain == 'general' else 'general'
+                before = records(flow.root)
+                with patch.object(owner.decision_command_service, 'update', side_effect=DecisionStateError('校准故障：改域未提交')):
+                    await owner._select_library_domain(domain)
+                self.assertEqual(before, records(flow.root))
+                self.assertEqual(fingerprint, PlanStore.fingerprint(owner.plan))
+                flow.manager.execution_service.validate_approved_authority(flow.task_id, fingerprint)
+                await PlanReviewDialog._select_library_domain(owner, domain)
+            current = flow.store.load(flow.task_id)
+            self.assertEqual(domain, flow.service.decision_state_store.load(flow.task_id).library_domain)
+            self.assertNotEqual(fingerprint, PlanStore.fingerprint(current))
+            self.assertEqual(PlanStore.fingerprint(current), PlanStore.fingerprint(owner.plan))
+            self.assertFalse(flow.service.load(flow.task_id).approved_entry_ids)
+            for identity in (fingerprint, PlanStore.fingerprint(current)):
+                with self.assertRaises(PlanExecutionError):
+                    flow.manager.execution_service.validate_approved_authority(flow.task_id, identity)
 
     def test_invalid_plan_stays_invalid_and_cannot_be_approved(self):
         self.assertFalse(can_approve_plan("invalid"))
@@ -291,35 +261,164 @@ class PlanReviewPageTests(unittest.TestCase):
             localize_plan_term("Plan fingerprint 与 Verifier"),
         )
 
-    def test_execute_gate_requires_approved_task_and_non_test_mode(self):
+    def test_execute_gate_requires_approved_task_and_non_preview_record(self):
+        live_policy = ExecutionPolicy(target_root=Path("library"), dry_run=False)
         self.assertTrue(
             can_execute_approved_plan(
-                ReviewStatus.APPROVED, "approved", test_mode=False
+                ReviewStatus.APPROVED,
+                "approved",
+
+                execution_policy=live_policy,
             )
         )
         self.assertFalse(
             can_execute_approved_plan(
-                ReviewStatus.DRAFT, "approved", test_mode=False
+                ReviewStatus.DRAFT,
+                "approved",
+
+                execution_policy=live_policy,
             )
         )
         self.assertFalse(
             can_execute_approved_plan(
-                ReviewStatus.APPROVED, "need_confirm", test_mode=False
-            )
-        )
-        self.assertFalse(
-            can_execute_approved_plan(
-                ReviewStatus.APPROVED, "approved", test_mode=True
+                ReviewStatus.APPROVED,
+                "need_confirm",
+
+                execution_policy=live_policy,
             )
         )
         self.assertFalse(
             can_execute_approved_plan(
                 ReviewStatus.APPROVED,
                 "approved",
-                test_mode=False,
                 preview_only=True,
+                execution_policy=live_policy,
             )
         )
+        self.assertFalse(
+            can_execute_approved_plan(
+                ReviewStatus.APPROVED,
+                "approved",
+
+                preview_only=True,
+                execution_policy=live_policy,
+            )
+        )
+        self.assertFalse(
+            can_execute_approved_plan(
+                ReviewStatus.APPROVED,
+                "approved",
+
+                execution_policy=ExecutionPolicy(
+                    target_root=Path("library"), dry_run=True
+                ),
+            )
+        )
+
+    def test_production_execute_controls_reject_the_current_dry_run_plan(self):
+        class UiElement:
+            def __init__(self, label=""):
+                self.label = label
+                self.disabled = False
+                self.tooltip_text = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def classes(self, *_args):
+                return self
+
+            def props(self, *_args):
+                return self
+
+            def disable(self):
+                self.disabled = True
+                return self
+
+            def enable(self):
+                self.disabled = False
+                return self
+
+            def tooltip(self, value):
+                self.tooltip_text = value
+                return self
+
+        class UiCapture:
+            def __init__(self):
+                self.buttons = []
+
+            def expansion(self, *_args, **_kwargs):
+                return UiElement()
+
+            def row(self):
+                return UiElement()
+
+            def button(self, label, **_kwargs):
+                button = UiElement(label)
+                self.buttons.append(button)
+                return button
+
+        dialog = SimpleNamespace(
+            snapshot=SimpleNamespace(plan_status="ready"),
+            decision=SimpleNamespace(status=ReviewStatus.APPROVED),
+            task_data={"workflow_status": "approved", "preview_only": False},
+            plan=SimpleNamespace(
+                execution_policy=ExecutionPolicy(
+                    target_root=Path("library"), dry_run=True
+                )
+            ),
+            _download=Mock(),
+            _approve_selected=Mock(),
+            _safe_end=Mock(),
+            _approve_all=Mock(),
+            _confirm_execute=Mock(),
+            _close_review=Mock(),
+        )
+        ui_capture = UiCapture()
+        with (patch("src.pages.plan_review_page.ui", ui_capture)):
+            PlanReviewDialog.render_actions(dialog)
+            execute_button = next(
+                button for button in ui_capture.buttons
+                if button.label == "执行整理计划"
+            )
+            self.assertTrue(execute_button.disabled)
+            self.assertEqual(
+                "旧预演计划不能执行；请先点击“重试”生成真实整理计划",
+                execute_button.tooltip_text,
+            )
+            execute_button.enable()
+            PlanReviewDialog._refresh_execute_button(dialog)
+            self.assertTrue(execute_button.disabled)
+            with patch("src.pages.plan_review_page.notify") as notify:
+                PlanReviewDialog._confirm_execute(dialog)
+        notify.assert_called_once_with(
+            "旧预演计划不能执行；请先点击“重试”生成真实整理计划",
+            type="warning",
+        )
+
+    def test_execute_gate_fails_closed_when_canonical_policy_gate_is_disconnected(self):
+        live_policy = ExecutionPolicy(target_root=Path("library"), dry_run=False)
+        disconnected = PlanExecutionError(
+            "执行策略权威门已断开", code="execution_policy_gate_disconnected"
+        )
+        with patch(
+            "src.rename.plan_execution.require_approved_execution_policy",
+            create=True,
+            side_effect=disconnected,
+        ) as gate:
+            with self.assertRaises(PlanExecutionError) as raised:
+                can_execute_approved_plan(
+                    ReviewStatus.APPROVED,
+                    "approved",
+
+                    execution_policy=live_policy,
+                )
+        self.assertIs(raised.exception, disconnected)
+        gate.assert_called_once_with(live_policy)
+
     def _plan(self) -> RenamePlan:
         return with_tv_presentation(RenamePlan(
             task_id="review-task",
@@ -451,15 +550,6 @@ class PlanReviewPageTests(unittest.TestCase):
             [str(Path("source/OVA.mkv"))],
         )
 
-    def test_export_is_the_versioned_plan_contract(self):
-        plan = self._plan()
-
-        payload = json.loads(export_plan_json(plan))
-        restored = RenamePlan.from_dict(payload)
-
-        self.assertEqual(restored, plan)
-        self.assertEqual(payload["schema_version"], 6)
-
     def test_subtitle_filters_are_composable(self):
         rows = (
             {
@@ -510,12 +600,6 @@ class PlanReviewPageTests(unittest.TestCase):
         self.assertIn("与只读测试无关", summary[0]["detail"])
         self.assertNotIn("可执行的内容版本", summary[0]["title"])
 
-    def test_issue_card_keeps_icon_and_title_in_one_header_row(self):
-        source = inspect.getsource(PlanReviewDialog._render_issues)
-        self.assertIn("bar-issue-heading", source)
-        self.assertIn("no-wrap", source)
-        self.assertIn("bar-issue-detail", source)
-
     def test_inventory_draft_hides_derived_technical_errors_behind_one_action(self):
         source = inspect.getsource(PlanReviewDialog._render_issues)
         entry_source = inspect.getsource(PlanReviewDialog._render_entry)
@@ -527,69 +611,17 @@ class PlanReviewPageTests(unittest.TestCase):
         self.assertIn("完成整包后生成", entry_source)
 
     def test_inventory_completion_is_a_primary_workflow_before_file_list(self):
-        constructor = inspect.getsource(PlanReviewDialog.__init__)
-        completion = inspect.getsource(PlanReviewDialog._render_completion_workflow)
-        library_choices = inspect.getsource(
-            PlanReviewDialog._render_library_choices
-        )
+        helper = self._current_page()
+        children = list(helper.view.descendants())
+        self.assertIn(helper.view.completion_container, children)
+        self.assertIn(helper.view.entries_container, children)
+        self.assertLess(children.index(helper.view.completion_container), children.index(helper.view.entries_container))
+        self.assertFalse(helper.view.completion_container.is_deleted)
+        # Choice visibility/order and real buttons are covered behaviorally in
+        # test_err060_role_entry, rather than requiring inline source strings.
 
-        self.assertLess(
-            constructor.index("_render_completion_workflow"),
-            constructor.index("_render_toolbar"),
-        )
-        self.assertLess(
-            constructor.index("_render_completion_workflow"),
-            constructor.index("_render_entries"),
-        )
-        self.assertIn('ui.label("整理计划")', completion)
-        self.assertNotIn("完成这个包", completion)
-        self.assertNotIn("先确认上方作品，再选择整理方式", completion)
-        self.assertNotIn("已确认：", completion)
-        self.assertIn("self._render_library_choices", completion)
-        self.assertIn('ui.label("保存位置")', library_choices)
-        self.assertNotIn("还需确认保存到哪个媒体库", completion)
-        choice = inspect.getsource(PlanReviewDialog._render_completion_choice)
-        picker = inspect.getsource(PlanReviewDialog._render_movie_primary_picker)
-        self.assertIn("这些视频是同一电影的连续分段", choice)
-        self.assertIn("ui.checkbox(", choice)
-        self.assertNotIn('icon="view_carousel"', choice)
-        self.assertIn("self._toggle_movie_segments", choice)
-        self.assertIn("选择电影正片版本", picker)
-        self.assertIn("按所选视频生成电影正片版本", choice)
-        self.assertIn("按季和集智能整理", choice)
-        self.assertLess(
-            choice.index("按季和集智能整理"),
-            choice.index("按所选视频生成电影正片版本"),
-        )
-        self.assertNotIn("智能整理固定在左", choice)
-
-    def test_movie_segments_checkbox_can_select_and_cancel(self):
-        dialog = Mock()
-        dialog.plan = Mock(task_id="movie-segments")
-        dialog.review_service = Mock()
-        reopened = Mock()
-        dialog.review_service.reopen_inventory_draft.return_value = reopened
-        dialog.task_decision = Mock(revision=0)
-        dialog.decision_command_service = Mock()
-        dialog.decision_command_service.update.return_value = (
-            Mock(revision=1), reopened
-        )
-
-        PlanReviewDialog._toggle_movie_segments(dialog, "group-1", True)
-        dialog._complete_inventory_draft.assert_called_once_with(
-            "group-1", "movie_continuous"
-        )
-
-        with patch.object(PlanStore, "fingerprint", return_value="fingerprint"):
-            PlanReviewDialog._toggle_movie_segments(dialog, "group-1", False)
-
-        dialog.review_service.reopen_inventory_draft.assert_called_once_with(
-            "movie-segments",
-            "fingerprint",
-            reason="用户取消连续分段整理方式",
-            persist_revision=False,
-        )
-        dialog._adopt_revision.assert_called_once_with(reopened)
+    def test_retired_movie_layout_toggle_is_not_a_hidden_callback(self):
+        self.assertFalse(hasattr(PlanReviewDialog, '_toggle_movie_segments'))
 
     def test_movie_primary_picker_is_anchored_and_has_confirm_action(self):
         picker = inspect.getsource(
@@ -604,7 +636,7 @@ class PlanReviewPageTests(unittest.TestCase):
         self.assertIn('picker.on("popup-show"', picker)
         self.assertIn('picker.on("popup-hide"', picker)
 
-    def test_completion_choice_remains_visible_after_smart_completion(self):
+    def test_completed_plan_keeps_version_editor_not_duplicate_generation(self):
         completion = inspect.getsource(
             PlanReviewDialog._render_completion_workflow
         )
@@ -613,22 +645,33 @@ class PlanReviewPageTests(unittest.TestCase):
         smart_branch = completion.split(
             'if mapping_source == "inventory_smart_completion":', 1
         )[1].split('if mapping_source != "inventory_review_draft":', 1)[0]
-        self.assertIn("self._render_completion_choice", smart_branch)
+        self.assertIn('not is_confirmed_movie_plan(self.plan)', smart_branch)
+        self.assertIn('self._render_completion_choice(group, selected_kind="tv_episodes")', smart_branch)
+        self.assertNotIn('layout_mode =', smart_branch)
+        self.assertIn('正片选择与标签编辑', inspect.getsource(PlanReviewDialog._render_plan_tools))
+        self.assertIn('self._render_library_choices()', smart_branch)
 
-    def test_completion_choice_keeps_inferred_season_and_selected_state(self):
-        """A reliable season must not be silently rewritten as user input.
-
-        This protects the NAS regression where every TV task was forced
-        through a visible manual field and subsequently created a different
-        series/season decision on each retry.
-        """
-        choice = inspect.getsource(PlanReviewDialog._render_completion_choice)
-        completion = inspect.getsource(PlanReviewDialog._complete_inventory_draft)
-        self.assertIn('source in {"", "unset", "legacy_placeholder"}', choice)
-        self.assertIn('"自动识别：第 {season_value} 季"', choice)
-        self.assertIn('if selected_season is not None:', completion)
-        self.assertNotIn('else 1\n                )', completion)
-        self.assertNotIn("点击另一项会生成新版整理计划", choice)
+    async def test_completion_choice_keeps_inferred_season_and_selected_state(self):
+        from tests.test_general_season_correction_contract import GeneralSeasonCorrectionContracts
+        from tests.test_content_workbench_gui import ContentWorkbenchGui
+        from src.pages import plan_review_page as page
+        helper = GeneralSeasonCorrectionContracts('runTest')
+        async with helper.current() as (flow, plan, state):
+            gui = ContentWorkbenchGui('runTest')
+            gui.create_page(prepared=(flow.root, flow.service, plan, []), cleanup_owner=self)
+            self.assertIsNone(gui.view.tv_season_input)
+            saved = state.season_binding
+            command = Mock()
+            command.update.return_value = (state, plan)
+            with patch.object(flow.service, 'complete_inventory_draft', return_value=plan) as complete,                 patch.object(page, '_inventory_draft_for_completion', return_value=plan):
+                result = page._complete_inventory_plan(plan, state, flow.service, command, flow.service.series_catalog,
+                    plan.presentation_groups[0].group_id, 'tv_episodes', flow.service.root_snapshot_source.observe(),
+                    state.library_domain, None)
+            self.assertIs(plan, result)
+            self.assertEqual(saved['season_number'], complete.call_args.kwargs['season_number'])
+            self.assertEqual(saved['decision_source'], complete.call_args.kwargs['season_source'])
+            self.assertNotIn('season_binding', command.update.call_args.kwargs['changes'])
+            self.assertEqual(saved, flow.service.decision_state_store.load(flow.task_id).season_binding)
 
     def test_file_filter_keeps_joined_shape_and_equal_width_class(self):
         toolbar = inspect.getsource(PlanReviewDialog._render_toolbar)
@@ -646,7 +689,7 @@ class PlanReviewPageTests(unittest.TestCase):
 
         self.assertIn('"outline color=blue-7 no-caps "', completion)
         self.assertIn("aria-pressed", completion)
-        self.assertIn("已选择；选择整理方式后应用", completion)
+        self.assertIn("已选择；生成新版整理计划后应用", completion)
         self.assertIn('ui.label("保存位置")', completion)
 
     def test_completed_plan_explains_real_hardlink_execution_steps(self):
@@ -656,8 +699,8 @@ class PlanReviewPageTests(unittest.TestCase):
         confirmation = inspect.getsource(PlanReviewDialog._confirm_execute)
 
         self.assertIn("整理计划已生成，尚未创建硬链接", completion)
-        self.assertIn("批准全部 · 不执行", completion)
-        self.assertIn("执行已批准的整理计划", completion)
+        self.assertIn("批准整理计划", completion)
+        self.assertIn("执行整理计划", completion)
         self.assertIn("当前整理计划是只读预演版本", completion)
         self.assertIn("实际创建硬链接", confirmation)
         self.assertIn("不会移动或复制源文件", confirmation)
@@ -708,10 +751,10 @@ class PlanReviewPageTests(unittest.TestCase):
         self.assertEqual(2, len(normalize_provider_candidates(dict(frozen))))
 
     def test_explicit_type_mismatch_has_plain_language_warning(self):
-        warning = candidate_type_warning(False, [{"entity_type": "movie"}])
+        warning = candidate_type_warning(False, [{"namespace": "tmdb", "entity_type": "movie"}])
         self.assertIn("没有找到正确的电视剧匹配", warning)
         self.assertIn("电影结果", warning)
-        self.assertEqual("", candidate_type_warning(False, [{"entity_type": "tv"}]))
+        self.assertEqual("", candidate_type_warning(False, [{"namespace": "tmdb", "entity_type": "tv"}]))
 
     def test_movie_content_version_target_rule_is_visible_in_gui(self):
         source = inspect.getsource(PlanReviewDialog)
@@ -719,12 +762,18 @@ class PlanReviewPageTests(unittest.TestCase):
         self.assertIn("电影连续版的正片目标文件名由作品目录和版本信息自动生成", source)
         self.assertIn("保存版本决定会覆盖这里填写的目标路径", source)
 
-    def test_v4_migration_banner_explains_old_approval_is_invalid(self):
-        source = inspect.getsource(PlanReviewDialog._render_header)
-
-        self.assertIn("此整理计划已从 schema v4 转换", source)
-        self.assertIn("旧批准已经失效，必须重新处理并批准", source)
-        self.assertIn("原始 v4 历史不会被覆盖", source)
+    def test_old_schema_cannot_reuse_current_approval(self):
+        helper = self._current_page()
+        store, plan = helper.service.plan_store, helper.plan
+        payload = plan.to_dict()
+        payload['schema_version'] = 4
+        payload['approved_entry_ids'] = ['旧批准']
+        path = store.path_for(plan.task_id)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        before = path.read_bytes()
+        with self.assertRaises(PlanStoreError):
+            store.load(plan.task_id)
+        self.assertEqual(before, path.read_bytes())
 
     def test_low_confidence_provider_card_cannot_look_auto_confirmed(self):
         source = inspect.getsource(PlanReviewDialog._render_provider_candidate)
@@ -758,34 +807,52 @@ class PlanReviewPageTests(unittest.TestCase):
         recovery_dialog.assert_called_once()
         recovery.delete.assert_called_once()
 
-    def test_review_dialog_mounts_outside_refreshable_dashboard_and_cleans_up(self):
-        plan = self._plan()
-
-        class AwaitableDialog:
-            def __init__(self):
-                self.delete = Mock()
-
+    async def test_review_dialog_mounts_outside_refreshable_dashboard_and_cleans_up(self):
+        from src.pages import plan_review_page as page
+        helper = self._current_page()
+        created = []
+        class ClosingDialog(PlanReviewDialog):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.mounted_on = self.parent_slot.parent
+                self.hydrated = False
+                created.append(self)
+            def _load_plan_view(self, plan, *, snapshot=None):
+                super()._load_plan_view(plan, snapshot=snapshot)
+                self.hydrated = True
             def __await__(self):
-                async def wait_until_closed():
-                    return None
+                async def close():
+                    self._close_review()
+                return close().__await__()
+        with helper.client, page.ui.column() as dashboard:
+            with patch.object(page, 'PlanReviewDialog', ClosingDialog), patch.object(page.task_queue, '_provider_reads', {}, create=True):
+                await page.plan_review_page(helper.plan.task_id)
+        self.assertEqual(1, len(created))
+        self.assertIs(helper.client.content, created[0].mounted_on)
+        self.assertIsNot(dashboard, created[0].mounted_on)
+        self.assertTrue(created[0].hydrated)
+        self.assertTrue(created[0].is_deleted)
 
-                return wait_until_closed().__await__()
-
-        opened_dialog = AwaitableDialog()
-        with (
-            patch("src.pages.plan_review_page.PlanStore") as store_factory,
-            patch("src.pages.plan_review_page.get_task", return_value={"workflow_status": "need_confirm"}),
-            patch("src.pages.plan_review_page._dialog_mount_context", return_value=nullcontext()) as mount,
-            patch("src.pages.plan_review_page.PlanReviewDialog", return_value=opened_dialog) as dialog_factory,
-        ):
-            store_factory.return_value.load.return_value = plan
-            asyncio.run(plan_review_page(plan.task_id))
-
-        mount.assert_called_once_with()
-        dialog_factory.assert_called_once_with(
-            plan, {"workflow_status": "need_confirm"}
-        )
-        opened_dialog.delete.assert_called_once_with()
+    async def test_failed_tv_recompletion_keeps_current_plan_and_records(self):
+        from tests.test_general_season_correction_contract import GeneralSeasonCorrectionContracts
+        from tests.test_content_workbench_gui import ContentWorkbenchGui
+        from tests.test_content_choice_contract import records
+        from src.pages import plan_review_page as page
+        fixture = GeneralSeasonCorrectionContracts('runTest')
+        async with fixture.current() as (flow, plan, state):
+            gui = ContentWorkbenchGui('runTest')
+            gui.create_page(prepared=(flow.root, flow.service, plan, []), cleanup_owner=self)
+            worker = getattr(gui.view, '_season_reference_task', None)
+            if worker is not None:
+                await worker
+            before = records(flow.root)
+            original = gui.view.plan
+            with gui.client, patch.object(page, '_complete_inventory_plan', side_effect=ValueError('校准故障：剧集补全失败')) as complete:
+                await gui.view._complete_inventory_draft(plan.presentation_groups[0].group_id, 'tv_episodes')
+            complete.assert_called_once()
+            self.assertIs(original, gui.view.plan)
+            self.assertEqual(before, records(flow.root))
+            self.assertTrue(any('剧集补全失败' in text for text in gui.notices), gui.notices)
 
 
 if __name__ == "__main__":

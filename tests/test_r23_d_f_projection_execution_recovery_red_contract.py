@@ -1,6 +1,7 @@
 """R23 D/F contracts for projection, execution identity, and recovery."""
 
 from __future__ import annotations
+from tests.queue_fixture import TaskQueueManager as ControlledQueue
 
 import os
 import tempfile
@@ -81,7 +82,7 @@ class ProjectionCompletenessIncidentRedContracts(unittest.TestCase):
             self.assertFalse(plan_store.path_for(plan.task_id).exists())
             self.assertIsNone(service.ownership_store.load_optional(plan.task_id))
 
-    def test_d_ordinary_projected_source_is_revalidated_immediately_before_write(self):
+    def test_d_ordinary_projected_source_drift_cannot_complete(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             draft, source = _plan(root, "ordinary-drift")
@@ -90,10 +91,11 @@ class ProjectionCompletenessIncidentRedContracts(unittest.TestCase):
             replacement = source.with_suffix(".replacement")
             replacement.write_bytes(b"different source identity and content")
             os.replace(replacement, source)
-            with self.assertRaisesRegex(
-                PlanExecutionError, "变化|漂移|identity|物理身份"
-            ):
-                PlanExecutionService._validate_execution_paths(projected)
+            from src.rename.media_file_identity import frozen_sources
+            PlanExecutionService._validate_execution_paths(projected)
+            error=Trans(projected.as_mapping(),projected.task_id,'frozen-identity',mode='hardlink',dry_run=False,record_root=root/'records',source_identities=frozen_sources(projected)).trans_file()
+            self.assertIsNotNone(error)
+            self.assertFalse(any(e.target_path.exists() for e in projected.entries))
 
     def test_control_complete_projection_writes_decision_plan_and_ownership(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,25 +190,14 @@ class ProjectionBlindWindowIncidentRedContracts(unittest.TestCase):
 
 class ExecutionIdentityAndIsolationIncidentRedContracts(unittest.TestCase):
     def test_d_zero_inode_cannot_be_recorded_as_proven_hardlink(self):
-        source = MagicMock(spec=Path)
-        target = MagicMock(spec=Path)
-        source.stat.return_value = SimpleNamespace(
-            st_dev=7, st_ino=0, st_nlink=2, st_size=10
-        )
-        target.stat.return_value = SimpleNamespace(
-            st_dev=7, st_ino=0, st_nlink=2, st_size=10
-        )
-        target.is_symlink.return_value = False
-        target.exists.return_value = True
-        with self.assertRaisesRegex(
-            OSError, "identity|inode|物理身份|unavailable|不可用"
-        ):
-            Trans._verify_result(source, target, "hardlink", {})
+        from src.rename.media_file_identity import MediaFileIdentity
+        with self.assertRaisesRegex(ValueError,'文件系统身份'):
+            MediaFileIdentity(10,7,0)
 
     def test_f_custom_queue_roots_do_not_construct_global_execution_stores(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=root / "tasks",
                 decision_state_root=root / "decisions",
                 recovery_abandon_audit_root=root / "abandon",
@@ -230,10 +221,10 @@ class ExecutionIdentityAndIsolationIncidentRedContracts(unittest.TestCase):
             target = root / "target.mkv"
             source.write_bytes(b"hardlink control")
             os.link(source, target)
-            entry: dict[str, object] = {}
-            Trans._verify_result(source, target, "hardlink", entry)
+            from src.rename.media_file_identity import media_identity,verify_link_target
+            observed = verify_link_target(target,media_identity(source))
             self.assertEqual(source.stat().st_ino, target.stat().st_ino)
-            self.assertGreaterEqual(int(entry["target_link_count"]), 2)
+            self.assertGreaterEqual(observed.st_nlink, 2)
 
 
 if __name__ == "__main__":

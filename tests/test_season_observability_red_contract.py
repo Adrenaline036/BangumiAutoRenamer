@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 import tests.test_r1_real_media_production_red_contract as production_fixture
 from src.rename.process import Rename
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 class SeasonObservabilityRedContracts(unittest.IsolatedAsyncioTestCase):
     _NoopReviewDialog = production_fixture.R1RealQueueWorkerContracts._NoopReviewDialog
@@ -34,6 +37,8 @@ class SeasonObservabilityRedContracts(unittest.IsolatedAsyncioTestCase):
                     source=source,
                     task_id="season-observability-s4",
                     candidate=production_fixture._candidate("290980"),
+                    is_anime=True,
+                    is_movie=False,
                 )
 
         messages = tuple(
@@ -46,8 +51,8 @@ class SeasonObservabilityRedContracts(unittest.IsolatedAsyncioTestCase):
             result.initial_plan.metadata.get("mapping_source"),
         )
         self.assertEqual(
-            "invalid",
-            result.task.get("selection_operation", {}).get(
+            "need_confirm",
+            current_provider_selection_context(result.task).get(
                 "previous_workflow_status"
             ),
         )
@@ -57,20 +62,12 @@ class SeasonObservabilityRedContracts(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all("Season 04" in str(entry.target_path) for entry in result.plan.entries)
         )
-        title_candidate = "[处理任务] 目录标题季号候选：未匹配"
-        heuristic_candidate = "[处理任务] 目录启发式季号候选：1（非最终值）"
-        final_authority = "[处理任务] 最终季号：4；来源：跨站映射"
-        self.assertIn(title_candidate, messages)
-        self.assertIn(heuristic_candidate, messages)
-        final_messages = tuple(
-            message
-            for message in messages
-            if message.startswith("[处理任务] 最终季号：")
-        )
-        self.assertEqual((final_authority,), final_messages)
-        self.assertLess(messages.index(title_candidate), messages.index(heuristic_candidate))
-        self.assertLess(messages.index(heuristic_candidate), messages.index(final_authority))
+        # Current completion consumes frozen season authority; it need not run
+        # or log the retired directory-guessing branch before showing it.
+        self.assertEqual(4, result.state.season_binding['season_number'])
+        self.assertEqual('provider_crosswalk', result.state.season_binding['decision_source'])
         self.assertNotIn("[处理任务] 识别季号：1", messages)
+        self.assertFalse(any(message.startswith("[处理任务] 最终季号：1") for message in messages))
 
     def test_unlinked_low_similarity_control_keeps_existing_season_one(self):
         """The observability fix must not alter legacy directory inference."""

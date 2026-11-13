@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+import json
 from pathlib import Path
 
 from src.rename.decision_state import DecisionState, DecisionStateStore
@@ -78,11 +79,65 @@ def reserve_active_batch_fixture(store, *, batch_id, task_requests):
     return activate_batch_fixture(store, manifest)
 
 
+def task_source_scope_fixture(store: PlanStore, plan: RenamePlan, *, task_root=None):
+    """Admit actual fixture files and persist the task precondition for completion.
+
+    This is component setup, not a production-entry acceptance claim. Existing
+    task fields are preserved, and an existing scope must still describe these
+    files; the helper never fabricates reservation fingerprints.
+    """
+    from src.rename.projection_authority import SourceIdentity
+    from src.rename.task_batch_scope import (
+        BatchTaskSourceRequest, SourceIdentity as BatchSourceIdentity,
+        TaskBatchScopeManifestStore, TaskSourceScope,
+        source_identity_set_fingerprint,
+    )
+    from src.utils.utils import safe_task_path
+
+    identities = tuple(BatchSourceIdentity.from_mapping(
+        SourceIdentity.from_path(Path(path), inventory_fingerprint="fixture").to_dict()
+    ) for path in sorted(plan.expected_sources, key=str))
+    tasks = Path(task_root) if task_root is not None else store.root.parent / "task"
+    task_path = safe_task_path(tasks, plan.task_id)
+    task = json.loads(task_path.read_text("utf-8")) if task_path.exists() else {
+        "uuid": plan.task_id, "path": str(plan.source_root),
+        "workflow_status": "pending_review", "completed_at": None,
+    }
+    if task.get("task_source_scope") is not None:
+        scope = TaskSourceScope.from_mapping(task["task_source_scope"])
+        if (scope.task_id != plan.task_id or scope.media_domain != "tv"
+                or scope.source_identity_set_fingerprint != source_identity_set_fingerprint(identities)):
+            raise ValueError("fixture task source scope no longer matches its actual input files")
+        return scope
+    admission = TaskBatchScopeManifestStore(store.root.parent / "task_batch_scope")
+    manifest = admission.reserve_batch(batch_id="fixture-" + plan.task_id,
+        task_requests=(BatchTaskSourceRequest(task_id=plan.task_id,
+            input_scope=(str(Path(plan.source_root).resolve(strict=True)),),
+            scope_kind="parent_directory", source_identities=identities, media_domain="tv"),))
+    # Some older component tests replace their task JSON after initial setup.
+    # The public reserve operation revalidates the identical request before
+    # reusing its already-active admission; never activate that batch twice.
+    if manifest.state == "reservations_written":
+        manifest = activate_batch_fixture(admission, manifest)
+    elif manifest.state == "tasks_enqueued":
+        manifest = admission.activate_batch(manifest.batch_id, expected_revision=manifest.revision)
+    elif manifest.state != "active":
+        raise ValueError("fixture admission is not active")
+    scope = manifest.task_source_scopes[0]
+    tasks.mkdir(parents=True, exist_ok=True)
+    task.update(task_source_scope=scope.to_dict(), batch_id=manifest.batch_id)
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    return scope
+
+
+
+
 def save_plan_fixture(
     store: PlanStore,
     plan: RenamePlan,
     *,
     state_store: DecisionStateStore | None = None,
+    task_root: Path | None = None,
 ) -> RenamePlan:
     """Persist a fixture through the same typed projector used in production."""
 
@@ -176,6 +231,8 @@ def save_plan_fixture(
         }
     if fixture_changes:
         candidate = replace(candidate, **fixture_changes)
+    if plan.expected_sources:
+        task_source_scope_fixture(store, plan, task_root=task_root)
     _decision, projected = commit_projected_plan(
         state_store,
         store,

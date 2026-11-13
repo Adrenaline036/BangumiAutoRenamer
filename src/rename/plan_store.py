@@ -34,10 +34,8 @@ class PlanStore:
         return self.root / f"{value}.json"
 
     def save(self, plan: RenamePlan) -> Path:
-        if plan.migrated_from_schema is not None:
-            raise PlanStoreError(
-                "Legacy Plan is read-only; generate a current projection"
-            )
+        from .recognition_reset import require_plan_current
+        require_plan_current(self.root.parent, plan)
         if plan.projection_receipt is None:
             raise PlanStoreError(
                 "Current Plan requires a typed ProjectionReceipt"
@@ -68,6 +66,8 @@ class PlanStore:
         self.path_for(task_id).unlink(missing_ok=True)
 
     def restore_current(self, plan: RenamePlan) -> None:
+        from .recognition_reset import require_plan_current
+        require_plan_current(self.root.parent, plan)
         """Restore a previously trusted current pointer after revision failure."""
 
         if plan.projection_receipt is None:
@@ -76,6 +76,8 @@ class PlanStore:
         self._atomic_write(destination, plan.to_dict())
 
     def load(self, task_id: str) -> RenamePlan:
+        from .recognition_reset import require_ready
+        require_ready(self.root.parent, task_id)
         path = self.path_for(task_id)
         return self._load_path(path, str(task_id))
 

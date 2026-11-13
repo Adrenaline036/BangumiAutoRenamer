@@ -6,14 +6,22 @@ from pathlib import Path
 
 from src.rename.series_catalog import SeriesCatalog, SeriesCatalogError
 from src.rename.plan_store import PlanStore
+from src.rename.decision_state import DecisionState, DecisionStateStore
+from src.rename.projection_authority import commit_projected_plan
+from src.rename.series_registration import manual_tv_binding, build_series_registration_authority
+from src.rename.provider_link_resolver import collect_subject_observations, resolve_provider_link
 from src.rename.rename_plan import (
     PresentationGroup, ProviderIdentity, RenamePlan, WorkIdentity,
 )
-from tests.projection_test_support import save_plan_fixture
 
 
 def tmdb_tv(provider_id="100565"):
     return {"namespace": "tmdb", "entity_type": "tv", "provider_id": provider_id}
+
+
+def canonical_series_key(provider):
+    prefix = 'bar:tmdb:tv:' if provider['namespace'] == 'tmdb' else 'bar:bangumi:subject:'
+    return f"series-{uuid.uuid5(uuid.NAMESPACE_URL, prefix + provider['provider_id'])}"
 
 
 def completed_tv_plan(
@@ -39,14 +47,45 @@ def completed_tv_plan(
             "canonical_work_root": str(root / "Anime" / "86 (2021)"),
         },
         work_identity=WorkIdentity(
-            status="confirmed", domain="animation", title=title, year=2021,
+            status="confirmed", domain="general" if provider['namespace'] == 'tmdb' else 'animation', title=title, year=2021,
             primary_provider=identity, domain_source="provider",
         ),
         presentation_groups=(
             PresentationGroup("tv", "tv_episodes", "TV 分集版", None),
         ),
     )
-    return save_plan_fixture(PlanStore(root / "plans"), plan)
+    catalog = SeriesCatalog(root / 'series')
+    if provider['namespace'] == 'tmdb':
+        binding = manual_tv_binding(plan.work_identity, catalog,
+            Path(plan.metadata['canonical_work_root']))
+    else:
+        # A complete synthetic no-match observation is resolved by the actual
+        # Bangumi singleton resolver. No random key or fake materialized mapping.
+        subject_id = provider['provider_id']
+        subjects = [dict(provider, title=title, original_title=title,
+            air_date='2021-01-01', episode_count=12, platform='TV')]
+        observations = collect_subject_observations(selected_subject_id=subject_id,
+            bangumi_subjects=subjects, bangumi_relations=[], max_subjects=1,
+            search_subject=lambda _: {'bangumi_subject_id': subject_id,
+                'policy_version': 'subject-candidate-v1', 'observed_at': '2026-09-06T00:00:00Z',
+                'queries': [{'locale': 'localized', 'query': title, 'year': 2021,
+                    'outcome': 'no_match', 'truncated': False, 'candidates': []}]})
+        resolution = resolve_provider_link(selected_provider=provider, bangumi_subjects=subjects,
+            bangumi_relations=[], subject_observations=observations)
+        authority = build_series_registration_authority(resolution)
+        binding = dict(series_key=authority.series_key,
+            canonical_root=plan.metadata['canonical_work_root'], catalog_revision=0,
+            decision_source='explicit_user', registration_authority=authority.to_dict())
+    if binding['series_key'] != series_key:
+        raise AssertionError('fixture series key must come from the canonical provider authority')
+    state = DecisionState(task_id=task_id, confirmed_work=plan.work_identity.to_dict(),
+        provider_evidence=(identity.to_dict(),), library_domain=plan.work_identity.domain,
+        layout_mode='tv_episodes', series_binding=binding,
+        season_binding={'season_binding_id': plan.metadata['season_binding_id'],
+            'season_number': season, 'decision_source': 'provider'})
+    _, projected = commit_projected_plan(DecisionStateStore(root / 'decision_state'),
+        PlanStore(root / 'plans'), previous=None, candidate=state, draft_plan=plan)
+    return projected
 
 
 class SeriesCatalogTests(unittest.TestCase):
@@ -67,7 +106,7 @@ class SeriesCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             catalog = SeriesCatalog(root / "series")
-            series_key = f"series-{uuid.uuid4()}"
+            series_key = canonical_series_key(tmdb_tv())
             first = catalog.register_completed(
                 completed_tv_plan(
                     root, task_id="season-one", series_key=series_key,
@@ -94,7 +133,7 @@ class SeriesCatalogTests(unittest.TestCase):
             catalog.register_completed(
                 completed_tv_plan(
                     root, task_id="bangumi-one",
-                    series_key=f"series-{uuid.uuid4()}", season=1,
+                    series_key=canonical_series_key({'namespace': 'bangumi', 'provider_id': '1'}), season=1,
                     provider={
                         "namespace": "bangumi", "entity_type": "subject",
                         "provider_id": "1",
@@ -126,7 +165,7 @@ class SeriesCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             catalog = SeriesCatalog(root / "series")
-            series_key = f"series-{uuid.uuid4()}"
+            series_key = canonical_series_key(tmdb_tv())
             plan = completed_tv_plan(
                 root,
                 task_id="season-one",
@@ -178,7 +217,7 @@ class SeriesCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             catalog = SeriesCatalog(root / "series")
-            series_key = f"series-{uuid.uuid4()}"
+            series_key = canonical_series_key(tmdb_tv())
             plan = completed_tv_plan(
                 root,
                 task_id="season-one",

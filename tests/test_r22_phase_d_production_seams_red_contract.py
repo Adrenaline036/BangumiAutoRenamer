@@ -10,9 +10,12 @@ regression test; no expected-failure wrapper remains.
 """
 
 from __future__ import annotations
+from tests.queue_fixture import TaskQueueManager as ControlledQueue
+from tests.source_collection_fixture import collected_identity
 
 import ast
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 import inspect
 import json
@@ -43,6 +46,9 @@ from src.rename.tv_planning_authority import (
     TVPlanningAuthorityError,
 )
 from src.task_queue import TaskQueueManager
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 import tests.test_provider_subject_plan_wiring_red_contract as phase_b_fixture
 import tests.test_r22_fullset_p1_red_contract as fullset_fixture
 import tests.test_r22_revised_c_c0_red_contract as c1_fixture
@@ -165,6 +171,14 @@ def _build_production_authority(
     selected_subject_id: str,
 ):
     subject_ids = tuple(str(row["bangumi_subject_id"]) for row in ranges)
+    # The collector now consumes an explicit current routing draft, not a raw
+    # inventory with no work root or series identity.
+    from src.rename.rename_plan import PresentationGroup
+    work_root = root / "target" / "示例作品 (2021)"
+    plan = replace(plan, metadata={**dict(plan.metadata),
+        "canonical_work_root": str(work_root), "series_key": "series-production-seam",
+        "series_catalog_revision": 0, "season_number": 1},
+        presentation_groups=(PresentationGroup(group_id="tv", kind="tv_episodes", display_name="示例", preferred_version_ref=None),))
     identities = []
     for source in sorted(plan.expected_sources, key=lambda item: str(item).casefold()):
         resolved = Path(source).resolve(strict=True)
@@ -249,14 +263,12 @@ class RelationPreBuilderIncidentRedContracts(unittest.IsolatedAsyncioTestCase):
             dialog = c1_fixture._boundary_dialog(result)
             notices: list[tuple[str, object]] = []
             with c1_fixture._boundary_patches(result, notices):
-                PlanReviewDialog._apply_provider_subject_boundary_inline(
-                    dialog, True, revision, fingerprint, edge
-                )
+                await c1_fixture._dispatch_boundary(dialog)
 
             task = c1_fixture._load_task(result)
             state = DecisionStateStore(result.decisions).load(result.task_id)
             plan = PlanStore(result.plans).load(result.task_id)
-            operation = task.get("selection_operation") or {}
+            operation = current_provider_selection_context(task)
             self.assertEqual("succeeded", operation.get("state"))
             self.assertEqual("need_confirm", task.get("workflow_status"))
             self.assertIsNotNone(state.tv_planning_authority)
@@ -264,17 +276,30 @@ class RelationPreBuilderIncidentRedContracts(unittest.IsolatedAsyncioTestCase):
                 3, state.tv_planning_authority.selected_season_number
             )
             self.assertEqual(
-                "53918",
+                "216310",
                 state.tv_planning_authority.work_identity[
                     "primary_provider"
                 ]["provider_id"],
             )
+            self.assertIn(
+                ("tmdb", "tv", "53918"),
+                {
+                    (
+                        str(item.get("namespace") or ""),
+                        str(item.get("entity_type") or ""),
+                        str(item.get("provider_id") or ""),
+                    )
+                    for item in (
+                        state.tv_planning_authority.metadata_provider_identities
+                    )
+                },
+            )
             self.assertEqual(result.task_id, plan.task_id)
 
     def test_a_public_boundary_no_longer_requires_selected_exact_candidate(self):
-        source = inspect.getsource(
-            PlanReviewDialog._apply_provider_subject_boundary_inline
-        )
+        from src.rename import tv_boundary_completion
+        self.assertFalse(hasattr(PlanReviewDialog, '_apply_provider_subject_boundary_inline'))
+        source = inspect.getsource(tv_boundary_completion.resolve)
         self.assertNotIn("匹配到的电视剧资料不完整", source)
         self.assertNotRegex(
             source,
@@ -402,7 +427,7 @@ class RealAddTaskBatchAdmissionIncidentRedContracts(
                     f"input-{index}".encode("ascii"),
                 ))
 
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=root / "tasks",
                 decision_state_root=root / "decisions",
                 recovery_abandon_audit_root=root / "abandon",
@@ -416,24 +441,20 @@ class RealAddTaskBatchAdmissionIncidentRedContracts(
                 paths=tuple(str(path) for path in paths),
                 selected_paths=tuple(str(path) for path in paths),
                 media_type="anime",
-                use_ai=False,
                 _submitting=False,
                 submit_button=MagicMock(),
                 close=MagicMock(),
             )
             notices: list[str] = []
             try:
-                with (
-                    patch.object(add_task_page, "task_queue", manager),
-                    patch.object(add_task_page, "is_ui_test_mode", return_value=True),
-                    patch.object(
+                with (patch.object(add_task_page, "task_queue", manager),
+patch.object(
                         add_task_page,
                         "notify",
                         side_effect=lambda message, **_kwargs: notices.append(
                             str(message)
                         ),
-                    ),
-                ):
+                    )):
                     await AddTaskDialog._submit(submit)
             finally:
                 await manager.stop()
@@ -544,7 +565,7 @@ class RealAddTaskBatchAdmissionIncidentRedContracts(
             parent = root / "Steins Gate 0"
             child = _write(parent / "23beta.mkv", b"official-special")
             episode = _write(parent / "Episode 01.mkv", b"parent-episode")
-            manager = TaskQueueManager(
+            manager = ControlledQueue(
                 task_root=root / "tasks",
                 decision_state_root=root / "decisions",
                 recovery_abandon_audit_root=root / "abandon",
@@ -552,13 +573,13 @@ class RealAddTaskBatchAdmissionIncidentRedContracts(
                 batch_scope_root=root / "batch_scope",
                 test_mode=True,
             )
-            shared = manager._batch_source_identity(child)
+            shared = collected_identity(child)
             parent_request = review_page.BatchTaskSourceRequest(
                 task_id="parent-task",
                 input_scope=(str(parent),),
                 scope_kind="parent_directory",
                 source_identities=(
-                    manager._batch_source_identity(episode), shared
+                    collected_identity(episode), shared
                 ),
                 media_domain="tv",
             )
@@ -588,102 +609,6 @@ class RealAddTaskBatchAdmissionIncidentRedContracts(
             self.assertEqual((episode,), expected)
 
 
-class FontObservationCollectorIncidentRedContracts(unittest.TestCase):
-    def test_d_real_font_file_is_stat_hashed_blobbed_and_built_without_old_manifest(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            plan, _episodes, font = _episode_plan(
-                root, episodes=range(1, 3), font_suffix=".7z"
-            )
-            assert font is not None
-            expected_hash = hashlib.sha256(font.read_bytes()).hexdigest()
-            authority = _build_production_authority(
-                root,
-                plan,
-                ranges=({
-                    "bangumi_subject_id": "41658",
-                    "season_number": 1,
-                    "episode_start": 1,
-                    "episode_end": 2,
-                },),
-                selected_subject_id="41658",
-            )
-            value = authority.to_dict()
-            entries = value["associated_asset_manifest"]["entries"]
-            self.assertEqual(1, len(entries))
-            self.assertEqual(str(font.resolve()), entries[0]["source"])
-            self.assertEqual(font.stat().st_size, entries[0]["size"])
-            self.assertEqual(expected_hash, entries[0]["content_sha256"])
-            self.assertEqual("示例作品 (2021) [Fonts].7z", entries[0]["target_name"])
-            self.assertEqual(1, len(value["observation_refs"]))
-            blob_path = (
-                root / "tv_observation_blobs"
-                / value["observation_refs"][0][:2]
-                / f"{value['observation_refs'][0]}.json"
-            )
-            blob = json.loads(blob_path.read_text("utf-8"))
-            self.assertEqual(expected_hash, blob["font_archive"]["content_sha256"])
-
-    def test_d_collector_does_not_read_replaced_plan_manifest_as_observation(self):
-        source = inspect.getsource(review_page._tv_font_observation)
-        self.assertNotIn("associated_asset_manifest", source)
-        self.assertNotIn("plan.metadata", source)
-        self.assertTrue(
-            ".stat(" in source or "stat_result" in source,
-            "collector does not freeze file stat evidence",
-        )
-        self.assertTrue(
-            "sha256" in source.casefold(),
-            "collector does not freeze content identity",
-        )
-
-    def test_d_independent_fonts_token_with_rar_fails_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            plan, _episodes, _font = _episode_plan(
-                root, episodes=range(1, 2), font_suffix=".rar"
-            )
-            with self.assertRaisesRegex(
-                TVPlanningAuthorityError, "7z|zip|rar|字体"
-            ):
-                _build_production_authority(
-                    root,
-                    plan,
-                    ranges=({
-                        "bangumi_subject_id": "41658",
-                        "season_number": 1,
-                        "episode_start": 1,
-                        "episode_end": 1,
-                    },),
-                    selected_subject_id="41658",
-                )
-
-    def test_d_builder_remains_io_free_and_blob_disconnect_has_no_fallback(self):
-        builder_source = inspect.getsource(TVPlanningAuthorityBuilder)
-        for forbidden in ("open(", ".stat(", ".exists(", "Path("):
-            self.assertNotIn(forbidden, builder_source)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            plan, _episodes, _font = _episode_plan(
-                root, episodes=range(1, 2), font_suffix=".7z"
-            )
-            with patch.object(
-                review_page.ObservationBlobStore,
-                "put",
-                side_effect=OSError("blob store disconnected"),
-            ):
-                with self.assertRaisesRegex(OSError, "blob store disconnected"):
-                    _build_production_authority(
-                        root,
-                        plan,
-                        ranges=({
-                            "bangumi_subject_id": "41658",
-                            "season_number": 1,
-                            "episode_start": 1,
-                            "episode_end": 1,
-                        },),
-                        selected_subject_id="41658",
-                    )
 
 
 class RedWrapperShapeControls(unittest.TestCase):

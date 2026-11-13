@@ -17,7 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Iterable, Mapping, Optional
 
-from .file_lock import FileLockBusyError, advisory_file_lock
+from .file_lock import FileLockBusyError
 
 
 PROVIDER_LINK_SCHEMA_VERSION = 1
@@ -212,18 +212,22 @@ class ProviderLinkCatalog:
     def __init__(self, root: Path):
         self.root = Path(root)
 
+    def _lock_resource(self):
+        from .file_lock import LockResource
+        return LockResource(self, self.root / '.provider-link-catalog.lock', 'provider_link_catalog')
+
     @contextmanager
     def lock(self):
-        self.root.mkdir(parents=True, exist_ok=True)
+        from .file_lock import serialized_resource_guard
         try:
-            with advisory_file_lock(
-                self.root / ".provider-link-catalog.lock",
+            with serialized_resource_guard(
+                self._lock_resource(),
                 owner={"kind": "provider_link_catalog"},
             ):
                 yield
         except FileLockBusyError as exc:
             raise ProviderLinkCatalogError(
-                "ProviderLinkCatalog 正在由另一个任务更新"
+                "作品关联登记暂时忙，本次排队未能完成，请稍后重试"
             ) from exc
 
     def load(self, mapping_id: str) -> ProviderLinkMapping:

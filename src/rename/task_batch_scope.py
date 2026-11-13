@@ -20,7 +20,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping, Optional
 
-from src.rename.file_lock import FileLockBusyError, advisory_file_lock
+from src.rename.file_lock import FileLockBusyError
+from .content_policy import ContentPolicy, parse as parse_policy, require_typed
 
 
 TASK_BATCH_MANIFEST_PHASES = (
@@ -155,6 +156,12 @@ class TaskSourceScope:
     reservation_revision: int
     source_identity_set_fingerprint: str
     source_identities: tuple[SourceIdentity, ...]
+    content_policy: ContentPolicy | None = None
+
+    def __post_init__(self):
+        require_typed(self.content_policy)
+        if self.schema_version != (2 if self.content_policy is not None else 1):
+            raise TaskBatchScopeError('TaskSourceScope schema/policy 不一致')
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "TaskSourceScope":
@@ -184,10 +191,14 @@ class TaskSourceScope:
         revision = int(value.get("reservation_revision", -1))
         if revision < 0:
             raise TaskBatchScopeError("TaskSourceScope reservation revision 无效")
-        if int(value.get("schema_version", 0)) != 1:
+        version = value.get('schema_version')
+        if type(version) is not int or version not in (1, 2):
             raise TaskBatchScopeError("TaskSourceScope schema_version 不受支持")
+        if version == 1 and 'content_policy' in value:
+            raise TaskBatchScopeError('旧TaskSourceScope不能夹带新policy')
+        policy = parse_policy(value.get('content_policy')) if version == 2 else None
         return cls(
-            schema_version=1,
+            schema_version=version,
             task_id=task_id,
             media_domain=media_domain,
             batch_scope_fingerprint=batch_fingerprint,
@@ -195,11 +206,13 @@ class TaskSourceScope:
             reservation_revision=revision,
             source_identity_set_fingerprint=set_fingerprint,
             source_identities=identities,
+            content_policy=policy,
         )
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
+            **({'content_policy': self.content_policy.value} if self.content_policy is not None else {}),
             "task_id": self.task_id,
             "media_domain": self.media_domain,
             "batch_scope_fingerprint": self.batch_scope_fingerprint,
@@ -217,6 +230,10 @@ class BatchTaskSourceRequest:
     scope_kind: str
     source_identities: tuple[SourceIdentity, ...]
     media_domain: str = "tv"
+    content_policy: ContentPolicy | None = None
+
+    def __post_init__(self):
+        require_typed(self.content_policy)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "BatchTaskSourceRequest":
@@ -234,6 +251,12 @@ class BatchTaskSourceRequest:
         media_domain = str(value.get("media_domain") or "tv").strip().casefold()
         if media_domain not in {"tv", "movie"}:
             raise TaskBatchScopeError("batch task request media_domain 无效")
+        version = value.get('schema_version', 1)
+        if type(version) is not int or version not in (1, 2):
+            raise TaskBatchScopeError('batch task request schema_version 无效')
+        if version == 1 and 'content_policy' in value:
+            raise TaskBatchScopeError('旧request不能夹带新policy')
+        policy = parse_policy(value.get('content_policy')) if version == 2 else None
         return cls(
             task_id=_require_safe_id(value.get("task_id"), field_name="task_id"),
             input_scope=tuple(str(item) for item in scope_value),
@@ -242,11 +265,14 @@ class BatchTaskSourceRequest:
                 SourceIdentity.from_mapping(item) for item in identity_value
             ),
             media_domain=media_domain,
+            content_policy=policy,
         )
 
     def to_dict(self) -> dict[str, object]:
         return {
             "task_id": self.task_id,
+            **({'schema_version': 2, 'content_policy': self.content_policy.value}
+               if self.content_policy is not None else {}),
             "input_scope": list(self.input_scope),
             "scope_kind": self.scope_kind,
             "source_identities": [item.to_dict() for item in self.source_identities],
@@ -321,7 +347,6 @@ class TaskBatchScopeManifest:
             not item.retired and item.owner_task_id not in task_ids
             for item in self.reservations
         )
-
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": 1,
@@ -359,6 +384,8 @@ class TaskBatchScopeManifest:
         )
 
 
+
+
 class TaskBatchScopeManifestStore:
     """Single-writer JSON store for batch manifests and reservation history."""
 
@@ -383,6 +410,10 @@ class TaskBatchScopeManifestStore:
         )
         self._phase_hook = _phase_hook
 
+    def _lock_resource(self):
+        from .file_lock import LockResource
+        return LockResource(self, self.lock_path, 'task_batch_scope')
+
     @contextmanager
     def _mutation_lock(self, operation: str) -> Iterator[None]:
         """Serialize conflict checks and writes across processes.
@@ -393,9 +424,10 @@ class TaskBatchScopeManifestStore:
         Busy ownership fails closed; callers may retry through a new request.
         """
 
+        from .file_lock import serialized_resource_guard
         try:
-            with advisory_file_lock(
-                self.lock_path,
+            with serialized_resource_guard(
+                self._lock_resource(),
                 owner={
                     "component": "task_batch_scope",
                     "operation": str(operation),
@@ -404,7 +436,7 @@ class TaskBatchScopeManifestStore:
                 yield
         except FileLockBusyError as exc:
             raise TaskBatchScopeError(
-                "batch source reservation 正由另一进程修改，拒绝并发写入"
+                "批次来源登记暂时忙，本次排队未能完成，请稍后重试"
             ) from exc
 
     def path_for(self, batch_id: str) -> Path:
@@ -428,6 +460,8 @@ class TaskBatchScopeManifestStore:
     ) -> TaskBatchScopeManifest:
         """Prove that a persisted task scope still belongs to one active lineage."""
 
+        from .recognition_reset import require_ready
+        require_ready(self.root.parent, scope.task_id)
         candidates = (
             (self.load(batch_id),)
             if batch_id is not None
@@ -447,6 +481,7 @@ class TaskBatchScopeManifestStore:
                     and current.reservation_revision == scope.reservation_revision
                     and current.source_identity_set_fingerprint
                     == scope.source_identity_set_fingerprint
+                    and current == scope
                 ):
                     matches.append(manifest)
         if len(matches) != 1:
@@ -582,7 +617,8 @@ class TaskBatchScopeManifestStore:
                 source_identity_set_fingerprint=set_fingerprint,
             )
             scope = TaskSourceScope(
-                schema_version=1,
+                schema_version=2 if by_task[task_id].content_policy is not None else 1,
+                content_policy=by_task[task_id].content_policy,
                 task_id=task_id,
                 media_domain=by_task[task_id].media_domain,
                 batch_scope_fingerprint=batch_fingerprint,
@@ -740,6 +776,25 @@ class TaskBatchScopeManifestStore:
                 target_state=target_state,
             )
 
+    def prepare_recognition_reset(self, scope, *, batch_id, new_batch_id, media_domain):
+        """准备原任务的范围替换；实际写入由重新识别事务统一负责。"""
+        current = self.require_active_scope(scope, batch_id=batch_id)
+        requests = [r for r in current.requests if r.task_id == scope.task_id]
+        if len(requests) != 1 or media_domain not in {'tv', 'movie'}:
+            raise TaskBatchScopeError('重新识别来源请求无效')
+        request = replace(requests[0], source_identities=scope.source_identities, media_domain=media_domain)
+        new = self._materialize(batch_id=new_batch_id, requests=(request,),
+            batch_fingerprint=self._batch_fingerprint((request,)), state='active', revision=3)
+        if new.task_source_scopes[0].source_identities != scope.source_identities:
+            raise TaskBatchScopeError('重新识别改变了来源集合')
+        reservations = tuple(replace(r, retired=True, reservation_revision=r.reservation_revision+1)
+            if r.owner_task_id == scope.task_id and not r.retired else r for r in current.reservations)
+        old = replace(current, revision=current.revision+1,
+            state='active' if any(not r.retired for r in reservations) else 'abandoned',
+            reservations=reservations,
+            task_source_scopes=tuple(s for s in current.task_source_scopes if s.task_id != scope.task_id))
+        return old, new
+
     def retire_task(
         self,
         batch_id: str,
@@ -763,6 +818,14 @@ class TaskBatchScopeManifestStore:
                 and not item.retired
             )
             if not matching:
+                retired = tuple(item for item in current.reservations
+                    if item.owner_task_id == task_id
+                    and item.reservation_lineage_id == expected_lineage_id)
+                if (retired and all(item.retired for item in retired)
+                        and not any(item.owner_task_id == task_id and not item.retired
+                                    for item in current.reservations)
+                        and not any(item.task_id == task_id for item in current.task_source_scopes)):
+                    return current
                 raise TaskBatchScopeError("task reservation lineage 已变化")
             reservations = tuple(
                 replace(
@@ -945,6 +1008,30 @@ class TaskBatchScopeManifestStore:
         }
         self._append_history(transferred.reservation_lineage_id, event)
         return transferred
+
+    def partition_active_task(
+        self,
+        *,
+        source_batch_id: str,
+        parent_scope: TaskSourceScope,
+        child_task_id: str,
+        selected_location_keys: Iterable[str],
+        partition_batch_id: str,
+    ) -> None:
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise TaskBatchScopeError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
+
+    def prepare_partition_active_task(
+        self,
+        *,
+        source_batch_id: str,
+        parent_scope: TaskSourceScope,
+        child_task_id: str,
+        selected_location_keys: Iterable[str],
+        partition_batch_id: str,
+    ) -> None:
+        """Retired: no alternate writer or automatic compatibility fallback."""
+        raise TaskBatchScopeError('旧二分拆卡已停用，请使用“调整计划范围”；无法处理的旧任务请安全结束后重新添加。')
 
     def operation_history(self, lineage_id: str) -> tuple[Mapping[str, object], ...]:
         path = self._history_path(lineage_id)

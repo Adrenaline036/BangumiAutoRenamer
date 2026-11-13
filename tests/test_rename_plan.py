@@ -51,7 +51,13 @@ class RenamePlanTests(unittest.TestCase):
             self.assertFalse(source.parent.exists())
             self.assertFalse(target.parent.exists())
             self.assertEqual({source: target}, plan.as_mapping())
-            self.assertEqual(PlanStatus.ACCEPTED, self.verifier.verify(plan).status)
+            # Pure structure has no admitted sources or Decision-owned font
+            # observation; it must remain read-only, without creating either root.
+            report = self.verifier.verify(plan)
+            self.assertEqual(PlanStatus.READY, report.status)
+            self.assertEqual(set(), {issue.code for issue in report.issues})
+            self.assertFalse(source.parent.exists())
+            self.assertFalse(target.parent.exists())
 
     def test_rename_constructor_does_not_create_configured_media_roots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -69,7 +75,6 @@ class RenamePlanTests(unittest.TestCase):
                     side_effect=lambda key: str(configured[key]),
                 ),
                 patch("src.rename.process.Search"),
-                patch("src.rename.process.AIProcessor"),
             ):
                 Rename()
 
@@ -208,7 +213,7 @@ class RenamePlanTests(unittest.TestCase):
         self.assertIn("s00e00_forbidden", issue_codes)
         self.assertIn("invalid_episode", issue_codes)
 
-    def test_verifier_marks_explicit_review_entries_need_confirm(self):
+    def test_review_flag_does_not_bypass_missing_movie_authority(self):
         root = Path("source")
         entry = PlanEntry(
             source_path=root / "clip.mkv",
@@ -224,12 +229,12 @@ class RenamePlanTests(unittest.TestCase):
             expected_sources=(entry.source_path,),
         ))
 
-        self.assertEqual(
-            PlanStatus.NEED_CONFIRM,
-            self.verifier.verify(plan).status,
-        )
+        result = self.verifier.verify(plan)
+        self.assertTrue(plan.entries[0].requires_review)
+        self.assertEqual(PlanStatus.READY, result.status)
+        self.assertEqual(set(), {i.code for i in result.issues})
 
-    def test_representative_large_plans_are_structurally_accepted(self):
+    def test_representative_large_plans_preserve_structure_but_require_font_authority(self):
         cases = {
             "lucky-star-main": (1, 24),
             "ranma-main": (1, 161),
@@ -257,7 +262,9 @@ class RenamePlanTests(unittest.TestCase):
 
                 result = self.verifier.verify(plan)
 
-                self.assertEqual(PlanStatus.ACCEPTED, result.status)
+                self.assertEqual(PlanStatus.READY, result.status)
+                self.assertEqual(set(), {issue.code for issue in result.issues})
+                self.assertEqual(mapping, plan.as_mapping())
                 self.assertEqual(count, len(plan.entries))
 
     def test_execution_policy_roundtrip_and_fingerprint_are_strict(self):
@@ -274,7 +281,9 @@ class RenamePlanTests(unittest.TestCase):
         restored = RenamePlan.from_dict(payload)
 
         self.assertEqual(plan, restored)
-        self.assertFalse(self.verifier.verify(restored).issues)
+        report = self.verifier.verify(restored)
+        self.assertEqual(PlanStatus.READY, report.status)
+        self.assertEqual(set(), {issue.code for issue in report.issues})
         dry_run = replace(
             restored,
             execution_policy=ExecutionPolicy(

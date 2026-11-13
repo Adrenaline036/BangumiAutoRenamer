@@ -44,16 +44,9 @@ class ProviderLinkResolution:
     resolution_fingerprint: Optional[str] = None
     season_count_policy_version: Optional[str] = None
     subject_observations: Optional[Mapping[str, object]] = None
+    registration_authority: Optional[Mapping[str, object]] = None
 
 
-@dataclass(frozen=True)
-class JellyfinSeriesProjection:
-    folder_name: str
-    provider_identifier: Optional[str]
-    canonical_root: Optional[Path]
-    rename_existing_root: bool
-    write_nfo: bool
-    requires_live_jellyfin_verification: bool
 
 
 class ProviderCohortAnchorError(ValueError):
@@ -64,7 +57,15 @@ class ProviderCohortAnchorError(ValueError):
         self.reason_code = reason_code
 
 
-def resolve_provider_link(
+def resolve_provider_link(**kwargs) -> ProviderLinkResolution:
+    resolution = _resolve_provider_link(**kwargs)
+    if resolution.status == 'inferred' and not resolution.anchor_mapping_id and resolution.season_assignments and resolution.evidence_path:
+        from . import series_registration
+        resolution, _ = series_registration.bind_resolution(resolution)
+    return resolution
+
+
+def _resolve_provider_link(
     *,
     selected_provider: Mapping[str, object],
     existing_links: Iterable[ProviderLinkMapping] = (),
@@ -124,6 +125,7 @@ def resolve_provider_link(
 
 _SUBJECT_OBSERVATION_POLICY = "subject-candidate-v1"
 _SEASON_COUNT_POLICY = "date-count-delta-v1"
+SAME_ID_AGGREGATE_SUPPORT = "same_identity_aggregate_support"
 
 
 def _canonical_sha256(value: object) -> str:
@@ -548,37 +550,13 @@ def _projection_problem(status: str, reason: str) -> Mapping[str, object]:
     return {"status": status, "reason_codes": (reason,)}
 
 
-def project_jellyfin_series_identity(
-    *,
-    display_name: str,
-    year: int,
-    tmdb_tv_id: str,
-    materialized_canonical_root: Optional[Path],
-) -> JellyfinSeriesProjection:
-    """G1 safety shell; new-root metadata policy remains a later gate."""
-
-    if materialized_canonical_root is not None:
-        root = Path(materialized_canonical_root)
-        return JellyfinSeriesProjection(
-            folder_name=root.name,
-            provider_identifier=None,
-            canonical_root=root,
-            rename_existing_root=False,
-            write_nfo=False,
-            requires_live_jellyfin_verification=True,
-        )
-    return JellyfinSeriesProjection(
-        folder_name=f"{display_name} ({year}) [tmdbid-{tmdb_tv_id}]",
-        provider_identifier=f"tmdbid-{tmdb_tv_id}",
-        canonical_root=None,
-        rename_existing_root=False,
-        write_nfo=False,
-        requires_live_jellyfin_verification=True,
-    )
 
 
 def _l0_resolution(match: ProviderLinkMatch) -> ProviderLinkResolution:
     mapping = match.mapping
+    evidence = mapping.to_dict()['evidence_snapshot']
+    if isinstance(evidence.get('latest_evidence'), Mapping):
+        evidence = evidence['latest_evidence']
     tmdb_tv_id = None
     for edge in mapping.provider_edges:
         if edge.get("namespace") == "tmdb" and edge.get("entity_type") == "tv":
@@ -615,6 +593,67 @@ def _l0_resolution(match: ProviderLinkMatch) -> ProviderLinkResolution:
         anchor_mapping_id=mapping.mapping_id,
         anchor_revision=mapping.revision,
         anchor_fingerprint=mapping.evidence_fingerprint,
+        derived_episode_ranges=tuple(dict(bangumi_subject_id=str(e['provider_id']),
+            tmdb_tv_id=str(e['tmdb_tv_id']), season_number=e['season_number'],
+            episode_start=e['episode_start'], episode_end=e['episode_end'])
+            for e in mapping.season_edges if e.get('episode_start') is not None and e.get('episode_end') is not None),
+        work_segment=evidence.get('work_segment'),
+        # Materialized ranges are current authority. Original discovery
+        # observations are not a new provider-selection observation batch.
+        subject_observations=None,
+        mapping_shape=evidence.get('mapping_shape'),
+        season_count_policy_version=evidence.get('season_count_policy_version'),
+        resolution_fingerprint=evidence.get('resolution_fingerprint'),
+    )
+
+
+def _bangumi_standalone_resolution(
+    *,
+    selected_id: str,
+    subject: Mapping[str, object],
+    batch: Mapping[str, object],
+    reason_code: str,
+) -> ProviderLinkResolution:
+    """Project one selected Bangumi subject without promoting TMDB metadata."""
+
+    episode_count = subject.get("episode_count")
+    if not isinstance(episode_count, int) or isinstance(
+        episode_count, bool
+    ) or episode_count < 1:
+        episode_count = subject.get("eps")
+    derived_ranges: tuple[Mapping[str, object], ...] = ()
+    if isinstance(episode_count, int) and not isinstance(
+        episode_count, bool
+    ) and episode_count > 0:
+        derived_ranges = ({
+            "bangumi_subject_id": selected_id,
+            "work_identity_key": f"bangumi:subject:{selected_id}",
+            "season_number": 1,
+            "episode_start": 1,
+            "episode_end": int(episode_count),
+        },)
+    payload = {
+        "primary_provider": ("bangumi", "subject", selected_id),
+        "season_assignments": ((selected_id, 1),),
+        "derived_episode_ranges": derived_ranges,
+        "evidence_fingerprint": str(batch.get("evidence_fingerprint") or ""),
+        "reason_code": reason_code,
+    }
+    return ProviderLinkResolution(
+        automation_level="L2",
+        status="inferred",
+        tmdb_tv_id=None,
+        season_assignments=((selected_id, 1),),
+        requires_plan_review=True,
+        evidence_path=(str(batch["evidence_fingerprint"]),),
+        reason_codes=(reason_code,),
+        work_segment={"subject_ids": (selected_id,)},
+        derived_episode_ranges=derived_ranges,
+        boundaries=(),
+        mapping_shape="bangumi_standalone",
+        review_disposition="reviewable",
+        resolution_fingerprint=_canonical_sha256(payload),
+        subject_observations=dict(batch),
     )
 
 
@@ -728,6 +767,7 @@ def _resolve_subject_observations(
         return _subject_problem("blocked", "cyclic_sequel_graph")
 
     candidate_by_subject = {}
+    weak_problem = None
     missing_observations = set()
     for subject_id in ordered_ids:
         observation = observations.get(subject_id)
@@ -736,14 +776,33 @@ def _resolve_subject_observations(
             continue
         candidate, problem = _candidate_from_observation(observation)
         if problem is not None:
+            if problem.reason_codes == ("subject_candidate_confidence_insufficient",):
+                weak_problem = problem
+                continue
             if (
                 _is_explicit_no_match_observation(observation)
                 and problem.reason_codes
                 == ("subject_candidate_evidence_missing",)
             ):
                 continue
+            if (
+                subject_id == selected_id
+                and problem.reason_codes == ("locale_candidate_conflict",)
+            ):
+                return _bangumi_standalone_resolution(
+                    selected_id=selected_id,
+                    subject=subjects[selected_id],
+                    batch=batch,
+                    reason_code="bangumi_primary_tmdb_metadata_ambiguous",
+                )
             return problem
         candidate_by_subject[subject_id] = candidate
+
+    if weak_problem is not None:
+        aggregate = _same_identity_aggregate(
+            batch, ordered_ids, subjects, observations, candidate_by_subject
+        )
+        return aggregate if aggregate is not None else weak_problem
 
     if selected_id in missing_observations:
         return _subject_problem(
@@ -827,6 +886,16 @@ def _resolve_subject_observations(
         if _tmdb_candidate_id(candidate)
     }))
     if not candidate_ids:
+        if (
+            len(ordered_ids) == 1
+            and subject_is_explicit_no_match(batch, selected_id)
+        ):
+            return _bangumi_standalone_resolution(
+                selected_id=selected_id,
+                subject=subjects[selected_id],
+                batch=batch,
+                reason_code="explicit_bangumi_standalone",
+            )
         return _subject_problem(
             "manual_required", "subject_candidate_evidence_missing"
         )
@@ -978,6 +1047,59 @@ def _cohort_candidate_boundaries(
             "outside_tmdb_tv_id": outside_id,
         })
     return tuple(rows)
+
+
+def _same_identity_aggregate(batch, ordered_ids, subjects, observations, exact):
+    """One complete, count-proven aggregate; fuzzy observations stay observations.
+
+    Only this resolver proves the exception. Cohort and UI consumers recompute
+    it from the original batch instead of manufacturing exact-tier candidates.
+    """
+    from .tmdb_genre import TMDB_ANIMATION_POLICY_VERSION
+
+    identities = {_tmdb_candidate_id(item) for item in exact.values()}
+    if len(ordered_ids) < 2 or len(identities) != 1:
+        return None
+    identity = next(iter(identities))
+    try:
+        anchor = trusted_relation_tmdb_anchor(batch, identity)
+    except ProviderCohortAnchorError:
+        return None
+    fields = ('namespace', 'entity_type', 'provider_id', 'tmdb_tv_id',
+              'title', 'original_title', 'first_air_date', 'seasons')
+    anchor_metadata = _canonical_sha256({k: anchor.get(k) for k in fields})
+    for subject_id in ordered_ids:
+        count = subjects[subject_id].get('episode_count')
+        if type(count) is not int or count <= 0:
+            return None
+        row = observations.get(subject_id)
+        if not row or not row.get('queries'):
+            return None
+        for query in row['queries']:
+            candidates = query.get('candidates')
+            if (query.get('outcome') != 'ok' or query.get('truncated') is not False
+                    or not isinstance(candidates, (tuple, list)) or len(candidates) != 1):
+                return None
+            candidate = candidates[0]
+            if not isinstance(candidate, Mapping):
+                return None
+            score = candidate.get('score_components')
+            if (not isinstance(score, Mapping)
+                    or score.get('animation_confirmed') is not True
+                    or score.get('year_compatible') is not True
+                    or score.get('animation_policy_version') != TMDB_ANIMATION_POLICY_VERSION
+                    or not score.get('animation_evidence_source')
+                    or _canonical_sha256({k: candidate.get(k) for k in fields}) != anchor_metadata):
+                return None
+    resolution = _resolve_segment_seasons(
+        selected_tmdb_id=identity, candidate=anchor, segment_ids=ordered_ids,
+        segment_subjects=[subjects[s] for s in ordered_ids], boundaries=(),
+    )
+    if (resolution.review_disposition != 'reviewable'
+            or resolution.mapping_shape != 'many_subjects_one_season'):
+        return None
+    return replace(resolution, subject_observations=dict(batch),
+                   reason_codes=(*resolution.reason_codes, SAME_ID_AGGREGATE_SUPPORT))
 
 
 def _candidate_from_observation(
@@ -1463,7 +1585,6 @@ def _resolve_frozen_evidence(
         automation_level="L3" if many_to_one else "L2",
         status="inferred",
         tmdb_tv_id=tmdb_id,
-        proposed_series_key=f"series-{uuid.uuid4()}",
         season_assignments=tuple(assignments),
         requires_plan_review=True,
         evidence_path=tuple(evidence),
@@ -1607,7 +1728,8 @@ def _provider_id(value: Mapping[str, object]) -> str:
 def _is_tv_subject(value: Optional[Mapping[str, object]]) -> bool:
     if not isinstance(value, Mapping):
         return False
-    return unicodedata.normalize("NFKC", str(value.get("platform") or "")).upper() == "TV"
+    from .provider_selection_authority import is_bangumi_serial_platform
+    return is_bangumi_serial_platform(value.get("platform"))
 
 
 def _normalize_relation(value: object) -> str:

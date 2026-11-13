@@ -23,6 +23,7 @@ from src.rename.rename_plan import (
 )
 from tests.presentation_fixtures import with_tv_presentation
 from tests.projection_test_support import save_plan_fixture
+from tests.legacy_series_fixture import write_legacy_series_catalog_fixture
 
 
 def _fingerprint(value):
@@ -127,7 +128,7 @@ class ProviderLinkG4TransactionTests(unittest.TestCase):
                     work_identity=work_identity,
                 ),
             )
-            service.series_catalog.register_completed(existing, expected_revision=0)
+            write_legacy_series_catalog_fixture(service.series_catalog, existing)
             state_store = DecisionStateStore(root / "decision")
             state = state_store.save(
                 DecisionState(
@@ -176,14 +177,47 @@ class ProviderLinkG4TransactionTests(unittest.TestCase):
                 work_identity=work_identity,
             ))
             plan = state_store.project_plan(state, plan)
+            # Preserve the legacy TMDB-primary + crosswalk shape as a rejection.
+            with self.assertRaises(PlanExecutionError):
+                service._validate_provider_link_preflight(plan)
+            from src.rename.series_registration import bind_resolution, validate_plan_series_registration
+            from src.rename.provider_link_decision import stage_provider_link_series_decision
+            from src.rename.projection_authority import commit_projected_plan
+            primary = ProviderIdentity('confirmed', 'bangumi', 'subject', '2',
+                'Anchored Show', 2024, 'explicit_user')
+            current_work = replace(work_identity, primary_provider=primary)
+            resolution, match = bind_resolution(ProviderLinkResolution(
+                automation_level='L1', status='inferred', tmdb_tv_id='4242',
+                proposed_series_key=anchor.local_series_key, series_key=anchor.local_series_key,
+                season_assignments=(('1', 1), ('2', 2)), requires_plan_review=True,
+                evidence_path=('one', 'two'), reason_codes=('anchored_confirmed_series',),
+                review_disposition='reviewable', anchor_mapping_id=anchor.mapping_id,
+                anchor_revision=anchor.revision, anchor_fingerprint=anchor.evidence_fingerprint),
+                service.series_catalog, provider_catalog_root=service.provider_link_catalog.root)
+            self.assertIsNotNone(match)
+            current = replace(state, confirmed_work=current_work.to_dict(),
+                provider_evidence=(primary.to_dict(), work_identity.primary_provider.to_dict()))
+            current = stage_provider_link_series_decision(current, resolution,
+                canonical_root=canonical_root, catalog_revision=match.revision)
+            current, plan = commit_projected_plan(state_store, service.plan_store,
+                previous=state, candidate=current, draft_plan=replace(plan, work_identity=current_work))
+            proof = validate_plan_series_registration(plan, current)
+            self.assertEqual('bangumi', proof.namespace)
+            self.assertEqual((('1', 1), ('2', 2)), proof.season_membership)
             service._validate_provider_link_preflight(plan)
+            frozen_fingerprint = PlanStore.fingerprint(plan)
+            frozen_snapshot = dict(plan.metadata['provider_link_snapshot'])
             service.provider_link_catalog.save(
                 replace(anchor, status="user_confirmed"),
                 expected_revision=anchor.revision,
             )
 
+            self.assertEqual(frozen_fingerprint, PlanStore.fingerprint(plan))
+            self.assertEqual(frozen_snapshot, dict(plan.metadata['provider_link_snapshot']))
             with self.assertRaisesRegex(PlanExecutionError, "作品季度关系已变化"):
                 service._validate_provider_link_preflight(plan)
+            self.assertFalse(any(entry.target_path.exists() for entry in plan.entries))
+            self.assertFalse(list((root / 'records').glob('*.json')))
 
     def test_l2_materialization_creates_reusable_catalog_fact(self):
         with tempfile.TemporaryDirectory() as directory:

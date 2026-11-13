@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Union, Literal, Optional
 
 from nicegui import ui
+from src.component.icons import IconToggle
 from nicegui.context import context
 from nicegui.events import (
     Handler,
@@ -77,16 +78,16 @@ class RedDropDownButton(ui.dropdown_button):
             auto_close=auto_close,
             split=split,
         )
-        self._props['rounded'] = True
+        self._props['rounded'] = False
 
 
 class RedButton(ui.button):
     def __init__(self, text: str, on_click=None, icon=None):
         super().__init__(text, on_click=on_click, icon=icon, color=MAINC)
-        self._props['rounded'] = True
+        self._props['rounded'] = False
 
 
-class RedToogle(ui.toggle):
+class RedToogle(IconToggle):
     def __init__(
         self,
         options: Union[List, Dict],
@@ -103,5 +104,5 @@ class RedToogle(ui.toggle):
         )
         self._props['toggle-color'] = MAINC
         self._props['no-wrap'] = True
-        self._props['stack'] = True
-        self._props['spread'] = False
+        self._props['stack'] = False
+        self._props['spread'] = True

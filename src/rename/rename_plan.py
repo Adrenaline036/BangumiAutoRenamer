@@ -13,9 +13,11 @@ import re
 import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
-from typing import Dict, Iterable, Mapping, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
+from collections.abc import Mapping
 
 from .subtitle_labels import DimensionResolution, SUBTITLE_SUFFIXES
 from .utils import VIDEO_SUFFIX
@@ -23,7 +25,7 @@ from .utils import VIDEO_SUFFIX
 
 _EPISODE_TOKEN = re.compile(r"(?i)(?<![A-Z0-9])S(?P<season>\d+)E(?P<episode>\d+)(?!\d)")
 _SEASON_DIRECTORY = re.compile(r"(?i)^Season(?P<season>-?\d+)$")
-PLAN_SCHEMA_VERSION = 6
+PLAN_SCHEMA_VERSION = 7
 PROJECTION_RECEIPT_SCHEMA_VERSION = 1
 SUBTITLE_OVERRIDE_RULE_SCHEMA_VERSION = 1
 SUBTITLE_OVERRIDE_ENGINE_VERSION = "0.3.0-dev.s4.1"
@@ -185,8 +187,6 @@ class WorkIdentity:
 def derive_work_domain(
     metadata: Mapping[str, object],
     provider: Optional[ProviderIdentity] = None,
-    *,
-    migration: bool = False,
 ) -> Tuple[str, str]:
     """Return the canonical search domain and its auditable source.
 
@@ -195,18 +195,17 @@ def derive_work_domain(
     be used to infer playback layout.
     """
 
-    prefix = "v4_migration_" if migration else ""
     if (
         provider is not None
         and provider.namespace == "bangumi"
         and provider.entity_type == "subject"
     ):
-        return "animation", f"{prefix}provider_selection"
+        return "animation", "provider_selection"
     if metadata.get("is_anime") is True:
-        return "animation", f"{prefix}task_metadata"
+        return "animation", "task_metadata"
     if metadata.get("is_anime") is False and "is_anime" in metadata:
-        return "general", f"{prefix}task_metadata"
-    return "unknown", f"{prefix}unknown"
+        return "general", "task_metadata"
+    return "unknown", "unknown"
 
 
 @dataclass(frozen=True)
@@ -356,10 +355,12 @@ class VersionDescriptor:
     dynamic_range: EvidenceValue
     key_audio: EvidenceValue
     display_label: Optional[str]
+    identity_policy: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "version_ref": self.version_ref,
+            **({'identity_policy': self.identity_policy} if self.identity_policy is not None else {}),
             "edition": self.edition.to_dict(),
             "technical_variant_key": self.technical_variant_key,
             "resolution": self.resolution.to_dict(),
@@ -388,6 +389,7 @@ class VersionDescriptor:
                 raise ValueError(f"Version descriptor {name} must be string or null")
         return cls(
             version_ref=version_ref,
+            identity_policy=data.get('identity_policy'),
             technical_variant_key=technical_key,
             display_label=display_label,
             **fields,
@@ -434,55 +436,63 @@ class CollisionResolution:
 
     Normal entries keep this field ``None`` and must create a new target.
     ``reuse_existing`` is the only action which permits an existing target;
-    both files are fully fingerprinted so execution can revalidate the exact
-    decision instead of making a new one after approval.
+    media reuses the same physical hardlink, while small companion files use
+    explicit content evidence. Execution revalidates the approved decision.
     """
 
     action: str
     source_size: int
-    source_sha256: str
     target_size: int
-    target_sha256: str
     target_device: Optional[int] = None
     target_inode: Optional[int] = None
+    evidence_kind: str = "hardlink-identity-v1"
+    source_xxh3_128: Optional[str] = None
+    target_xxh3_128: Optional[str] = None
+
+    @property
+    def content_key(self):
+        if self.evidence_kind == 'content-xxh3-128-v1':
+            return f'xxh3-128:{self.target_size}:{self.target_xxh3_128}'
+        return None
 
     def to_dict(self) -> Dict[str, object]:
-        return {
-            "action": self.action,
-            "source_size": self.source_size,
-            "source_sha256": self.source_sha256,
-            "target_size": self.target_size,
-            "target_sha256": self.target_sha256,
-            "target_device": self.target_device,
-            "target_inode": self.target_inode,
-        }
+        if self.evidence_kind == 'content-xxh3-128-v1':
+            return {'action':self.action,'evidence_kind':self.evidence_kind,
+                    'source_size':self.source_size,'source_xxh3_128':self.source_xxh3_128,
+                    'target_size':self.target_size,'target_xxh3_128':self.target_xxh3_128,
+                    'target_device':self.target_device,'target_inode':self.target_inode}
+        if self.evidence_kind == 'hardlink-identity-v1':
+            return {"action": self.action, "evidence_kind": self.evidence_kind,
+                    "source_size": self.source_size, "target_size": self.target_size,
+                    "target_device": self.target_device, "target_inode": self.target_inode}
+        raise ValueError('目标复用证据格式不受支持')
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "CollisionResolution":
         action = data.get("action")
         if action != "reuse_existing":
             raise ValueError("collision_resolution.action is not supported")
-        hashes = {}
-        for name in ("source_sha256", "target_sha256"):
-            value = data.get(name)
-            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
-                raise ValueError(f"collision_resolution.{name} must be lowercase SHA-256")
-            hashes[name] = value
-        integers = {}
-        for name in ("source_size", "target_size"):
-            value = data.get(name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"collision_resolution.{name} must be a non-negative integer")
-            integers[name] = value
-        optional = {}
-        for name in ("target_device", "target_inode"):
-            value = data.get(name)
-            if value is not None and (
-                not isinstance(value, int) or isinstance(value, bool) or value < 0
-            ):
-                raise ValueError(f"collision_resolution.{name} must be integer or null")
-            optional[name] = value
-        return cls(action=action, **integers, **hashes, **optional)
+        if data.get('evidence_kind') == 'content-xxh3-128-v1':
+            from .small_file_identity import SmallFileFingerprint
+            if set(data) != {'action','evidence_kind','source_size','source_xxh3_128',
+                             'target_size','target_xxh3_128','target_device','target_inode'}:
+                raise ValueError('小文件复用证据不得混入旧摘要或未知字段')
+            target=SmallFileFingerprint(data['target_size'],data['target_xxh3_128'],
+                                        data['target_device'],data['target_inode'])
+            source=SmallFileFingerprint(data['source_size'],data['source_xxh3_128'],target.device,target.inode)
+            if (source.size,source.xxh3_128) != (target.size,target.xxh3_128):
+                raise ValueError('小文件复用内容不一致')
+            return cls(action,source.size,target.size,target.device,target.inode,
+                       target.kind,source.xxh3_128,target.xxh3_128)
+        if data.get('evidence_kind') == 'hardlink-identity-v1':
+            from .media_file_identity import MediaFileIdentity
+            if set(data) != {'action', 'evidence_kind', 'source_size', 'target_size', 'target_device', 'target_inode'}:
+                raise ValueError('媒体复用证据不得混入内容摘要或未知字段')
+            entity = MediaFileIdentity(data['target_size'], data['target_device'], data['target_inode'])
+            if type(data['source_size']) is not int or data['source_size'] != entity.size:
+                raise ValueError('媒体复用大小不一致')
+            return cls(action, entity.size, entity.size, entity.device, entity.inode, entity.kind)
+        raise ValueError('目标复用证据格式不受支持')
 
 
 @dataclass(frozen=True)
@@ -701,12 +711,32 @@ class SeriesScopeIdentity:
     scope_id: str
 
     @classmethod
+    def from_series_key(cls, series_key: object) -> "SeriesScopeIdentity":
+        value = str(series_key).strip()
+        if not value:
+            raise ValueError("Series scope requires a confirmed series key")
+        import hashlib
+        scope = hashlib.sha256(
+            f"bar\0series\0{value}".encode("utf-8")
+        ).hexdigest()
+        return cls("bar", "series", value, scope)
+
+    @classmethod
     def from_provider(cls, namespace: str, media_type: str, provider_id: object) -> "SeriesScopeIdentity":
         namespace = str(namespace).strip().casefold()
         media_type = str(media_type).strip().casefold()
         value = str(provider_id).strip()
-        if namespace != "tmdb" or media_type != "tv" or not value:
-            raise ValueError("Series scope currently requires an explicit TMDB TV identity")
+        if (
+            (namespace, media_type) not in {
+                ("tmdb", "tv"),
+                ("bangumi", "subject"),
+                ("bar", "series"),
+            }
+            or not value
+        ):
+            raise ValueError(
+                "Series scope requires a confirmed TV work identity"
+            )
         import hashlib
         scope = hashlib.sha256(f"{namespace}\0{media_type}\0{value}".encode("utf-8")).hexdigest()
         return cls(namespace, media_type, value, scope)
@@ -721,10 +751,14 @@ class SeriesScopeIdentity:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "SeriesScopeIdentity":
-        expected = cls.from_provider(
-            str(data.get("provider_namespace", "")),
-            str(data.get("provider_media_type", "")),
-            data.get("provider_id", ""),
+        namespace = str(data.get("provider_namespace", ""))
+        media_type = str(data.get("provider_media_type", ""))
+        provider_id = data.get("provider_id", "")
+        expected = (
+            cls.from_series_key(provider_id)
+            if (namespace.casefold(), media_type.casefold())
+            == ("bar", "series")
+            else cls.from_provider(namespace, media_type, provider_id)
         )
         if data.get("scope_id") != expected.scope_id:
             raise ValueError("Series scope identity fingerprint mismatch")
@@ -885,8 +919,12 @@ class SubtitlePlanContract:
     applied_rule_fingerprint: str = ""
     applied_rule_scope: str = ""
     applied_rule_engine_version: str = ""
+    inherited_edit_fingerprint: str = ""
 
     def __post_init__(self) -> None:
+        if (not isinstance(self.inherited_edit_fingerprint, str)
+                or self.inherited_edit_fingerprint and re.fullmatch(r'[0-9a-f]{64}', self.inherited_edit_fingerprint) is None):
+            raise ValueError('Subtitle inherited_edit_fingerprint is invalid')
         object.__setattr__(
             self,
             "associated_video_source_path",
@@ -933,6 +971,7 @@ class SubtitlePlanContract:
             "applied_rule_fingerprint": self.applied_rule_fingerprint,
             "applied_rule_scope": self.applied_rule_scope,
             "applied_rule_engine_version": self.applied_rule_engine_version,
+            **({'inherited_edit_fingerprint': self.inherited_edit_fingerprint} if self.inherited_edit_fingerprint else {}),
         }
 
     @classmethod
@@ -975,6 +1014,7 @@ class SubtitlePlanContract:
             "association_rule_version", "label_rule_version", "decision_source", "manual_reason",
             "applied_rule_id", "applied_rule_fingerprint", "applied_rule_scope",
             "applied_rule_engine_version",
+            "inherited_edit_fingerprint",
         ):
             value = data.get(name, "")
             if not isinstance(value, str):
@@ -1010,6 +1050,7 @@ class PlanEntry:
     subtitle: Optional[SubtitlePlanContract] = None
     presentation_asset: Optional[PresentationAssetPlanContract] = None
     collision_resolution: Optional[CollisionResolution] = None
+    episode_end: Optional[int] = None
 
     @classmethod
     def from_paths(cls, source_path: Path, target_path: Path) -> "PlanEntry":
@@ -1030,6 +1071,7 @@ class PlanEntry:
 
     def to_dict(self) -> Dict[str, object]:
         return {
+            **({"episode_end": self.episode_end} if self.episode_end is not None else {}),
             "source_path": str(self.source_path),
             "target_path": str(self.target_path),
             "season_id": self.season_id,
@@ -1084,6 +1126,7 @@ class PlanEntry:
             target_path=Path(target_path),
             season_id=_optional_int(data.get("season_id"), "season_id"),
             episode_id=_optional_int(data.get("episode_id"), "episode_id"),
+            episode_end=_optional_int(data.get("episode_end"), "episode_end"),
             media_kind=media_kind,
             role=role,
             requires_review=requires_review,
@@ -1122,9 +1165,24 @@ class RenamePlan:
     presentation_groups: Tuple[PresentationGroup, ...] = ()
     work_identity: Optional[WorkIdentity] = None
     linked_provider_identities: Tuple[ProviderIdentity, ...] = ()
-    migrated_from_schema: Optional[int] = None
-    migration_source_fingerprint: str = ""
     projection_receipt: Optional[ProjectionReceipt] = None
+
+    @cached_property
+    def parsed_content_selection(self):
+        """Pure choice parsed once for this deeply frozen Plan, not live evidence."""
+        from .content_selection import ContentSelection
+        raw = self.metadata.get('content_selection')
+        return ContentSelection.from_mapping(raw) if raw is not None else None
+
+    @cached_property
+    def initial_source_basis(self):
+        """Parse this object's frozen metadata once, never cache live file checks.
+
+        Replacement and deserialization create new Plan objects; the property
+        is not a dataclass field and never enters persisted data or fingerprints.
+        """
+        from .source_basis import InitialSourceBasis
+        return InitialSourceBasis.from_mapping(self.metadata.get('initial_source_basis'))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_root", Path(self.source_root))
@@ -1144,72 +1202,6 @@ class RenamePlan:
         groups = tuple(self.presentation_groups)
         links = tuple(self.linked_provider_identities)
         work_identity = self.work_identity
-        legacy_identities = tuple(
-            group.provider_identity for group in groups
-            if group.provider_identity is not None
-        )
-        if work_identity is None and legacy_identities:
-            unique = {}
-            for identity in legacy_identities:
-                key = (
-                    identity.namespace, identity.entity_type, identity.provider_id
-                )
-                unique[key] = identity
-            identities = tuple(unique.values())
-            valid_identities = tuple(
-                item for item in identities
-                if all((item.namespace, item.entity_type, item.provider_id, item.title))
-            )
-            confirmed = tuple(
-                item for item in valid_identities if item.status == "confirmed"
-            )
-            if len(confirmed) == 1:
-                primary = confirmed[0]
-                domain, domain_source = derive_work_domain(
-                    self.metadata, primary,
-                    migration=self.migrated_from_schema == 4,
-                )
-                work_identity = WorkIdentity(
-                    status="confirmed",
-                    domain=domain,
-                    title=primary.title or "",
-                    year=primary.year,
-                    primary_provider=primary,
-                    domain_source=domain_source,
-                )
-                links = tuple(item for item in valid_identities if item != primary) + links
-            else:
-                primary = ProviderIdentity(
-                    status="unresolved", namespace=None, entity_type=None,
-                    provider_id=None, title=None, year=None,
-                    decision_source="v4_migration",
-                    evidence=("v4 中存在多个或未确认的作品身份，必须重新确认",),
-                )
-                work_identity = WorkIdentity(
-                    status="unresolved",
-                    domain=derive_work_domain(
-                        self.metadata,
-                        migration=self.migrated_from_schema == 4,
-                    )[0],
-                    title=str(self.metadata.get("name") or ""),
-                    year=None,
-                    primary_provider=primary,
-                    domain_source=derive_work_domain(
-                        self.metadata,
-                        migration=self.migrated_from_schema == 4,
-                    )[1],
-                )
-                links = tuple(
-                    replace(
-                        item,
-                        status="candidate",
-                        decision_source="v4_migration",
-                        evidence=item.evidence + (
-                            "v4 多身份迁移后必须重新确认跨来源关系",
-                        ),
-                    )
-                    for item in valid_identities
-                ) + links
         groups = tuple(replace(group, provider_identity=None) for group in groups)
         object.__setattr__(self, "presentation_groups", groups)
         object.__setattr__(self, "work_identity", work_identity)
@@ -1330,8 +1322,6 @@ class RenamePlan:
             "linked_provider_identities": [
                 identity.to_dict() for identity in self.linked_provider_identities
             ],
-            "migrated_from_schema": self.migrated_from_schema,
-            "migration_source_fingerprint": self.migration_source_fingerprint,
             "projection_receipt": (
                 self.projection_receipt.to_dict()
                 if self.projection_receipt is not None else None
@@ -1341,10 +1331,10 @@ class RenamePlan:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "RenamePlan":
         version = data.get("schema_version")
-        if version not in {4, 5, PLAN_SCHEMA_VERSION}:
+        if version != PLAN_SCHEMA_VERSION:
             raise ValueError(
                 "Unsupported plan schema_version: "
-                f"{version!r}; expected 4, 5 or {PLAN_SCHEMA_VERSION}"
+                f"{version!r}; expected {PLAN_SCHEMA_VERSION}"
             )
         try:
             task_id = data["task_id"]
@@ -1374,8 +1364,6 @@ class RenamePlan:
         groups = data.get("presentation_groups", ())
         work_identity = data.get("work_identity")
         linked_identities = data.get("linked_provider_identities", ())
-        migrated_from_schema = data.get("migrated_from_schema")
-        migration_source_fingerprint = data.get("migration_source_fingerprint", "")
         projection_receipt = data.get("projection_receipt")
         if series_scope is not None and not isinstance(series_scope, Mapping):
             raise ValueError("Plan series_scope must be object or null")
@@ -1393,20 +1381,6 @@ class RenamePlan:
             isinstance(item, Mapping) for item in linked_identities
         ):
             raise ValueError("Plan linked_provider_identities must be objects")
-        if version in {4, 5}:
-            migrated_from_schema = int(version)
-            migration_source_fingerprint = hashlib.sha256(json.dumps(
-                data, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            ).encode("utf-8")).hexdigest()
-        else:
-            if migrated_from_schema is not None and migrated_from_schema not in {4, 5}:
-                raise ValueError("Plan migrated_from_schema must be 4, 5 or null")
-            if not isinstance(migration_source_fingerprint, str):
-                raise ValueError("Plan migration_source_fingerprint must be a string")
-            if migration_source_fingerprint and re.fullmatch(
-                r"[0-9a-f]{64}", migration_source_fingerprint
-            ) is None:
-                raise ValueError("Plan migration_source_fingerprint is invalid")
         revision_fields = {}
         for name in (
             "revision_parent_fingerprint", "revision_action", "revision_reason"
@@ -1436,8 +1410,6 @@ class RenamePlan:
             linked_provider_identities=tuple(
                 ProviderIdentity.from_dict(item) for item in linked_identities
             ),
-            migrated_from_schema=migrated_from_schema,
-            migration_source_fingerprint=migration_source_fingerprint,
             projection_receipt=(
                 ProjectionReceipt.from_dict(projection_receipt)
                 if isinstance(projection_receipt, Mapping) else None
@@ -1487,18 +1459,36 @@ def _string_tuple(value: object, field_name: str) -> Tuple[str, ...]:
     return tuple(value)
 
 
+@dataclass(frozen=True, eq=False)
+class _FrozenMapping(Mapping):
+    _data: Mapping
+
+    def __post_init__(self):
+        object.__setattr__(self, '_data', MappingProxyType(
+            {str(key): _deep_freeze(item) for key, item in self._data.items()}))
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+
 def _deep_freeze(value: object) -> object:
+    if type(value) is _FrozenMapping:
+        return value
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _deep_freeze(item) for key, item in value.items()})
+        return _FrozenMapping(value)
     if isinstance(value, (list, tuple)):
         return tuple(_deep_freeze(item) for item in value)
     return value
 
 
 def _deep_freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
-    frozen = _deep_freeze(dict(value))
-    assert isinstance(frozen, Mapping)
-    return frozen
+    return _deep_freeze(value)
 
 
 def _deep_thaw(value: object) -> object:
@@ -1507,3 +1497,7 @@ def _deep_thaw(value: object) -> object:
     if isinstance(value, tuple):
         return [_deep_thaw(item) for item in value]
     return value
+
+
+def is_movie_plan(plan: RenamePlan) -> bool:
+    return {group.kind for group in plan.presentation_groups} == {"movie_continuous"}

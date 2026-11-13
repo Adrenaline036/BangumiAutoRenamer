@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "catalog_id": "r24-phase-d-canary-provider-record-catalog-v1",
+  "record_replay_policy_version": "r24-provider-record-replay-v1",
+  "provider_contract": {
+    "provider": "bangumi+tmdb",
+    "provider_schema_version": "bangumi-subject-graph+tmdb-tv-candidate-v1",
+    "endpoint_contract_version": "sanitized-subjects+relations+candidate-observations-v1",
+    "normalization_policy_version": "subject-candidate-v1+date-count-delta-v1",
+    "transport": "offline_fixture_only"
+  },
+  "privacy_contract": {
+    "sanitizer_policy_version": "r23-d-p1-incident-sanitizer-v1",
+    "forbidden_content": [
+      "credentials",
+      "cookies",
+      "private absolute paths",
+      "task UUIDs",
+      "complete media manifests",
+      "runtime log text"
+    ]
+  },
+  "source_records": {
+    "entry-control": {
+      "path": "tests/fixtures/r23_d_p1_incidents/entry_success_control.json",
+      "bytes": 1318,
+      "sha256": "4c766dec131f955e5b8d9ea8cf03fc83ca4cb9e2cf8a7ee7795f429326c49149",
+      "source_evidence_fingerprint": "6a05c08bd1afddeb58cd655a973d84eb4e00392eb45f7bfc1fb97edcad0557ee"
+    },
+    "kaguya-cohort": {
+      "path": "tests/fixtures/r23_d_p1_incidents/p1_b_cohort_anchor.json",
+      "bytes": 16163,
+      "sha256": "577c25900e8056e96990049af1319130f85c2ff9d514c179e4df314d4b180da1",
+      "source_evidence_fingerprint": "6a05c08bd1afddeb58cd655a973d84eb4e00392eb45f7bfc1fb97edcad0557ee"
+    },
+    "yama-cohort": {
+      "path": "tests/fixtures/r22_c1_cohort_incident_v1.json",
+      "bytes": 6687,
+      "sha256": "bf97c711bdd580d7e66ee0ce8dc9a7901644910998091205be2c1db67332b75a",
+      "source_evidence_fingerprint": "bf97c711bdd580d7e66ee0ce8dc9a7901644910998091205be2c1db67332b75a"
+    }
+  },
+  "canaries": [
+    {
+      "canary_id": "kaguya-s2-zero-edge",
+      "sanitized_input_id": "set-04/kaguya-s2",
+      "role": "incident_zero_edge",
+      "selected_provider": {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "293049"
+      },
+      "source_record": "kaguya-cohort",
+      "replay_profile": "provider-link-resolution",
+      "expected": {
+        "status": "inferred",
+        "review_disposition": "reviewable",
+        "tmdb_tv_id": "83121",
+        "selected_season_number": 2,
+        "reason_codes": [],
+        "resolution_fingerprint": "d97bfc494eaf96dffa0c50f694a9b341652ba0407d14548da257d84aa0d40206",
+        "observation_fingerprint": "0b23de16fe6ca719594b56b45d361fdece4baeebd9ef9883e8625a68aaf099a0"
+      }
+    },
+    {
+      "canary_id": "yama-s2",
+      "sanitized_input_id": "set-02/yama-s2",
+      "role": "incident_successor",
+      "selected_provider": {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "86670"
+      },
+      "source_record": "yama-cohort",
+      "replay_profile": "provider-link-resolution",
+      "expected": {
+        "status": "inferred",
+        "review_disposition": "reviewable",
+        "tmdb_tv_id": "53918",
+        "selected_season_number": 2,
+        "reason_codes": ["season_window_date_locked"],
+        "resolution_fingerprint": "5a3769ec446e706bebabdc6e47b3c0e9756d7cf49ce88232b2168579a0ba842b",
+        "observation_fingerprint": "aeab85e8a69f0e723eb6b4bba50ffb13e7baba8870dc93990d7d90fab293051e"
+      }
+    },
+    {
+      "canary_id": "yama-s4-date-locked",
+      "sanitized_input_id": "set-02/yama-s4",
+      "role": "incident_date_locked",
+      "selected_provider": {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "290980"
+      },
+      "source_record": "yama-cohort",
+      "replay_profile": "provider-link-resolution",
+      "expected": {
+        "status": "inferred",
+        "review_disposition": "reviewable",
+        "tmdb_tv_id": "53918",
+        "selected_season_number": 4,
+        "reason_codes": ["season_window_date_locked"],
+        "resolution_fingerprint": "5a3769ec446e706bebabdc6e47b3c0e9756d7cf49ce88232b2168579a0ba842b",
+        "observation_fingerprint": "b7ca8d3ec2b469bf0200eda6ec4a44c976ac9c1f81ab6dfec2c7d3caee993e42"
+      }
+    },
+    {
+      "canary_id": "yama-s1-ordinary-control",
+      "sanitized_input_id": "set-02/yama-s1",
+      "role": "ordinary_s1_control",
+      "selected_provider": {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": "41658"
+      },
+      "source_record": "entry-control",
+      "replay_profile": "mounted-entry-identity-control",
+      "expected": {
+        "phase_d_target_state": "reviewable",
+        "selected_season_number": 1
+      }
+    }
+  ]
+}

@@ -126,7 +126,7 @@ class PresentationSchemaTests(unittest.TestCase):
         payload = plan.to_dict()
         restored = RenamePlan.from_dict(payload)
 
-        self.assertEqual(6, payload["schema_version"])
+        self.assertEqual(7, payload["schema_version"])
         self.assertEqual(plan, restored)
         self.assertEqual(
             "movie-continuous",
@@ -265,7 +265,10 @@ class PresentationSchemaTests(unittest.TestCase):
 
         result = PlanVerifier().verify(plan)
 
-        self.assertEqual(PlanStatus.ACCEPTED, result.status)
+        # This pure shape has no admission/Decision/target authority. The four
+        # leaves remain valid, but shape alone must not be an executable Plan.
+        self.assertEqual(PlanStatus.READY, result.status)
+        self.assertEqual(set(), {i.code for i in result.issues})
         self.assertEqual(4, len(refs))
         self.assertEqual(4, len({
             entry.presentation_asset.version_descriptor.display_label
@@ -388,7 +391,10 @@ class PresentationSchemaTests(unittest.TestCase):
             presentation_groups=(group,),
         ))
 
-        self.assertEqual(PlanStatus.ACCEPTED, result.status)
+        # A movie identity does not exempt a TV-episodes layout from the current
+        # contribution authority gate; no real source/Decision is supplied here.
+        self.assertEqual(PlanStatus.READY, result.status)
+        self.assertEqual(set(), {issue.code for issue in result.issues})
         self.assertNotIn(
             "presentation_provider_type_mismatch",
             {issue.code for issue in result.issues},

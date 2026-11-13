@@ -10,38 +10,23 @@ from src.rename.movie_assets import (
     compare_movie_asset_inventory,
     inventory_movie_assets,
 )
-from src.rename.utils import is_font_archive, is_ignored_asset_directory
+from src.rename.utils import is_auxiliary_directory
 
 
 class MovieAssetInventoryTests(unittest.TestCase):
-    def test_font_archive_gate_requires_a_final_bracketed_fonts_token(self):
-        accepted = (
-            Path("[Fonts].7z"),
-            Path("Example Work [Fonts].7Z"),
-        )
-        rejected = (
-            Path("Fonts.7z"),
-              Path("Example Work Fonts Archive.7z"),
-              Path("Example Work [FontsBackup].7z"),
-              Path("Example Work [Fonts]notes.7z"),
-              Path("ExampleWork[Fonts].7z"),
-              Path("Example Work [Fonts].zip"),
-          )
-
-        self.assertTrue(all(is_font_archive(path) for path in accepted))
-        self.assertFalse(any(is_font_archive(path) for path in rejected))
 
     def test_auxiliary_directory_gate_is_exact_and_unicode_normalized(self):
         self.assertTrue(all(
-            is_ignored_asset_directory(name)
+            is_auxiliary_directory(name)
             for name in ("CD", "CDs", "Scan", "Scans", "ＣＤｓ")
         ))
         self.assertFalse(any(
-            is_ignored_asset_directory(name)
+            is_auxiliary_directory(name)
             for name in ("CD Art", "Scans Backup", "MyScans", "Disc")
         ))
 
-    def test_inventory_skips_cd_and_scan_subtrees_but_keeps_sp_and_font_archive(self):
+
+    def test_inventory_keeps_cd_scan_sp_and_font_archive_without_opening_contents(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "movie"
             root.mkdir()
@@ -54,13 +39,14 @@ class MovieAssetInventoryTests(unittest.TestCase):
             (root / "SPs").mkdir()
             (root / "SPs" / "Trailer.mkv").touch()
 
-            inventory = inventory_movie_assets(root)
+            with patch('builtins.open', side_effect=AssertionError('archive content read')):
+                inventory = inventory_movie_assets(root)
 
         paths = {entry.relative_path for entry in inventory.entries}
         self.assertIn("Example [Fonts].7z", paths)
         self.assertIn("SPs/Trailer.mkv", paths)
-        self.assertFalse(any(path.startswith("CDs") for path in paths))
-        self.assertFalse(any(path.startswith("Scans") for path in paths))
+        self.assertIn('CDs/track.flac', paths)
+        self.assertIn('Scans/[Fonts].7z', paths)
 
     def test_inventory_is_relative_deterministic_and_metadata_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -88,7 +74,7 @@ class MovieAssetInventoryTests(unittest.TestCase):
         self.assertEqual("video", by_path["Feature.mkv"].entry_type)
         self.assertEqual("subtitle", by_path["Feature.zh-Hans.ass"].entry_type)
         self.assertEqual("video", by_path["Extras/Interview.MP4"].entry_type)
-        self.assertEqual("associated", by_path["poster.jpg"].entry_type)
+        self.assertEqual("other", by_path["poster.jpg"].entry_type)
         for entry in first.entries:
             self.assertFalse(Path(entry.relative_path).is_absolute())
             self.assertNotIn(str(root), entry.relative_path)
@@ -121,7 +107,7 @@ class MovieAssetInventoryTests(unittest.TestCase):
             old = root / "old.mkv"
             old.touch()
             expected = inventory_movie_assets(root)
-            old.unlink()
+            old.rename(Path(temp_dir)/"held-old.mkv")
             (root / "new.mkv").touch()
 
             comparison = compare_movie_asset_inventory(root, expected)
@@ -136,7 +122,7 @@ class MovieAssetInventoryTests(unittest.TestCase):
             asset = root / "asset"
             asset.touch()
             expected = inventory_movie_assets(root)
-            asset.unlink()
+            asset.rename(Path(temp_dir)/"held-asset")
             asset.mkdir()
 
             comparison = compare_movie_asset_inventory(root, expected)

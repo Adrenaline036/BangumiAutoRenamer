@@ -23,7 +23,7 @@ SUBTITLE_ASSOCIATION_SCHEMA_VERSION = 1
 SUBTITLE_ASSOCIATION_RULE_VERSION = "0.3.0-dev.s0.1"
 SUBTITLE_LABEL_SCHEMA_VERSION = 1
 SUBTITLE_LABEL_RULE_VERSION = "0.3.0-dev.s1.2"
-SUBTITLE_SUFFIXES = frozenset({".ass", ".ssa", ".srt", ".vtt", ".sup"})
+SUBTITLE_SUFFIXES = frozenset({'.ass', '.ssa', '.srt', '.vtt', '.sup', '.mks', '.idx', '.sub'})
 
 
 class AssociationStatus(str, Enum):
@@ -263,7 +263,7 @@ def associate_subtitle_to_video(
     seen_paths = set()
     for raw_video in video_paths:
         video = Path(raw_video)
-        if video in seen_paths:
+        if video.parent != subtitle.parent or video in seen_paths:
             continue
         seen_paths.add(video)
         video_stem, video_suffix = _split_normalized_extension(video)

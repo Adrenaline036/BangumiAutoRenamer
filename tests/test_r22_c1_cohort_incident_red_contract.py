@@ -27,7 +27,7 @@ import tests.test_provider_subject_plan_wiring_red_contract as phase_b_fixture
 import tests.test_r22_revised_c_c0_red_contract as c1_fixture
 from src.pages.plan_review_page import PlanReviewDialog
 from src.rename.decision_state import DecisionStateStore
-from src.rename.plan_review import PlanReviewService, ReviewStatus
+from src.rename.plan_review import entry_id, PlanReviewService, ReviewStatus
 from src.rename.plan_store import PlanStore
 from src.rename.plan_verifier import PlanVerifier
 from src.rename.provider_link_decision import (
@@ -37,6 +37,9 @@ from src.rename.provider_link_decision import (
 from src.rename.provider_link_resolver import collect_subject_observations
 from src.rename.rename_plan import PlanStatus, RenamePlan
 from tests.projection_test_support import save_plan_fixture
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 
 FIXTURE_PATH = (
@@ -160,9 +163,7 @@ async def _run_yama_incident(root: Path):
 
 
 def _operation_edge(task: dict[str, object]) -> tuple[int, str, dict[str, object]]:
-    operation = task.get("selection_operation")
-    if not isinstance(operation, dict):
-        raise AssertionError("selection operation is missing")
+    operation = current_provider_selection_context(task)
     evidence = operation.get("provider_subject_evidence")
     edges = (
         evidence.get("provider_subject_boundary_edges")
@@ -207,9 +208,10 @@ class CohortResolverIncidentRedContracts(unittest.TestCase):
         )
         self.assertEqual(3, len(decision.get("cohort_edges") or ()))
 
-    def test_steins_incompatible_successor_is_a_manual_boundary_not_a_false_merge(self):
+    def test_incomplete_metadata_allows_explicit_native_chain_without_provider_pollution(self):
         case = _fixture()["steins_boundary"]
         failure, edge = _failure(case)
+        before = _canonical_sha256(failure)
         try:
             resolution, decision = resolve_provider_subject_boundary_decision(
                 failure,
@@ -217,23 +219,20 @@ class CohortResolverIncidentRedContracts(unittest.TestCase):
                 boundary_edge=edge,
             )
         except ValueError as exc:
-            self.fail(f"unique compatible selected segment did not close: {exc}")
+            self.fail(f"explicit native relationship confirmation did not close: {exc}")
 
         self.assertEqual("reviewable", resolution.review_disposition)
-        self.assertEqual("42509", resolution.tmdb_tv_id)
-        self.assertEqual({"10380": 1}, dict(resolution.season_assignments))
-        self.assertNotIn("129807", dict(resolution.season_assignments))
-        self.assertEqual(1, len(resolution.boundaries))
-        boundary = resolution.boundaries[0]
-        self.assertEqual(
-            ("10380", "129807"),
-            (boundary.get("from_subject_id"), boundary.get("to_subject_id")),
-        )
-        self.assertNotEqual(
-            "different_unique_tmdb_id", boundary.get("boundary_kind")
-        )
-        self.assertEqual("", str(boundary.get("outside_tmdb_tv_id") or ""))
+        self.assertFalse(resolution.tmdb_tv_id)
+        self.assertEqual({"10380": 1, "129807": 2}, dict(resolution.season_assignments))
+        self.assertEqual('bangumi_subjects_one_work', resolution.mapping_shape)
+        self.assertEqual((), resolution.boundaries)
         self.assertIsInstance(decision, dict)
+        self.assertEqual(('10380', '129807'), tuple(decision['cohort_subject_ids']))
+        self.assertEqual('same_work', decision['decision'])
+        self.assertFalse(decision['selected_tmdb_tv_id'])
+        self.assertEqual(before, _canonical_sha256(failure))
+        self.assertEqual(_canonical_sha256(failure['subject_observations']),
+                         _canonical_sha256(resolution.subject_observations))
 
     def test_only_complete_no_match_rows_can_be_offered_for_overlay(self):
         base = _fixture()["yama"]
@@ -331,6 +330,8 @@ class CohortRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             result, source, case = await _run_yama_incident(Path(directory))
             dialog = c1_fixture._boundary_dialog(result)
+            proof = dialog.task_decision.pending_tv_selection
+            protected = c1_fixture._protected_boundary_files(result)
             notices: list[tuple[str, object]] = []
             capture = ui_fixture._CaptureUi()
             capture.card = capture.column
@@ -365,15 +366,15 @@ class CohortRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase):
                     problems.append(f"cohort preview omitted {title}")
             if len(callbacks) != 1:
                 problems.append("cohort preview did not expose one bounded confirm action")
-            operation = task.get("selection_operation") or {}
+            operation = current_provider_selection_context(task)
             if (
                 task.get("workflow_status") != "need_confirm"
                 or operation.get("state") != "succeeded"
             ):
                 problems.append("all-successor-no-match decision did not close the task")
             verification = PlanVerifier().verify(plan)
-            if verification.status != PlanStatus.ACCEPTED or verification.issues:
-                problems.append("cohort decision did not persist an approvable Plan")
+            self.assertNotEqual(PlanStatus.ACCEPTED, verification.status)
+            self.assertTrue(verification.issues, "unknown OVA must still need manual review")
 
             targets = tuple(entry.target_path for entry in plan.entries)
             forbidden = str(case["source_shape"]["forbidden_target_marker"])
@@ -386,44 +387,25 @@ class CohortRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase):
             )
             if len(ova_entries) != 2:
                 problems.append("OVA video/subtitle pair was dropped")
-            for entry in ova_entries:
-                parts = entry.target_path.parts
-                if "Season 01" not in parts or "Extras" not in parts:
-                    problems.append(
-                        f"OVA asset escaped Season 01/Extras: {entry.target_path}"
-                    )
-
-            preview = (
-                result.task.get("selection_operation", {}).get(
-                    "provider_subject_cohort_preview"
-                )
-            )
-            receipt = plan.metadata.get(
-                "provider_subject_boundary_selection_receipt"
-            )
-            if not isinstance(preview, Mapping) or not isinstance(
-                receipt, Mapping
-            ):
-                problems.append("cohort preview/receipt pair is incomplete")
-            else:
-                if receipt.get("schema_version") != 3:
-                    problems.append("cohort receipt schema is not routing-aware v3")
-                if receipt.get("target_root_config_fingerprint") != (
-                    plan.metadata.get("target_root_config_fingerprint")
-                ):
-                    problems.append("receipt lost the frozen target-root fingerprint")
-                if receipt.get("resolved_target_root") != plan.metadata.get(
-                    "target_root"
-                ):
-                    problems.append("receipt target root forked from the Plan")
-                if preview.get("request_fingerprint") != receipt.get(
-                    "request_fingerprint"
-                ):
-                    problems.append("preview and receipt fingerprints forked")
-                if tuple(receipt.get("cohort_subject_ids") or ()) != (
-                    "41658", "86670", "216310", "290980"
-                ):
-                    problems.append("receipt omitted cohort subjects")
+            self.assertTrue(any(e.media_kind == "video" for e in ova_entries))
+            self.assertFalse(dialog.review_service.load_or_create(plan).approved_entry_ids)
+            from src.rename.tv_boundary_completion import receipt_fingerprint
+            receipt = plan.metadata.get("tv_boundary_completion_receipt") or {}
+            preview = current_provider_selection_context(result.task)["provider_subject_cohort_preview"]
+            self.assertEqual(proof.fingerprint, receipt.get("pending_fingerprint"))
+            self.assertEqual(preview["request_fingerprint"], receipt.get("request_fingerprint"))
+            self.assertEqual(64, len(receipt_fingerprint(plan)))
+            # Human choice, not automatic conversion of every unknown OVA.
+            video = next(e for e in ova_entries if e.media_kind == "video")
+            with c1_fixture._boundary_patches(result, notices):
+                plan = dialog.review_service.revise_tv_content(result.task_id, PlanStore.fingerprint(plan),
+                    expected_revision=state.revision, mode="role",
+                    edit={"entry_id": entry_id(video), "role": "extra"})
+            state = DecisionStateStore(result.decisions).load(result.task_id)
+            corrected = [e for e in plan.entries if e.source_path in {row.source_path for row in ova_entries}]
+            self.assertEqual(2, len(corrected))
+            self.assertTrue(all("Season 01" in e.target_path.parts and "Extras" in e.target_path.parts for e in corrected))
+            self.assertFalse(dialog.review_service.load_or_create(plan).approved_entry_ids)
             boundary_rows = tuple(
                 state.provider_subject_boundary_decisions.values()
             )
@@ -435,55 +417,42 @@ class CohortRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase):
                 problems.append("Decision edges are not linked by one cohort decision id")
             if not result.source_unchanged or not source.exists():
                 problems.append("Plan-only cohort flow changed the source")
-            if result.business_json or result.target_files:
-                problems.append("Plan-only cohort flow crossed a business/media boundary")
+            self.assertEqual(protected, c1_fixture._protected_boundary_files(result))
             self.assertEqual([], problems, "\n".join(problems))
 
     async def test_failed_cohort_action_persists_reason_and_renders_safe_exits(self):
+        # The current retained pending request plus visible error and cancel
+        # path suffice; no separate persisted error/recovery schema is required.
         with tempfile.TemporaryDirectory() as directory:
             result, _source, _case = await _run_yama_incident(Path(directory))
-            revision, evidence, edge = _operation_edge(result.task)
             dialog = c1_fixture._boundary_dialog(result)
-            notices: list[tuple[str, object]] = []
-            with c1_fixture._boundary_patches(result, notices), patch.object(
-                review_page,
-                "resolve_provider_subject_boundary_decision",
+            protected = c1_fixture._protected_boundary_files(result)
+            before = c1_fixture._authority_bytes(result)
+            notices = []
+            with c1_fixture._boundary_patches(result, notices), patch(
+                "src.rename.tv_boundary_completion.resolve_provider_subject_boundary_decision",
                 side_effect=ValueError("季度相容分段存在多解"),
-            ):
-                PlanReviewDialog._apply_provider_subject_boundary_inline(
-                    dialog, True, revision, evidence, edge
-                )
-
-            task = json.loads(
-                (result.tasks / f"{result.task_id}.json").read_text("utf-8")
-            )
-            operation = task.get("selection_operation") or {}
-            failure = operation.get("boundary_resolution_failure")
-            if not isinstance(failure, dict):
-                self.fail("boundary failure was notify-only and did not persist")
-            self.assertRegex(str(failure.get("public_code") or ""), r"^[a-z0-9_]+$")
-            self.assertTrue(str(failure.get("public_title") or "").strip())
-            self.assertTrue(tuple(failure.get("affected_subject_titles") or ()))
-            self.assertTrue(
-                {"change_work", "separate", "remove"}.issubset(
-                    set(failure.get("safe_actions") or ())
-                )
-            )
-            technical = json.dumps(failure, ensure_ascii=False)
-            self.assertNotIn("324820", technical)
-
-            reopened = c1_fixture._boundary_dialog(result, task=task)
+            ) as resolver:
+                await c1_fixture._dispatch_boundary(dialog)
+            resolver.assert_called_once()
+            self.assertTrue(any("季度相容分段存在多解" in message and kind == "negative" for message, kind in notices))
+            self.assertEqual(before, c1_fixture._authority_bytes(result))
+            reopened = c1_fixture._boundary_dialog(result)
+            self.assertIsNotNone(reopened.task_decision.pending_tv_selection)
             capture = ui_fixture._CaptureUi()
             capture.card = capture.column
-            with patch.object(review_page, "ui", capture):
+            with c1_fixture._boundary_patches(result, notices), patch.object(review_page, "ui", capture):
                 PlanReviewDialog._render_selection_operation(reopened)
-            visible = "\n".join(capture.visible)
-            self.assertIn(str(failure["public_title"]), visible)
-            self.assertTrue(
-                any(title in visible for title in failure["affected_subject_titles"])
-            )
-            for label in ("换一个作品", "分开整理", "移除任务"):
-                self.assertIn(label, capture.callbacks)
+                cancel = capture.callbacks["取消本次季度关系确认"]
+                value = cancel()
+                if asyncio.iscoroutine(value):
+                    await value
+            current = DecisionStateStore(result.decisions).load(result.task_id)
+            self.assertIsNone(current.pending_tv_selection)
+            self.assertEqual(result.state.content_selection, current.content_selection)
+            current_plan = PlanStore(result.plans).load(result.task_id)
+            self.assertFalse(reopened.review_service.load_or_create(current_plan).approved_entry_ids)
+            self.assertEqual(protected, c1_fixture._protected_boundary_files(result))
 
 
 class CohortAlreadyGreenSafetyControls(unittest.TestCase):

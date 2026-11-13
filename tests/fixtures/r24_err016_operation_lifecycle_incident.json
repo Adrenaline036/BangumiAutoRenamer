@@ -1,0 +1,83 @@
+{
+  "schema_version": "r24-err016-operation-lifecycle-incident/v1",
+  "incident": {
+    "source_path_shape": "<SANITIZED_DRIVE>:\\媒体\\[Release] Ridge Climb S1 [1080p]",
+    "source_stem": "Yama Season 1",
+    "regular_episode_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "selected_work": {
+      "namespace": "bangumi",
+      "provider_id": "41658",
+      "public_title": "向山进发"
+    },
+    "same_work_successor_query_terms": [
+      "第二季",
+      "セカンドシーズン",
+      "第三季",
+      "サードシーズン",
+      "Next Summit"
+    ],
+    "tmdb_anchor": {
+      "provider_id": 53918,
+      "title": "向山进发",
+      "original_title": "ヤマノススメ",
+      "first_air_date": "2013-01-03",
+      "seasons": [
+        {"season_number": 1, "air_date": "2013-01-03", "episode_count": 13},
+        {"season_number": 2, "air_date": "2014-07-09", "episode_count": 24},
+        {"season_number": 3, "air_date": "2018-07-02", "episode_count": 13},
+        {"season_number": 4, "air_date": "2022-10-05", "episode_count": 12}
+      ]
+    },
+    "observation_shape": {
+      "selected_subject": "unique_tmdb_anchor",
+      "successors": "complete_no_match",
+      "cohort_confirmation": "required",
+      "provider_transport": "frozen_local"
+    },
+    "expected_lifecycle": {
+      "after_enqueue": "pending",
+      "after_provider_observation": "awaiting_user",
+      "after_explicit_cohort_command": "succeeded"
+    },
+    "expected_decision_revisions": [0, 0, 1],
+    "expected_waiting_outcome": {
+      "workflow_status": "need_confirm",
+      "task_error_present": false,
+      "queue_exception_count": 0,
+      "retry_current_allowed": false,
+      "safe_remove_allowed": true
+    }
+  },
+  "genuine_error_controls": [
+    "provider_transport_error",
+    "unusable_provider_evidence",
+    "stale_decision_revision",
+    "tampered_operation_fingerprint"
+  ],
+  "privacy": {
+    "omitted": [
+      "real_absolute_path",
+      "runtime_task_uuid",
+      "credential_or_query_value",
+      "raw_provider_body_or_headers",
+      "complete_media_manifest",
+      "raw_dom",
+      "private_runtime_log"
+    ],
+    "public_provider_ids_retained": true
+  }
+}

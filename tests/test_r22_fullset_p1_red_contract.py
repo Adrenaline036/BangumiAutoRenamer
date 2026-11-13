@@ -32,6 +32,9 @@ from src.rename.provider_link_decision import (
 )
 from src.rename.rename_plan import ProviderIdentity, RenamePlan, WorkIdentity
 from tests.presentation_fixtures import with_tv_presentation
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 
 def _case(selected_subject_id: str) -> dict[str, object]:
@@ -221,7 +224,7 @@ class CohortRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase):
                 )
             except Exception as exc:
                 self.fail(f"real AddTask→worker→BGM S3 path crashed: {exc}")
-        operation = result.task.get("selection_operation") or {}
+        operation = current_provider_selection_context(result.task)
         evidence = operation.get("provider_subject_evidence") or {}
         edges = _edge_anchor_payload(evidence.get("provider_subject_boundary_edges"))
         problems = harness._real_path_problems(result)
@@ -482,6 +485,7 @@ class LinkedProviderRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase)
             "poster_url": r1_fixture.POSTER_URL,
             "source_url": "https://bgm.tv/subject/425211",
             "snapshot_at": "2026-08-26T00:00:00+00:00",
+            "platform": "TV",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -511,7 +515,7 @@ class LinkedProviderRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase)
             )
             persisted_plan = RenamePlan.from_dict(plan.to_dict())
             persisted_state = DecisionState.from_dict(state.to_dict())
-        expected = ("bangumi", "subject", "425211")
+        expected_metadata = ("tmdb", "tv", "330299")
         plan_linked = {
             (item.namespace, item.entity_type, item.provider_id)
             for item in persisted_plan.linked_provider_identities
@@ -527,15 +531,17 @@ class LinkedProviderRealEntrypointRedContracts(unittest.IsolatedAsyncioTestCase)
             if isinstance(item, dict)
         }
         problems = []
-        if expected not in state_linked:
-            problems.append("disk Decision lost selected BGM425211 linked authority")
-        if expected not in plan_linked:
-            problems.append("disk Plan did not project BGM425211 from Decision")
+        if expected_metadata not in state_linked:
+            problems.append("disk Decision lost optional TMDB330299 metadata")
+        if expected_metadata not in plan_linked:
+            problems.append("disk Plan did not project optional TMDB330299 metadata")
         if plan.metadata.get("decision_state_fingerprint") != DecisionStateStore.fingerprint(state):
             problems.append("Plan fingerprint does not bind the linked-aware Decision")
         primary = plan.work_identity.primary_provider if plan.work_identity else None
-        if primary is None or primary.provider_id != "330299":
-            problems.append("real reidentify did not retain TMDB330299 as primary")
+        if primary is None or (
+            primary.namespace, primary.entity_type, primary.provider_id
+        ) != ("bangumi", "subject", "425211"):
+            problems.append("real reidentify did not retain Bangumi425211 as primary")
         self.assertEqual([], problems, "\n".join(problems))
 
 

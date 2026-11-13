@@ -12,6 +12,7 @@ from src.rename.plan_review import (
 from src.rename.plan_store import PlanStore, PlanStoreError
 from src.rename.plan_verifier import PlanVerifier
 from src.rename.rename_plan import (
+    ExecutionPolicy,
     PlanEntry,
     RenamePlan,
     SeriesScopeIdentity,
@@ -26,7 +27,6 @@ from src.rename.subtitle_labels import (
     SUBTITLE_LABEL_RULE_VERSION,
 )
 from tests.presentation_fixtures import with_tv_presentation
-from tests.projection_test_support import save_plan_fixture
 
 
 def make_plan(*, unresolved=False, unknown=False):
@@ -101,11 +101,57 @@ def make_series_plan():
     ))
 
 
+def persist_subtitle_fixture(store, plan, root):
+    """Explicit legal TV preconditions only for this module's component tests.
+
+    Pure schema tests keep the small relative-path fixture. Persistent review
+    tests own independent temporary sources, an explicitly selected general-TV
+    identity and real registration/source/font observation producers.
+    """
+    from src.rename.decision_state import DecisionState, DecisionStateStore
+    from src.rename.projection_authority import commit_projected_plan
+    from src.rename.series_catalog import SeriesCatalog
+    from src.rename.series_registration import manual_tv_binding
+
+    entries = []
+    for entry in plan.entries:
+        source = root / entry.source_path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"synthetic subtitle review component source\n")
+        subtitle = entry.subtitle
+        if subtitle is not None:
+            subtitle = replace(subtitle,
+                associated_video_source_path=root / subtitle.associated_video_source_path)
+        entries.append(replace(entry, source_path=source,
+            target_path=root / entry.target_path, subtitle=subtitle))
+    work = replace(plan.work_identity, domain="general", domain_source="provider_selection")
+    work_root = root / "Library" / "Show"
+    plan = replace(plan, source_root=root / plan.source_root,
+        entries=tuple(entries), expected_sources=tuple(root / path for path in plan.expected_sources),
+        metadata={**dict(plan.metadata), "target_root": str(root / "Library"),
+                  "canonical_work_root": str(work_root)},
+        work_identity=work, execution_policy=ExecutionPolicy(target_root=root / "Library", dry_run=False))
+    states = DecisionStateStore(root / "decision_state")
+    binding = manual_tv_binding(work, SeriesCatalog(root / "series_catalog"), work_root)
+    candidate = DecisionState(task_id=plan.task_id, confirmed_work=work.to_dict(),
+        provider_evidence=(work.primary_provider.to_dict(),), library_domain="general", layout_mode="tv_episodes",
+        series_binding=binding, season_binding={"season_binding_id": "subtitle-fixture-season",
+            "season_number": 1, "decision_source": "explicit_user"})
+    decision, projected = commit_projected_plan(states, store, previous=None,
+        candidate=candidate, draft_plan=plan)
+    task_path = root / "task" / f"{plan.task_id}.json"
+    task = json.loads(task_path.read_text("utf-8"))
+    task.update(plan_fingerprint=store.fingerprint(projected),
+        decision_state_revision=decision.revision, decision_state_fingerprint=states.fingerprint(decision))
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    return projected
+
+
 class SubtitlePlanContractTests(unittest.TestCase):
     def test_schema_v4_roundtrip_is_strict_and_fingerprint_covers_contract(self):
         plan = make_plan()
         payload = plan.to_dict()
-        self.assertEqual(6, payload["schema_version"])
+        self.assertEqual(7, payload["schema_version"])
         restored = RenamePlan.from_dict(payload)
         self.assertEqual(payload, restored.to_dict())
         self.assertEqual(PlanStore.fingerprint(plan), PlanStore.fingerprint(restored))
@@ -152,7 +198,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             fingerprint = store.fingerprint(plan)
             with self.assertRaisesRegex(PlanReviewError, "subtitle_parse_unresolved"):
@@ -188,14 +234,14 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             with self.assertRaisesRegex(PlanReviewError, "结构化字幕决定"):
                 service.override_target(
                     plan.task_id,
                     store.fingerprint(plan),
                     entry_id(plan.entries[1]),
-                    Path("Library/Show/Season 01/custom.ass"),
+                    root / "Library/Show/Season 01/custom.ass",
                     "try raw path",
                 )
 
@@ -204,7 +250,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             before = store.fingerprint(plan)
             service.load_or_create(plan)
@@ -224,7 +270,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
             after = store.fingerprint(revised)
             self.assertNotEqual(before, after)
             self.assertEqual(
-                Path("Library/Show/Season 01/Show S01E01.zh-Hans.Mystery.default.ass"),
+                root / "Library/Show/Season 01/Show S01E01.zh-Hans.Mystery.default.ass",
                 revised.entries[1].target_path,
             )
             review = service.load(plan.task_id)
@@ -237,7 +283,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             revised = service.apply_subtitle_override_rule(
                 plan.task_id,
@@ -255,7 +301,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
             subtitles = [entry for entry in revised.entries if entry.media_kind == "subtitle"]
             self.assertEqual(2, len(subtitles))
             self.assertEqual(
-                (Path("Source/Ep01.mkv"), Path("Source/Ep02.mkv")),
+                (root / "Source/Ep01.mkv", root / "Source/Ep02.mkv"),
                 tuple(entry.subtitle.associated_video_source_path for entry in subtitles),
             )
             self.assertEqual(
@@ -274,7 +320,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             with self.assertRaisesRegex(PlanReviewError, "TMDB TV"):
                 service.apply_subtitle_override_rule(
@@ -295,7 +341,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             before = store.fingerprint(plan)
             preview = service.apply_subtitle_override_rule(
@@ -323,7 +369,7 @@ class SubtitlePlanContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = PlanStore(root / "plans")
-            plan = save_plan_fixture(store, plan)
+            plan = persist_subtitle_fixture(store, plan, root)
             service = PlanReviewService(store, root / "reviews")
             applied = service.override_subtitle_decision(
                 plan.task_id,

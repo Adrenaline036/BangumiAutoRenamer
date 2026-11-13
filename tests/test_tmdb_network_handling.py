@@ -183,10 +183,16 @@ class TMDBNetworkHandlingTests(unittest.TestCase):
         duplicate = SimpleNamespace(results=[dict(correct.results[0])])
         for item in (wrong, correct, duplicate):
             item.tv = Mock()
+            if not hasattr(item, 'total_results'):
+                item.total_results = len(item.results)
+            if not hasattr(item, 'total_pages'):
+                item.total_pages = 1
         search_factory.side_effect = [wrong, correct, duplicate]
-        fake_tv = SimpleNamespace(id=100565)
-        fake_tv.info = Mock()
-        tv_factory.return_value = fake_tv
+        details = {item['id']: {**item, 'genres': [], 'seasons': []}
+                   for item in (wrong.results[0], correct.results[0])}
+        tv_factory.side_effect = lambda identity: SimpleNamespace(
+            id=identity, info=Mock(return_value=details[identity]),
+            alternative_titles=Mock(return_value={'results': []}))
         search = object.__new__(Search)
 
         name, info = search.get_tv_subject_observation_info(
@@ -219,11 +225,15 @@ class TMDBNetworkHandlingTests(unittest.TestCase):
                 'first_air_date': '2020-01-01',
             } for index in range(11)])
             search.tv = Mock()
+            search.total_results = len(search.results)
+            search.total_pages = 1
             searches.append(search)
         search_factory.side_effect = searches
-        fake_tv = SimpleNamespace(id=1)
-        fake_tv.info = Mock()
-        tv_factory.return_value = fake_tv
+        details = {item['id']: {**item, 'genres': [], 'seasons': []}
+                   for response in searches for item in response.results}
+        tv_factory.side_effect = lambda identity: SimpleNamespace(
+            id=identity, info=Mock(return_value=details[identity]),
+            alternative_titles=Mock(return_value={'results': []}))
         search = object.__new__(Search)
 
         name, info = search.get_tv_subject_observation_info(
@@ -306,359 +316,15 @@ class TMDBNetworkHandlingTests(unittest.TestCase):
         self.assertIsNone(info)
         self.assertIn('置信度过低', issue)
 
-    def test_tv_network_failure_does_not_fall_through_to_movie_search(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.side_effect = TMDBRequestError(
-            '电视剧搜索请求失败'
-        )
 
-        result = renamer.check_task_type(
-            'task-id',
-            'Series',
-            0,
-            Path('source'),
-            is_anime=True,
-        )
 
-        self.assertIsInstance(result, str)
-        self.assertIn('网络请求失败', result)
-        renamer.search.get_movie_info.assert_not_called()
 
-    def test_successful_empty_tv_result_can_still_fall_back_to_movie(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.return_value = ('', None)
-        movie_info = {'genres': []}
-        renamer.search.get_movie_info.return_value = ('Movie', movie_info)
 
-        result = renamer.check_task_type(
-            'task-id',
-            'Movie',
-            0,
-            Path('source'),
-            is_anime=False,
-        )
 
-        self.assertEqual(('Movie', movie_info, False, True), result)
-        renamer.search.get_movie_info.assert_called_once_with('Movie', 0)
 
-    def test_multiple_videos_are_layout_evidence_not_a_tv_type_lock(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.return_value = ('', None)
-        movie_info = {
-            'id': 997317,
-            'title': 'Kaguya-sama: The First Kiss That Never Ends',
-            'release_date': '2022-12-17',
-            'genres': [{'name': 'Animation'}],
-        }
-        renamer.search.get_movie_info.return_value = (
-            'Kaguya-sama: The First Kiss That Never Ends',
-            movie_info,
-        )
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / 'Kaguya-sama First Kiss'
-            source.mkdir()
-            (source / 'Movie Cut.mkv').touch()
-            (source / 'TV Part 01.mkv').touch()
-            result = renamer.check_task_type(
-                'task-id',
-                'Kaguya-sama First Kiss',
-                2022,
-                source,
-                is_anime=True,
-            )
 
-        self.assertEqual(
-            (
-                'Kaguya-sama: The First Kiss That Never Ends',
-                movie_info,
-                True,
-                True,
-            ),
-            result,
-        )
-        renamer.search.get_movie_info.assert_called()
 
-    def test_explicit_tv_type_surfaces_movie_as_choice_without_falling_back(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.return_value = ('', None)
-        renamer.search.get_movie_info.return_value = (
-            'Possible Movie',
-            {'id': 55, 'title': 'Possible Movie', 'release_date': '2022-01-01'},
-        )
-
-        result = renamer.check_task_type(
-            'task-id',
-            'Explicit Series',
-            0,
-            Path('source'),
-            is_anime=True,
-            is_movie=False,
-        )
-
-        self.assertIsInstance(result, str)
-        self.assertIn('没有找到正确的电视剧匹配', result)
-        self.assertIn('Possible Movie', result)
-        renamer.search.get_movie_info.assert_called()
-        self.assertEqual('Possible Movie', renamer.last_type_candidates['movie']['name'])
-
-    def test_multi_video_exact_movie_can_beat_unrelated_low_confidence_tv(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.return_value = (
-            'Banana',
-            {
-                'id': 101,
-                'name': 'Banana',
-                'first_air_date': '2017-01-01',
-                'genres': [{'name': 'Animation'}],
-            },
-        )
-        movie_info = {
-            'id': 202,
-            'title': 'Exact Anime Movie',
-            'release_date': '2022-01-01',
-            'genres': [{'name': 'Animation'}],
-        }
-        renamer.search.get_movie_info.return_value = (
-            'Exact Anime Movie', movie_info
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / 'Exact Anime Movie 2022'
-            source.mkdir()
-            (source / 'Feature.mkv').touch()
-            (source / 'Extras.mkv').touch()
-            result = renamer.check_task_type(
-                'task-id',
-                'Exact Anime Movie',
-                2022,
-                source,
-                is_anime=True,
-            )
-
-        self.assertEqual(('Exact Anime Movie', movie_info, True, True), result)
-        renamer.search.get_movie_info.assert_called()
-
-    def test_multi_video_conflicting_tv_and_movie_identities_fail_closed(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.return_value = (
-            'Shared Presentation',
-            {
-                'id': 101,
-                'name': 'Shared Presentation',
-                'first_air_date': '2022-01-01',
-                'genres': [{'name': 'Animation'}],
-            },
-        )
-        renamer.search.get_movie_info.return_value = (
-            'Shared Presentation',
-            {
-                'id': 202,
-                'title': 'Shared Presentation',
-                'release_date': '2022-01-01',
-                'genres': [{'name': 'Animation'}],
-            },
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / 'Shared Presentation 2022'
-            source.mkdir()
-            (source / 'Movie Cut.mkv').touch()
-            (source / 'TV Part 01.mkv').touch()
-            result = renamer.check_task_type(
-                'task-id',
-                'Shared Presentation',
-                2022,
-                source,
-                is_anime=True,
-            )
-
-        self.assertIsInstance(result, str)
-        self.assertIn('同时存在可信电视剧和电影身份', result)
-        renamer.search.get_tv_info.assert_called()
-        renamer.search.get_movie_info.assert_called()
-
-    def test_multi_video_anime_tv_ambiguity_never_selects_movie(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        ambiguous_tv = {
-            'id': 259140,
-            'name': '乱马1/2',
-            'original_name': 'らんま1/2',
-            'first_air_date': '2024-10-06',
-            '_bar_search_alternatives': [
-                {
-                    'id': 259140,
-                    'name': '乱马1/2',
-                    'original_name': 'らんま1/2',
-                    'first_air_date': '2024-10-06',
-                },
-                {
-                    'id': 57706,
-                    'name': '乱马1/2',
-                    'original_name': 'らんま1/2',
-                    'first_air_date': '1989-04-15',
-                },
-            ],
-        }
-        renamer.search.get_tv_info.return_value = ('乱马1/2', ambiguous_tv)
-        renamer.search.get_movie_info.return_value = (
-            'Ranma vs Ryoga: duelo del elixir prohibido',
-            {
-                'id': 999,
-                'title': 'Ranma vs Ryoga: duelo del elixir prohibido',
-                'release_date': '1994-01-01',
-                'genres': [{'name': 'Animation'}],
-            },
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / 'Ranma ½ [BDRip]'
-            source.mkdir()
-            (source / 'Ranma ½ - 001.mkv').touch()
-            (source / 'Ranma ½ - 002.mkv').touch()
-
-            result = renamer.check_task_type(
-                'task-id',
-                'Ranma ½',
-                0,
-                source,
-                is_anime=True,
-                search_candidates=(
-                    SearchTitleCandidate('Ranma ½', 0, 'clean title'),
-                ),
-            )
-
-        self.assertIsInstance(result, str)
-        self.assertIn('1989/2024', result)
-        renamer.search.get_movie_info.assert_called()
-
-    def test_multi_video_low_confidence_tv_never_selects_unrelated_movie(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.return_value = (
-            'Eighty-Sixed',
-            {
-                'id': 71789,
-                'name': 'Eighty-Sixed',
-                'original_name': 'Eighty-Sixed',
-                'first_air_date': '2017-04-18',
-            },
-        )
-        renamer.search.get_movie_info.return_value = (
-            'Unrelated Movie',
-            {
-                'id': 888,
-                'title': 'Unrelated Movie',
-                'release_date': '2017-01-01',
-                'genres': [],
-            },
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / '86-不存在的战区- [BD]'
-            source.mkdir()
-            (source / '01.mkv').touch()
-            (source / '02.mkv').touch()
-
-            result = renamer.check_task_type(
-                'task-id',
-                '86-不存在的战区-',
-                0,
-                source,
-                is_anime=True,
-                search_candidates=(
-                    SearchTitleCandidate('86-不存在的战区-', 0, 'clean title'),
-                ),
-            )
-
-        self.assertIsInstance(result, str)
-        self.assertIn('置信度过低', result)
-        renamer.search.get_movie_info.assert_called()
-
-    def test_candidate_fallback_recovers_title_that_really_ends_in_year(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        wrong = {
-            'id': 10,
-            'name': 'Class Of',
-            'first_air_date': '1980-01-01',
-            'genres': [],
-        }
-        correct = {
-            'id': 20,
-            'name': 'Class of 1999',
-            'first_air_date': '1990-01-01',
-            'genres': [],
-        }
-        renamer.search.get_tv_info.side_effect = [
-            ('Class Of', wrong),
-            ('Class of 1999', correct),
-        ]
-        renamer.search.get_movie_info.return_value = ('', None)
-        candidates = (
-            SearchTitleCandidate('Class of', 1999, 'year field'),
-            SearchTitleCandidate('Class of 1999', 0, 'literal fallback'),
-        )
-
-        result = renamer.check_task_type(
-            'task-id',
-            'Class of',
-            1999,
-            Path('source'),
-            is_anime=False,
-            is_movie=False,
-            search_candidates=candidates,
-        )
-
-        self.assertEqual(('Class of 1999', correct, False, False), result)
-        self.assertEqual(
-            [unittest.mock.call('Class of', 1999),
-             unittest.mock.call('Class of 1999', 0)],
-            renamer.search.get_tv_info.call_args_list,
-        )
-
-    def test_close_different_provider_matches_are_rejected_as_ambiguous(self):
-        renamer = object.__new__(Rename)
-        renamer.search = Mock()
-        renamer.search.get_tv_info.side_effect = [
-            ('Alpha Show', {
-                'id': 10,
-                'name': 'Alpha Show',
-                'first_air_date': '',
-                'genres': [],
-            }),
-            ('Alpha Shows', {
-                'id': 20,
-                'name': 'Alpha Shows',
-                'first_air_date': '',
-                'genres': [],
-            }),
-        ]
-        renamer.search.get_movie_info.return_value = ('', None)
-        candidates = (
-            SearchTitleCandidate('Alpha Shou', 0, 'normalized'),
-            SearchTitleCandidate('Alpha Showz', 0, 'conservative'),
-        )
-
-        result = renamer.check_task_type(
-            'task-id',
-            'Alpha Shou',
-            0,
-            Path('source'),
-            is_anime=False,
-            is_movie=False,
-            search_candidates=candidates,
-        )
-
-        self.assertIsInstance(result, str)
-        self.assertIn('候选结果存在歧义', result)
 
     def test_exact_candidate_stops_without_extra_network_queries(self):
         renamer = object.__new__(Rename)

@@ -1,22 +1,43 @@
 import tempfile
 import unittest
-import os
 import json
 from dataclasses import replace
 from pathlib import Path
 
 from src.rename.rename_plan import (
-    AssetRole, CollisionResolution, EditionValue, EvidenceValue, PlanEntry,
+    AssetRole, EditionValue, EvidenceValue, PlanEntry,
     PresentationAssetPlanContract, PresentationGroup, ProviderIdentity,
     RenamePlan, VersionDescriptor, WorkIdentity,
 )
 from src.rename.work_catalog import WorkCatalog, WorkCatalogError
 from src.rename.plan_store import PlanStore
+from src.rename.trans import Trans
+from src.rename.asset_collision import build_reuse_resolution
 from tests.projection_test_support import save_plan_fixture
 
 
 def trusted(plan: RenamePlan) -> RenamePlan:
     return save_plan_fixture(PlanStore(plan.source_root / "plans"), plan)
+
+
+def complete_ledger(plan: RenamePlan, record_root: Path | None = None):
+    """Component fixture: real Trans output, never a manufactured completion."""
+    record_root = record_root or plan.source_root / "records"
+    operations = [dict(source=str(entry.source_path), target=str(entry.target_path),
+        action="reuse_existing" if entry.collision_resolution else "create",
+        collision_resolution=entry.collision_resolution.to_dict() if entry.collision_resolution else None)
+        for entry in plan.entries]
+    error = Trans(plan.as_mapping(), plan.task_id, PlanStore.fingerprint(plan), mode="hardlink",
+        dry_run=False, record_root=record_root, operations=operations).trans_file()
+    if error:
+        raise AssertionError(error)
+    return json.loads((record_root / f"{plan.task_id}.ledger.json").read_text("utf-8"))
+
+
+def remove_fixture_materialization(plan):
+    for entry in plan.entries:
+        entry.target_path.unlink()
+    Path(plan.metadata["canonical_work_root"]).rmdir()
 
 
 def provider(provider_id="997317"):
@@ -87,106 +108,46 @@ class WorkCatalogTests(unittest.TestCase):
             key = "work-12345678-1234-1234-1234-123456789abc"
             catalog = WorkCatalog(root / "catalog")
             first = trusted(tv_plan(root, key, 1))
-            catalog.register_completed(first, {"plan_fingerprint": "one"})
+            catalog.register_completed(first, complete_ledger(first))
             second = trusted(tv_plan(root, key, 2))
             record = catalog.register_completed(
-                second, {"plan_fingerprint": "two"}, expected_revision=1
+                second, complete_ledger(second), expected_revision=1
             )
             match = catalog.find_exact(second.work_identity.primary_provider, group_kind="tv_episodes")
             self.assertEqual("tv_episodes", record["group_kind"])
             self.assertEqual([1, 2], [item["season_number"] for item in record["seasons"]])
             self.assertEqual(root / "Anime" / "Example", match.canonical_root)
 
-    def test_v1_record_remains_readable_without_startup_rewrite(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            catalog_root = root / "catalog"
-            catalog_root.mkdir()
-            key = "work-12345678-1234-1234-1234-123456789abc"
-            path = catalog_root / f"{key}.json"
-            payload = {
-                "schema_version": 1, "work_key": key, "revision": 1,
-                "title": "Example", "year": 2022, "domain": "animation",
-                "group_kind": "movie_continuous",
-                "canonical_root": str(root / "Example (2022)"),
-                "aliases": [], "providers": [provider().to_dict()],
-                "versions": [], "assets": [{
-                    "target": str(root / "Example (2022)" / "Associated" / "Fonts.7z"),
-                    "source": str(root / "source" / "Fonts.7z"),
-                    "media_kind": "associated", "role": "font", "task_id": "old",
-                }],
-            }
-            path.write_text(json.dumps(payload), encoding="utf-8")
 
-            loaded = WorkCatalog(catalog_root).load(key)
-
-            self.assertEqual(1, loaded["schema_version"])
-            self.assertEqual(payload, json.loads(path.read_text("utf-8")))
-
-    def test_reused_content_adds_association_without_promoting_shared_scope(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            key = "work-12345678-1234-1234-1234-123456789abc"
-            base = movie_plan(root, key)
-            target = base.entries[0].target_path.parent / "Associated" / "Fonts.7z"
-            first_source = root / "first-fonts.7z"
-            second_source = root / "second-fonts.7z"
-            asset_contract = PresentationAssetPlanContract(
-                "movie-continuous", AssetRole("associated"), None, None, "v-1"
-            )
-            first = replace(base, entries=base.entries + (PlanEntry(
-                first_source, target, media_kind="associated", role="font",
-                presentation_asset=asset_contract,
-            ),))
-            catalog = WorkCatalog(root / "catalog")
-            first = trusted(first)
-            catalog.register_completed(first, {"plan_fingerprint": "one"})
-            collision = CollisionResolution(
-                "reuse_existing", 5, "a" * 64, 5, "a" * 64, 1, 2
-            )
-            second = replace(
-                base,
-                task_id="task-two",
-                entries=(PlanEntry(
-                    second_source, target, media_kind="associated", role="font",
-                    presentation_asset=asset_contract,
-                    collision_resolution=collision,
-                ),),
-            )
-
-            second = trusted(second)
-            record = catalog.register_completed(
-                second, {"plan_fingerprint": "two"}, expected_revision=1
-            )
-
-            asset = next(item for item in record["assets"] if item["target"] == str(target))
-            self.assertEqual(2, len(asset["associations"]))
-            self.assertEqual("version", asset["scope"])
-            self.assertEqual(f"sha256:5:{'a' * 64}", asset["content_key"])
     def test_register_then_exact_provider_match(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             catalog = WorkCatalog(root / "catalog")
             key = "work-12345678-1234-1234-1234-123456789abc"
             plan = trusted(movie_plan(root, key))
-            record = catalog.register_completed(plan, {"plan_fingerprint": "fp"})
+            record = catalog.register_completed(plan, complete_ledger(plan))
             match = catalog.find_exact(provider())
             self.assertEqual(1, record["revision"])
             self.assertEqual(key, match.work_key)
             self.assertEqual("1080p", match.versions[0]["display_label"])
 
-    def test_revision_check_blocks_stale_append(self):
+    def test_selected_slot_change_blocks_stale_registration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             catalog = WorkCatalog(root / "catalog")
             key = "work-12345678-1234-1234-1234-123456789abc"
             plan = trusted(movie_plan(root, key))
-            catalog.register_completed(plan, {"plan_fingerprint": "one"})
-            with self.assertRaises(WorkCatalogError):
+            catalog.register_completed(plan, complete_ledger(plan))
+            raw_second = movie_plan(root, key, "Example (2022) - 1080p revised.mkv")
+            second = trusted(replace(raw_second, task_id="stale-second", entries=(
+                replace(raw_second.entries[0], source_path=root / "source-second.mkv"),)))
+            ledger = complete_ledger(second)
+            before = (catalog.root / f"{key}.json").read_bytes()
+            with self.assertRaisesRegex(WorkCatalogError, "追加依赖"):
                 catalog.register_completed(
-                    trusted(movie_plan(root, key, "Example (2022) - 2160p SDR.mkv")),
-                    {"plan_fingerprint": "two"}, expected_revision=0,
+                    second, ledger, expected_revision=0,
                 )
+            self.assertEqual(before, (catalog.root / f"{key}.json").read_bytes())
 
     def test_work_lock_blocks_concurrent_execution_for_same_movie(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,6 +163,7 @@ class WorkCatalogTests(unittest.TestCase):
             catalog = WorkCatalog(Path(tmp) / "catalog")
             key = "work-12345678-1234-1234-1234-123456789abc"
             lock_path = catalog.lock_root / f"{key}.lock"
+            lock_path.parent.mkdir(parents=True)
             lock_path.write_text("legacy-token", encoding="ascii")
             with catalog.lock(key):
                 self.assertTrue(lock_path.is_file())
@@ -212,12 +174,8 @@ class WorkCatalogTests(unittest.TestCase):
             catalog = WorkCatalog(root / "catalog")
             key = "work-12345678-1234-1234-1234-123456789abc"
             plan = trusted(movie_plan(root, key))
-            source = plan.entries[0].source_path
             target = plan.entries[0].target_path
-            source.write_bytes(b"movie")
-            target.parent.mkdir(parents=True)
-            os.link(source, target)
-            catalog.register_completed(plan, {"plan_fingerprint": "fp"})
+            catalog.register_completed(plan, complete_ledger(plan))
             new_parent = root / "ConfiguredAnimeMovies"
             new_parent.mkdir()
             new_root = new_parent / target.parent.name
@@ -240,7 +198,8 @@ class WorkCatalogTests(unittest.TestCase):
             catalog = WorkCatalog(root / "catalog")
             key = "work-12345678-1234-1234-1234-123456789abc"
             plan = trusted(movie_plan(root, key))
-            catalog.register_completed(plan, {"plan_fingerprint": "fp"})
+            catalog.register_completed(plan, complete_ledger(plan))
+            remove_fixture_materialization(plan)
             task_root = root / "tasks"
             task_root.mkdir()
 
@@ -259,7 +218,7 @@ class WorkCatalogTests(unittest.TestCase):
             key = "work-12345678-1234-1234-1234-123456789abc"
             plan = trusted(movie_plan(root, key))
             plan.entries[0].target_path.parent.mkdir(parents=True)
-            catalog.register_completed(plan, {"plan_fingerprint": "fp"})
+            catalog.register_completed(plan, complete_ledger(plan))
             task_root = root / "tasks"
             task_root.mkdir()
 
@@ -273,9 +232,9 @@ class WorkCatalogTests(unittest.TestCase):
             root = Path(tmp)
             catalog = WorkCatalog(root / "catalog")
             key = "work-12345678-1234-1234-1234-123456789abc"
-            catalog.register_completed(
-                trusted(movie_plan(root, key)), {"plan_fingerprint": "fp"}
-            )
+            plan = trusted(movie_plan(root, key))
+            catalog.register_completed(plan, complete_ledger(plan))
+            remove_fixture_materialization(plan)
             task_root = root / "tasks"
             task_root.mkdir()
             (task_root / "active.json").write_text(json.dumps({

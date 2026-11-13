@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "subject_id": "129807",
+  "season_number": 1,
+  "episode_start": 1,
+  "episode_end": 23,
+  "provider_special": {
+    "provider_episode_id": "1649075",
+    "episode_number": 1,
+    "title": "OVA",
+    "air_date": "2018-12-21",
+    "runtime": 24
+  },
+  "files": {
+    "main": "[VCB-Studio] Steins;Gate 0 [01][Ma10p_1080p][x265_flac].mkv",
+    "overflow": "[VCB-Studio] Steins;Gate 0 [24][Ma10p_1080p][x265_flac].mkv",
+    "overflow_subtitle": "[VCB-Studio] Steins;Gate 0 [24][Ma10p_1080p][x265_flac].sc.ass",
+    "cross_work": "SPs/[VCB-Studio] Steins;Gate [23β][Ma10p_1080p][x265_flac].mkv",
+    "cross_work_subtitle": "SPs/[VCB-Studio] Steins;Gate [23β][Ma10p_1080p][x265_flac].sc.ass"
+  },
+  "required_issue_codes": [
+    "provider_regular_episode_overflow_unresolved",
+    "provider_special_decision_required"
+  ],
+  "required_actions": [
+    "归入特别篇",
+    "内容保留与排除",
+    "作为独立作品整理"
+  ]
+}

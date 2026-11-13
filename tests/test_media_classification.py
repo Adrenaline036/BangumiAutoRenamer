@@ -112,7 +112,7 @@ class TraditionalMediaClassificationTests(unittest.TestCase):
             subtitle_target = self.renamer.R[subtitle].relative_to(work_path)
 
         self.assertIsNone(error)
-        self.assertEqual(Path('Season 01') / 'Extras', video_target.parent)
+        self.assertEqual(Path('Season 01') / 'Extras' / 'SPs', video_target.parent)
         self.assertEqual(video_target.parent, subtitle_target.parent)
         self.assertEqual(
             video_target.stem,
@@ -363,7 +363,7 @@ class TraditionalMediaClassificationTests(unittest.TestCase):
             target,
         )
 
-    def test_episode_subtitle_follows_the_same_numbering_route(self):
+    def test_episode_subtitle_alone_cannot_infer_numbering_without_video_authority(self):
         filename = '[Group] Series - 01.zh-Hans.ass'
 
         target = self.route(
@@ -372,11 +372,11 @@ class TraditionalMediaClassificationTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            Path('Season 04') / 'S04E01 - Series - 01.zh-Hans.ass',
+            Path('ManualReview') / 'Season 04' / 'Series - 01.zh-Hans.ass',
             target,
         )
 
-    def test_compound_subtitle_suffix_matches_normalized_video_stem(self):
+    def test_compound_subtitle_alone_requires_video_association(self):
         filename = (
             '[VCB-Studio] Yama no Susume Next Summit [05]'
             '[Ma10p_1080p][x265_flac].tc.ass'
@@ -388,8 +388,8 @@ class TraditionalMediaClassificationTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            Path('Season 04') / (
-                'S04E05 - Yama no Susume Next Summit [05].tc.ass'
+            Path('ManualReview') / 'Season 04' / (
+                'Yama no Susume Next Summit [05].tc.ass'
             ),
             target,
         )
@@ -880,11 +880,11 @@ class TraditionalMediaClassificationTests(unittest.TestCase):
             targets[main_two],
         )
         self.assertEqual(
-            Path('Season 04') / 'Extras' / 'Next Summit [Exploration Party].mkv',
+            Path('Season 04') / 'Extras' / 'SPs' / 'Next Summit [Exploration Party].mkv',
             targets[exploration],
         )
         self.assertEqual(
-            Path('Season 04') / 'Extras' / 'Next Summit OVA01.mkv',
+            Path('Season 04') / 'Extras' / 'SPs' / 'Next Summit OVA01.mkv',
             targets[ova],
         )
 

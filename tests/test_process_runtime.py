@@ -7,9 +7,6 @@ from unittest.mock import Mock, patch
 
 from src.rename.process import Rename, _with_parent_title_candidates
 from src.rename.cleaner import parse_release_title
-from src.rename.plan_store import PlanStore
-from src.rename.plan_verifier import PlanVerifier
-from src.rename.rename_plan import PlanStatus
 
 
 class ProcessRuntimeDependencyTests(unittest.TestCase):
@@ -156,14 +153,21 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
 
         self.assertIsNone(task['is_movie'])
         self.assertEqual(
-            {'movie_continuous'},
+            {'movie_continuous', 'tv_episodes'},
             set(task['provider_candidates']),
         )
         self.assertEqual(
-            {'997317', '330299'},
+            {'997317'},
             {
                 str(candidate['provider_id'])
                 for candidate in task['provider_candidates']['movie_continuous']
+            },
+        )
+        self.assertEqual(
+            {'330299'},
+            {
+                str(candidate['provider_id'])
+                for candidate in task['provider_candidates']['tv_episodes']
             },
         )
 
@@ -190,6 +194,7 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
             'aliases': ['Uma Musume Pretty Derby: ROAD TO THE TOP'],
             'year': 2023,
             'provider_rank': 0,
+            'platform': 'TV',
         }]
         renamer.R = {}
 
@@ -214,13 +219,21 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
                 renamer._process(source, _is_anime=True, _tuuid='uma-candidates')
             task = json.loads((task_root / 'uma-candidates.json').read_text('utf-8'))
 
-        candidates = task['provider_candidates']['movie_continuous']
+        movie_candidates = task['provider_candidates']['movie_continuous']
+        tv_candidates = task['provider_candidates']['tv_episodes']
         self.assertIsNone(task['is_movie'])
         self.assertEqual(
-            {('tmdb', '123456'), ('bangumi', '444888')},
+            {('tmdb', '123456')},
             {
                 (candidate['namespace'], str(candidate['provider_id']))
-                for candidate in candidates
+                for candidate in movie_candidates
+            },
+        )
+        self.assertEqual(
+            {('bangumi', '444888')},
+            {
+                (candidate['namespace'], str(candidate['provider_id']))
+                for candidate in tv_candidates
             },
         )
 
@@ -231,7 +244,7 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
         def stop_after_title_cleanup(*args, **kwargs):
             raise RuntimeError('type detection reached')
 
-        renamer.check_task_type = stop_after_title_cleanup
+        renamer._provider_search_batch = stop_after_title_cleanup
 
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / 'Example Show Season 2 [1080p]'
@@ -246,20 +259,17 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
         captured = {}
 
         def stop_after_title_cleanup(
-            _uuid,
-            rtpath_name,
-            year,
-            path,
+            search_candidates,
+            *,
             is_anime=None,
             is_movie=None,
-            search_candidates=None,
         ):
-            captured['title'] = rtpath_name
-            captured['year'] = year
+            captured['title'] = search_candidates[0].title
+            captured['year'] = search_candidates[0].year
             captured['candidates'] = search_candidates
             raise RuntimeError('type detection reached')
 
-        renamer.check_task_type = stop_after_title_cleanup
+        renamer._provider_search_batch = stop_after_title_cleanup
 
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / (
@@ -284,20 +294,17 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
         captured = {}
 
         def stop_after_title_cleanup(
-            _uuid,
-            rtpath_name,
-            year,
-            path,
+            search_candidates,
+            *,
             is_anime=None,
             is_movie=None,
-            search_candidates=None,
         ):
-            captured['title'] = rtpath_name
-            captured['year'] = year
+            captured['title'] = search_candidates[0].title
+            captured['year'] = search_candidates[0].year
             captured['candidates'] = search_candidates
             raise RuntimeError('type detection reached')
 
-        renamer.check_task_type = stop_after_title_cleanup
+        renamer._provider_search_batch = stop_after_title_cleanup
 
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / 'Ranma ½ [BDRip]'
@@ -309,7 +316,7 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
         self.assertEqual(1989, captured['year'])
         self.assertEqual(1989, captured['candidates'][0].year)
 
-    def test_lucky_star_full_process_uses_tv_route_and_removes_metadata_year(self):
+    def test_lucky_star_direct_tmdb_tv_stays_unresolved_without_season_authority(self):
         renamer = object.__new__(Rename)
         renamer.search = Mock(TMDB_KEY='offline-test-key')
         renamer.search.get_tv_info.return_value = (
@@ -324,9 +331,6 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
             },
         )
         renamer.search.get_movie_info.return_value = ('', None)
-        renamer.ai_processor = SimpleNamespace(
-            ai_client=SimpleNamespace(is_available=lambda: False)
-        )
         renamer.R = {}
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -357,6 +361,8 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
             renamer.ANIME_MOVIE_PATH = root / 'AnimeMovies'
             renamer.MOVIE_PATH = root / 'Movies'
             renamer.BANGUMI_PATH = root / 'TV'
+            renamer.decision_state_root = root / 'decision_state'
+            renamer.provider_link_catalog_root = root / 'provider_link_catalog'
             renamer.get_season_id = Mock(return_value=1)
 
             with (
@@ -365,42 +371,17 @@ class ProcessRuntimeDependencyTests(unittest.TestCase):
             ):
                 (root / 'tasks').mkdir()
                 result = renamer._process(source, _is_anime=True)
-                persisted_plan = PlanStore(root / 'plan').load(
-                    renamer.last_plan.task_id
+                task = json.loads(
+                    next((root / 'tasks').glob('*.json')).read_text('utf-8')
                 )
-                mapping = persisted_plan.as_mapping()
+                plan_files = tuple((root / 'plan').glob('*.json'))
 
-        verification = PlanVerifier().verify(persisted_plan)
-        self.assertEqual(PlanStatus.INVALID, verification.status)
-        self.assertIn(
-            "tv_authority_incomplete",
-            {issue.code for issue in verification.issues},
-        )
-        self.assertIn("尚未确认所属系列和季度", result)
-        self.assertEqual(persisted_plan, renamer.last_plan)
-        self.assertEqual(
-            ["tv-episodes"],
-            [group.group_id for group in persisted_plan.presentation_groups],
-        )
-        renamer.search.get_movie_info.assert_called()
-        targets = list(mapping.values())
-        self.assertTrue(any(
-            target.name == 'S01E01 - Lucky Star - EP01.mkv'
-            for target in targets
-        ))
-        self.assertTrue(any(
-            target.name == 'Lucky Star - OVA.mkv'
-            for target in targets
-        ))
-        self.assertTrue(any(
-            target.parent.name == 'Extras'
-            and target.name == 'Lucky Star - 特典映像1.mkv'
-            for target in targets
-        ))
-        self.assertTrue(all(
-            'Lucky Star 2007 -' not in str(target)
-            for target in targets
-        ))
+        self.assertIn('MULTIPLE_VIDEO_FILES_REQUIRE_LAYOUT_CLASSIFICATION', result)
+        self.assertEqual('inventory_only', task['plan_status'])
+        self.assertTrue(task['execution_blocked'])
+        self.assertTrue(task['provider_candidates']['tv_episodes'])
+        self.assertEqual((), plan_files)
+        self.assertFalse(hasattr(renamer, 'last_plan'))
 
 
 if __name__ == '__main__':

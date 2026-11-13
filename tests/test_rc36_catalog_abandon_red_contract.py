@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import inspect
 import json
@@ -16,6 +17,8 @@ from src.pages import data_table_page
 from src.rename.decision_state import DecisionStateStore
 from src.rename.execution_recovery import ExecutionRecoveryError
 from src.rename.plan_review import PlanReviewService
+from src.rename.plan_execution import PlanExecutionService
+from src.task_queue import TaskQueueManager
 from src.rename.plan_store import PlanStore
 from src.rename.rename_plan import RenamePlan
 from tests.projection_test_support import save_plan_fixture
@@ -78,7 +81,17 @@ class Rc36CatalogAbandonRedContracts(unittest.TestCase):
             recovery = SimpleNamespace(submit=Mock())
             review_refresh = Mock()
             history_refresh = Mock()
+            manager = TaskQueueManager(
+                task_root=root / "tasks", plan_root=root / "plans",
+                decision_state_root=root / "decisions",
+                recovery_abandon_audit_root=root / "audit",
+                execution_service=PlanExecutionService(
+                    plan_store, PlanReviewService(plan_store, root / "reviews"),
+                    task_root=root / "tasks", record_root=root / "records",
+                ),
+            )
             with (
+                patch.object(data_table_page, "task_queue", manager),
                 patch.object(data_table_page, "TASK_PATH", root / "tasks"),
                 patch.object(data_table_page, "RECORD_PATH", root / "records"),
                 patch.object(data_table_page, "PLAN_PATH", root / "plans"),
@@ -102,9 +115,9 @@ class Rc36CatalogAbandonRedContracts(unittest.TestCase):
                     history_refresh,
                 ),
             ):
-                data_table_page._abandon_catalog_update(
+                asyncio.run(data_table_page._abandon_catalog_update(
                     confirm, recovery, task_id, fingerprint
-                )
+                ))
 
             self.assertFalse((root / "tasks" / f"{task_id}.json").exists())
             self.assertTrue(

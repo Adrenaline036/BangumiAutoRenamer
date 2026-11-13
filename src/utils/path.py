@@ -23,7 +23,6 @@ RECORD_PATH = DATA_PATH / 'record'
 TASK_PATH = DATA_PATH / 'task'
 PLAN_PATH = DATA_PATH / 'plan'
 PLAN_REVIEW_PATH = DATA_PATH / 'plan_review'
-AI_ANALYSIS_PATH = DATA_PATH / 'ai_analysis'
 WORK_CATALOG_PATH = DATA_PATH / 'work_catalog'
 DECISION_STATE_PATH = DATA_PATH / 'decision_state'
 SERIES_CATALOG_PATH = DATA_PATH / 'series_catalog'
@@ -39,7 +38,6 @@ for i in [
     TASK_PATH,
     PLAN_PATH,
     PLAN_REVIEW_PATH,
-    AI_ANALYSIS_PATH,
     WORK_CATALOG_PATH,
     DECISION_STATE_PATH,
     SERIES_CATALOG_PATH,

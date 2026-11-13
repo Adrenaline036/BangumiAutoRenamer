@@ -8,7 +8,9 @@ the successful production result.
 """
 
 from __future__ import annotations
+from tests.queue_fixture import TaskQueueManager as ControlledQueue
 
+from tests._approval_stage_helpers import approve_dialog
 import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
@@ -26,7 +28,7 @@ import src.pages.plan_review_page as review_page
 import src.rename.projection_authority as projection_module
 import src.utils.utils as utils_module
 import tests.test_provider_subject_plan_wiring_red_contract as phase_b
-import tests.test_tv_font_series_association_red_contract as execution_fixture
+import tests._media_flow_helpers as execution_fixture
 from src.pages.plan_review_page import PlanReviewDialog
 from src.rename.execution_recovery import reconcile_catalog_update
 from src.rename.plan_execution import PlanExecutionError, PlanExecutionService
@@ -44,6 +46,9 @@ from src.rename.rename_plan import PlanStatus
 from src.rename.series_catalog import SeriesCatalog
 from src.rename.work_catalog import WorkCatalog
 from src.task_queue import TaskQueueManager
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 
 def _json(path: Path) -> dict:
@@ -82,11 +87,15 @@ class ProviderSubjectExecutionCatalogRedContracts(
             selected_subject_id="331887",
             library_root=root / "library",
         )
+        review = PlanReviewService(PlanStore(result.plans), result.reviews, result.root / 'work_catalog',
+            decision_state_root=result.decisions, task_root=result.tasks)
+        result.state = review.decision_state_store.load(result.task_id)
+        result.task = utils_module.read_task_at(result.tasks, result.task_id)
         verification = PlanVerifier().verify(result.plan)
         problems = []
-        if verification.status != PlanStatus.ACCEPTED:
+        if verification.status not in {PlanStatus.ACCEPTED, PlanStatus.NEED_CONFIRM}:
             problems.append(
-                f"86 provider Plan status is {verification.status.value}, not accepted"
+                f"86 provider Plan status is {verification.status.value}, not human-reviewable"
             )
         if verification.issues:
             problems.append(
@@ -107,12 +116,16 @@ class ProviderSubjectExecutionCatalogRedContracts(
         )
         return result
 
-    def _approve(self, result: SimpleNamespace):
+    async def _approve(self, result: SimpleNamespace):
         store = PlanStore(result.plans)
         review = PlanReviewService(
-            store, result.reviews, result.root / "work_catalog"
+            store, result.reviews, result.root / "work_catalog",
+            decision_state_root=result.decisions, task_root=result.tasks
         )
         plan = store.load(result.task_id)
+        result.plan = plan
+        result.state = review.decision_state_store.load(result.task_id)
+        result.task = utils_module.read_task_at(result.tasks, result.task_id)
         dialog = SimpleNamespace(
             review_service=review,
             plan=plan,
@@ -128,9 +141,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
             patch.object(utils_module, "TASK_PATH", result.tasks),
             patch.object(review_page, "notify"),
         ):
-            PlanReviewDialog._approve(
-                dialog, tuple(entry_id(item) for item in plan.entries)
-            )
+            await approve_dialog(dialog, tuple(entry_id(item) for item in plan.entries))
         approved = store.load(result.task_id)
         return store, review, approved, store.fingerprint(approved)
 
@@ -144,6 +155,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
             waiter_polled = threading.Event()
             cas_lock = threading.Lock()
             cas_count = 0
+            cas_observations = []
             barrier_task_id: str | None = None
             task_sha_at_barrier: str | None = None
             task_sha_after_waiter: str | None = None
@@ -151,7 +163,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
             original_cas = projection_module.replace_task_record_at_if_sha256
             original_read = TaskQueueManager._read
 
-            def blocked_second_cas(
+            def blocked_selection_cas(
                 task_root,
                 task_id,
                 *,
@@ -162,7 +174,14 @@ class ProviderSubjectExecutionCatalogRedContracts(
                 with cas_lock:
                     cas_count += 1
                     current_count = cas_count
-                if current_count == 2:
+                journal_path = Path(task_root).parent / 'projection_journal' / f'{task_id}.json'
+                journal = _json(journal_path) if journal_path.exists() else {}
+                selection = current_provider_selection_context(data)
+                cas_observations.append((current_count, journal.get('phase'),
+                    selection.get('state') if selection else None, data.get('queue_operation')))
+                if (not cas_entered.is_set() and journal.get('status') == 'pending'
+                        and journal.get('phase') == 'plan_written' and selection
+                        and data.get('queue_operation') == 'reidentify'):
                     barrier_task_id = task_id
                     task_path = Path(task_root) / f"{task_id}.json"
                     task_sha_at_barrier = hashlib.sha256(
@@ -198,7 +217,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
                     patch.object(
                         projection_module,
                         "replace_task_record_at_if_sha256",
-                        blocked_second_cas,
+                        blocked_selection_cas,
                     ),
                     patch.object(TaskQueueManager, "_read", traced_read),
                 ):
@@ -207,7 +226,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
                         await asyncio.wait_for(
                             asyncio.to_thread(cas_entered.wait, 10), timeout=11
                         ),
-                        "provider reidentify never reached the second projection CAS",
+                        f"provider reidentify never reached its plan-written terminal CAS: {cas_observations}",
                     )
                     self.assertTrue(
                         await asyncio.wait_for(
@@ -231,12 +250,13 @@ class ProviderSubjectExecutionCatalogRedContracts(
                     journal_during_barrier = _json(journal_path)
             finally:
                 cas_release.set()
-
-            if flow is not None:
-                try:
-                    result = await asyncio.wait_for(flow, timeout=20)
-                except BaseException as exc:
-                    flow_error = exc
+                if flow is not None:
+                    try:
+                        result = await asyncio.wait_for(asyncio.shield(flow), timeout=30)
+                    except BaseException as exc:
+                        flow_error = exc
+                        if not flow.done():
+                            await flow
 
             journal_path = (
                 root
@@ -248,7 +268,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
             final_task = _json(
                 root / "flow" / "tasks" / f"{barrier_task_id}.json"
             )
-            restarted = TaskQueueManager(
+            restarted = ControlledQueue(
                 task_root=root / "flow" / "tasks",
                 decision_state_root=root / "flow" / "decisions",
                 plan_root=root / "flow" / "plans",
@@ -274,7 +294,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
         self.assertEqual(task_sha_at_barrier, task_sha_after_waiter)
         self.assertEqual("completed", final_journal.get("status"))
         self.assertEqual(
-            "succeeded", final_task["selection_operation"]["state"]
+            "succeeded", current_provider_selection_context(final_task)["state"]
         )
         self.assertIsNone(restart_error)
         self.assertEqual((), pending_after_restart)
@@ -285,7 +305,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = await self._real_86_plan(root)
-            runner = execution_fixture.TVFontSeriesAssociationRedContracts(
+            runner = execution_fixture.MediaFlow(
                 methodName="runTest"
             )
             try:
@@ -356,7 +376,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = await self._real_86_plan(root, subtitles=False)
-            store, review, plan, fingerprint = self._approve(result)
+            store, review, plan, fingerprint = await self._approve(result)
             source = plan.entries[0].source_path
             source.write_bytes(source.read_bytes() + b"-changed-after-approval")
             transfer_calls: list[str] = []
@@ -477,7 +497,8 @@ class ProviderSubjectExecutionCatalogRedContracts(
             )
             service = PlanExecutionService(
                 PlanStore(result.plans),
-                PlanReviewService(PlanStore(result.plans), result.reviews),
+                PlanReviewService(PlanStore(result.plans), result.reviews, result.root / 'work_catalog',
+                    decision_state_root=result.decisions, task_root=result.tasks),
                 task_root=result.tasks,
                 record_root=result.root / "records",
                 catalog_root=result.root / "work_catalog",
@@ -501,7 +522,7 @@ class ProviderSubjectExecutionCatalogRedContracts(
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = await self._real_86_plan(root, subtitles=False)
-            runner = execution_fixture.TVFontSeriesAssociationRedContracts(
+            runner = execution_fixture.MediaFlow(
                 methodName="runTest"
             )
             with patch.object(

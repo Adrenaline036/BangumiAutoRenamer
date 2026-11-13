@@ -214,7 +214,7 @@ class RecoveryDiagnosisGate1Contracts(unittest.TestCase):
 
         self.assertEqual("catalog_detach_pending", pending.recovery_state)
 
-    def test_work_and_series_diagnosis_is_domain_orthogonal(self):
+    def test_domain_does_not_turn_unsigned_series_into_relocation_authority(self):
         missing_root = self.root / "missing-library-work"
         work_payload = {
             "schema_version": WORK_CATALOG_SCHEMA_VERSION,
@@ -275,11 +275,17 @@ class RecoveryDiagnosisGate1Contracts(unittest.TestCase):
                     ),
                 )
                 snapshot = service.diagnose(decision, self.plan)
-                self.assertEqual("catalog_root_missing", snapshot.state)
-                self.assertEqual(
-                    ("relocate_catalog", "confirm_catalog_detach"),
-                    snapshot.allowed_actions,
-                )
+                if backend == "series":
+                    self.assertEqual("evidence_conflict", snapshot.state)
+                    self.assertEqual((), snapshot.allowed_actions)
+                    self.assertFalse(snapshot.can_rebuild_catalog)
+                    self.assertFalse(snapshot.can_rebuild_plan)
+                else:
+                    self.assertEqual("catalog_root_missing", snapshot.state)
+                    self.assertEqual(
+                        ("relocate_catalog", "confirm_catalog_detach"),
+                        snapshot.allowed_actions,
+                    )
 
     def test_four_routes_keep_foreign_target_inode_conflicts_fail_closed(self):
         """Routing dimensions must never bypass the hardlink evidence gate."""
@@ -380,6 +386,9 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         transaction = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate1-idempotent-state",
+                "catalog_backend": "work",
+                "catalog_key": WORK_KEY,
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "catalog_archived",
                 "expected_decision_revision": 7,
@@ -409,6 +418,9 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         transaction = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate1-idempotent-plan",
+                "catalog_backend": "work",
+                "catalog_key": WORK_KEY,
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "decision_detached",
                 "expected_decision_revision": 8,
@@ -435,6 +447,9 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         transaction = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate1-block",
+                "catalog_backend": "work",
+                "catalog_key": WORK_KEY,
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "catalog_archived",
                 "expected_decision_revision": 2,
@@ -449,6 +464,7 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         transaction = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate1-prepared-window",
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "prepared",
                 "catalog_backend": "work",
@@ -478,6 +494,7 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         transaction = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate1-catalog-archived",
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "catalog_archived",
                 "catalog_backend": "work",
@@ -506,6 +523,9 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         transaction = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate3-pending-clear",
+                "catalog_backend": "work",
+                "catalog_key": WORK_KEY,
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "catalog_archived",
             }
@@ -591,6 +611,7 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
         prepared = api.RecoveryTransaction.from_dict(
             {
                 "task_id": "gate1-stale-prepared",
+                "recovery_nonce": "a" * 32,
                 "operation": "catalog_detach_pending",
                 "phase": "prepared",
                 "catalog_backend": "work",
@@ -632,7 +653,7 @@ class CatalogDetachTransactionGate1Contracts(unittest.TestCase):
 
 
 class CatalogDetachGate3ExecutionContracts(unittest.TestCase):
-    def test_work_catalog_detach_finishes_with_cleared_state_and_projected_plan(self):
+    def test_prepared_detach_can_cancel_when_media_root_exists(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.mkv"
@@ -691,6 +712,99 @@ class CatalogDetachGate3ExecutionContracts(unittest.TestCase):
             series_root.mkdir()
             task_root = root / "tasks"
             task_root.mkdir()
+            (task_root / f"{plan.task_id}.json").write_text(
+                json.dumps({"uuid": plan.task_id, "workflow_status": "need_confirm"}), encoding="utf-8"
+            )
+            transaction_store = RecoveryTransactionStore(root / "transactions")
+            work_catalog = WorkCatalog(catalog_root)
+            service = CatalogDetachService(
+                transaction_store=transaction_store,
+                decision_store=decision_store,
+                plan_store=plan_store,
+                work_catalog=work_catalog,
+                series_catalog=SeriesCatalog(series_root),
+                task_root=task_root,
+            )
+
+            # Simulate the critical crash window: Catalog was archived, but the
+            # prepared transaction phase was not advanced yet.
+            with transaction_store.lock(plan.task_id):
+                service._prepare(
+                    plan.task_id, catalog_backend="work", catalog_key=WORK_KEY
+                )
+            missing_target.parent.mkdir()
+            missing_target.write_bytes(b'preserve')
+            catalog_bytes=(catalog_root/f'{WORK_KEY}.json').read_bytes()
+            state, fresh=service.cancel_prepared(plan.task_id)
+            self.assertEqual('healthy', state.recovery_state)
+            self.assertIsNone(transaction_store.load_optional(plan.task_id))
+            self.assertEqual(catalog_bytes,(catalog_root/f'{WORK_KEY}.json').read_bytes())
+            self.assertEqual(b'preserve',missing_target.read_bytes())
+            self.assertEqual(1,len(list((root/'transactions'/'cancelled').glob('*.json'))))
+            self.assertIsNotNone(fresh.projection_receipt)
+
+    def test_work_catalog_detach_finishes_with_cleared_state_and_projected_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mkv"
+            source.write_bytes(b"media")
+            missing_target = root / "missing-library" / "Example.mkv"
+            plan = RenamePlan(
+                "gate3-work-detach",
+                root,
+                (PlanEntry(source, missing_target, media_kind="video", role="main_episode"),),
+                expected_sources=(source,),
+                metadata={"catalog_work_key": WORK_KEY, "catalog_revision": 3},
+            )
+            plan_store = PlanStore(root / "plans")
+            plan = save_plan_fixture(plan_store, plan)
+            decision_store = DecisionStateStore(root / "decisions")
+            original = decision_store.save(
+                DecisionState(
+                    task_id=plan.task_id,
+                    recovery_state="catalog_root_missing",
+                    execution_failure={
+                        "code": "catalog_root_missing",
+                        "catalog_backend": "work",
+                        "catalog_key": WORK_KEY,
+                    },
+                    catalog_link_intent={"work_key": WORK_KEY},
+                    season_binding={
+                        "season_binding_id": "season-binding-old",
+                        "season_number": 1,
+                        "decision_source": "provider",
+                    },
+                ),
+                expected_revision=-1,
+            )
+            catalog_root = root / "catalog"
+            catalog_root.mkdir()
+            (catalog_root / f"{WORK_KEY}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": WORK_CATALOG_SCHEMA_VERSION,
+                        "work_key": WORK_KEY,
+                        "revision": 3,
+                        "title": "Example",
+                        "year": 2024,
+                        "domain": "animation",
+                        "group_kind": "movie_continuous",
+                        "canonical_root": str(root / "missing-library"),
+                        "aliases": [],
+                        "providers": [{"namespace": "tmdb", "entity_type": "movie", "provider_id": "4242"}],
+                        "versions": [],
+                        "assets": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            series_root = root / "series"
+            series_root.mkdir()
+            task_root = root / "tasks"
+            task_root.mkdir()
+            (task_root / f"{plan.task_id}.json").write_text(
+                json.dumps({"uuid": plan.task_id, "workflow_status": "need_confirm"}), encoding="utf-8"
+            )
             transaction_store = RecoveryTransactionStore(root / "transactions")
             work_catalog = WorkCatalog(catalog_root)
             service = CatalogDetachService(
@@ -761,6 +875,9 @@ class CatalogDetachGate3ExecutionContracts(unittest.TestCase):
 
 
 class _UiStub:
+    def clear(self):
+        return None
+
     def classes(self, *_args, **_kwargs):
         return self
 
@@ -801,15 +918,18 @@ class TitleAuthorityGate1Contracts(unittest.TestCase):
 
     def test_review_header_renders_authoritative_title_not_legacy_metadata(self):
         dialog = SimpleNamespace(
-            plan=SimpleNamespace(
+            task_id="gate1-title",
+            plan=RenamePlan(
+                task_id="gate1-title",
+                source_root=Path("source"),
+                entries=(),
                 metadata={
                     "name": "错误的旧 Plan 标题",
                     "season_id": 1,
                     "mapping_source": "fixture",
                 },
-                task_id="gate1-title",
-                migrated_from_schema=None,
             ),
+            task_data={},
             snapshot=SimpleNamespace(
                 plan_status="need_confirm",
                 rows=(),

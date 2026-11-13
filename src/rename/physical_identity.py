@@ -12,7 +12,12 @@ class PhysicalIdentityUnavailable(ValueError):
 
 
 def canonical_location_key(path: Path) -> str:
-    return os.path.normcase(str(Path(path).resolve(strict=True))).casefold()
+    return location_key_from_resolved(Path(path).resolve(strict=True))
+
+
+def location_key_from_resolved(path: Path) -> str:
+    """Format a caller's just-resolved path without another filesystem walk."""
+    return os.path.normcase(str(path)).casefold()
 
 
 def canonical_physical_key(stat_result: Any) -> str:

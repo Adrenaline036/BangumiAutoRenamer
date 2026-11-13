@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import src.pages.plan_review_page as review_page
 import src.utils.utils as utils_module
 import tests.test_isolated_sample_acceptance as isolated_fixture
-import tests.test_movie_font_work_catalog_red_contract as movie_fixture
+import tests._media_flow_helpers as movie_fixture
 import tests.test_r1_real_media_production_red_contract as production_fixture
 from src.pages.plan_review_page import PlanReviewDialog
 from src.rename.decision_state import DecisionCommandService, DecisionStateStore
@@ -29,20 +29,26 @@ from src.rename.plan_verifier import PlanVerifier
 from src.rename.series_catalog import SeriesCatalog
 from src.rename.subtitle_workflow import format_subtitle_target_fields
 from src.rename.target_routing import TargetRootSnapshot
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+)
 
 
 class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
     async def _complete_real_movie(self, root: Path, task_id: str):
-        case = movie_fixture.MovieFontProductionRedContracts(methodName="runTest")
+        case = movie_fixture.MediaFlow(methodName="runTest")
         source, primary, expected_sources = movie_fixture._make_omoide(
             root / "sources"
         )
         initial = await case._run_provider_flow(root / "flow", source, task_id)
-        completed = case._complete_movie(
+        completed = await case._complete_movie(
             root=root / "flow",
             result=initial,
             primary=primary,
         )
+        self.addCleanup(case.doCleanups)
+        self.assertEqual('initial_movie_completion', completed.plan.revision_action,
+                         (completed.notices, completed.form_messages))
         return case, source, primary, expected_sources, initial, completed
 
     async def test_real_movie_ui_flow_persists_canonical_zh_hans_plan(self):
@@ -88,12 +94,15 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
             problems = []
             if initial.initial_plan.metadata.get("mapping_source") != "inventory_review_draft":
                 problems.append("initial worker did not persist the inventory review draft")
-            if initial.task.get("selection_operation", {}).get(
+            if current_provider_selection_context(initial.task).get(
                 "previous_workflow_status"
-            ) != "invalid":
-                problems.append("provider selection did not follow the safe-invalid draft")
-            if len(plan.entries) != 7 or set(plan.expected_sources) != set(expected_sources):
-                problems.append("production movie flow did not preserve the exact seven-file Plan")
+            ) != "need_confirm":
+                problems.append("provider selection did not follow the unapproved inventory draft")
+            actual_inputs=set(_source.rglob('*'))
+            actual_inputs={p for p in actual_inputs if p.is_file()}
+            media_inputs = actual_inputs - set(plan.ignored_sources)
+            if {e.source_path for e in plan.entries} != media_inputs or set(plan.expected_sources) != actual_inputs:
+                problems.append("production movie flow lost retained media or inventory")
             if (
                 subtitle.raw_label,
                 subtitle.primary_language,
@@ -110,10 +119,9 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
                 issue.code for issue in verification.issues
             }:
                 problems.append("the canonical production Plan was rejected by PlanVerifier")
-            if len(extra_entries) != 3 or any(
-                entry.target_path.parent.name != "Extras" for entry in extra_entries
-            ):
-                problems.append("movie extras did not retain the exact canonical Extras directory")
+            non_watchable = {p for p in expected_sources if 'SPs' in p.parts}
+            if extra_entries or not non_watchable <= set(plan.ignored_sources):
+                problems.append("CM/Menu must stay excluded while the canonical subtitle remains")
             persisted = completed.store.load(plan.task_id)
             if persisted != plan:
                 problems.append("movie smart-completion Plan was not persisted exactly")
@@ -148,7 +156,8 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
                 initial.task.get("completed_at"),
                 "fixture must preserve the real invalid-worker counterexample",
             )
-            self.assertEqual("need_confirm", completed.task.get("workflow_status"))
+            self.assertEqual("need_confirm", completed.task.get("workflow_status"),
+                [(i.code, i.message, str(i.source_path)) for i in PlanVerifier().verify(completed.plan).issues])
             self.assertIsNone(
                 completed.task.get("completed_at"),
                 "a non-terminal review task must not retain a terminal timestamp",
@@ -223,13 +232,16 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 {
                     "subtitle_target_not_canonical",
+                    "content_policy_pending",
                     "projection_receipt_mismatch",
+                    "movie_version_selection_invalid",
+                    "movie_asset_authority_invalid",
                 },
                 split_codes - canonical_codes,
             )
 
-    async def test_traditional_tv_worker_persists_exact_capitalized_extras(self):
-        """The rules/traditional route must emit ``Season NN/Extras``."""
+    async def test_current_tv_explicit_extra_uses_exact_capitalized_extras(self):
+        """New default keeps an ambiguous NCOP pending until explicit choice."""
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -255,30 +267,47 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
                 source=source,
                 task_id="traditional-tv-extras-canonical",
                 candidate=production_fixture._candidate("86670"),
+                is_anime=True,
+                is_movie=False,
             )
             persisted = PlanStore(root / "flow" / "plans").load(result.plan.task_id)
-            extra = next(
-                entry for entry in persisted.entries if entry.source_path == extra_source
-            )
+            flow = root/'flow'
+            review = PlanReviewService(PlanStore(flow/'plans'), flow/'reviews', flow/'work_catalog',
+                task_root=flow/'tasks', decision_state_root=flow/'decisions', record_root=flow/'records',
+                provider_link_catalog_root=flow/'provider_links')
+            from src.rename.initial_movie_completion import RootSnapshotSource
+            roots = TargetRootSnapshot.capture({'bangumi_path': flow/'TV', 'movie_path': flow/'Movies',
+                'anime_path': flow/'Anime', 'anime_movie_path': flow/'AnimeMovies'})
+            review.root_snapshot_source = RootSnapshotSource(lambda: roots)
+            from tests.test_content_choice_contract import change
+            persisted=change(review,persisted,[extra_source],action='restore')
+            extra=next(e for e in persisted.entries if e.source_path==extra_source)
+            from src.rename.plan_review import entry_id
+            persisted = review.revise_tv_content(persisted.task_id, PlanStore.fingerprint(persisted),
+                expected_revision=review.decision_state_store.load(persisted.task_id).revision, mode='role',
+                edit={'entry_id': entry_id(extra), 'role': 'extra'})
+            extra = next(e for e in persisted.entries if e.source_path == extra_source)
             canonical_root = Path(str(persisted.metadata["canonical_work_root"]))
 
-        self.assertEqual("rules", persisted.metadata.get("mapping_source"))
-        self.assertEqual(canonical_root / "Season 02", extra.target_path.parent.parent)
-        self.assertEqual("Extras", extra.target_path.parent.name)
+        self.assertEqual('tv_content_role', persisted.revision_action)
+        self.assertEqual(canonical_root / "Season 02" / "Extras", extra.target_path.parent)
 
-    async def test_smart_tv_button_persists_exact_capitalized_extras(self):
-        """The review smart-completion projection must use the same exact name."""
+    async def test_movie_has_no_legacy_tv_conversion_or_plan_mutation(self):
+        """Retired cross-type layout action must not return through old state."""
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            case = movie_fixture.MovieFontProductionRedContracts(methodName="runTest")
+            case = movie_fixture.MediaFlow(methodName="runTest")
             source, _primary, _expected = movie_fixture._make_omoide(root / "sources")
-            initial = await case._run_provider_flow(
-                root / "flow", source, "smart-tv-extras-canonical"
-            )
+            initial = await case._run_provider_flow(root / "flow", source, "smart-tv-extras-canonical")
+            self.assertIsNotNone(initial.state.content_selection)
             flow = root / "flow"
             store = PlanStore(flow / "plans")
-            review = PlanReviewService(store, flow / "reviews", flow / "work_catalog")
+            review = PlanReviewService(
+                store, flow / "reviews", flow / "work_catalog",
+                task_root=flow / "tasks",
+                decision_state_root=flow / "decisions",
+            )
             state_store = DecisionStateStore(flow / "decisions")
             dialog = SimpleNamespace(
                 plan=initial.plan,
@@ -295,7 +324,6 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
                 _selected_movie_primary_sources=MagicMock(return_value=[]),
                 _render_movie_primary_picker=MagicMock(),
                 _complete_movie_with_primary=MagicMock(),
-                _toggle_movie_segments=MagicMock(),
                 _render_groups=MagicMock(),
                 _render_catalog_context=MagicMock(),
                 _render_completion_workflow=MagicMock(),
@@ -341,6 +369,10 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
 
                 @staticmethod
                 def column():
+                    return _Node()
+
+                @staticmethod
+                def expansion(*_args, **_kwargs):
                     return _Node()
 
                 @staticmethod
@@ -390,107 +422,17 @@ class SubtitleExtrasCanonicalRedContracts(unittest.IsolatedAsyncioTestCase):
                 )
                 if dialog.tv_season_input is not None:
                     dialog.tv_season_input.value = 4
-                callback = ui.callbacks.get("按季和集智能整理")
-                if callback is None:
-                    raise AssertionError("TV smart completion button is not wired")
-                callback()
+                self.assertNotIn("生成剧集整理计划", ui.callbacks)
+                self.assertNotIn("重新生成剧集整理计划", ui.callbacks)
+                self.assertNotIn("按季和集智能整理", ui.callbacks)
 
             persisted = store.load(initial.plan.task_id)
             persisted_state = state_store.load(initial.plan.task_id)
-            notice_calls = tuple(
-                (str(call.args[0]), str(call.kwargs.get("type") or ""))
-                for call in notify_mock.call_args_list
-                if call.args
-            )
-            notifications = tuple(text for text, _kind in notice_calls)
-            extras = tuple(
-                entry
-                for entry in persisted.entries
-                if entry.presentation_asset is not None
-                and entry.presentation_asset.asset_role.kind == "extra"
-            )
+            notify_mock.assert_not_called()
+        self.assertEqual(before_revision, persisted_state.revision)
+        self.assertEqual(before_fingerprint, store.fingerprint(persisted))
+        self.assertEqual('movie', persisted.work_identity.primary_provider.entity_type)
 
-        self.assertEqual(
-            "inventory_smart_completion",
-            persisted.metadata.get("mapping_source"),
-            notifications,
-        )
-        self.assertEqual(
-            (("已完成可确定项目；仍有 4 个结构问题需要确认", "warning"),),
-            notice_calls,
-        )
-        self.assertGreater(persisted_state.revision, before_revision)
-        self.assertNotEqual(before_fingerprint, store.fingerprint(persisted))
-        self.assertEqual(
-            persisted_state.revision,
-            persisted.metadata.get("decision_state_revision"),
-        )
-        self.assertEqual(
-            DecisionStateStore.fingerprint(persisted_state),
-            persisted.metadata.get("decision_state_fingerprint"),
-        )
-        self.assertEqual({"tv_episodes"}, {group.kind for group in persisted.presentation_groups})
-        self.assertEqual(
-            {4},
-            {
-                entry.season_id
-                for entry in persisted.entries
-                if entry.media_kind != "associated"
-            },
-        )
-        self.assertEqual({4}, {entry.season_id for entry in extras})
-        self.assertEqual(3, len(extras))
-        expected_season_root = (
-            Path(str(persisted.metadata["canonical_work_root"])) / "Season 04"
-        )
-        self.assertTrue(
-            all(entry.target_path.parent.parent == expected_season_root for entry in extras)
-        )
-        self.assertTrue(all(entry.target_path.parent.name == "Extras" for entry in extras))
-
-    def test_movie_extras_control_is_exact_capitalized_plural(self):
-        """The already-correct movie projection is a non-RED control."""
-
-        fixture = isolated_fixture.IsolatedSampleAcceptanceTests(
-            methodName="runTest"
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            _source, allowed, plan, store, service = fixture._inventory_plan_with_identity(
-                root,
-                (
-                    "Example Work [1080p].mkv",
-                    "SPs/Example Work [CM01].mkv",
-                ),
-                task_id="movie-extras-control",
-                is_movie=True,
-            )
-            revised = service.complete_inventory_draft(
-                plan.task_id,
-                store.fingerprint(plan),
-                group_id=plan.presentation_groups[0].group_id,
-                group_kind="movie_continuous",
-                target_root=allowed / "AnimeMovies",
-                reason="用户确认电影正片",
-                root_snapshot=isolated_fixture.routing_snapshot_for(
-                    allowed / "AnimeMovies",
-                    domain="animation", group_kind="movie_continuous",
-                ),
-                primary_video_source=next(
-                    entry.source_path
-                    for entry in plan.entries
-                    if entry.media_kind == "video"
-                    and "SPs" not in entry.source_path.parts
-                ),
-            )
-            extra = next(
-                entry
-                for entry in revised.entries
-                if entry.presentation_asset is not None
-                and entry.presentation_asset.asset_role.kind == "extra"
-            )
-
-        self.assertEqual("Extras", extra.target_path.parent.name)
 
 
 if __name__ == "__main__":

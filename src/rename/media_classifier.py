@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .cleaner import extract_number
-from .utils import EXTRA_TAG
+from .utils import EXTRA_TAG, VIDEO_SUFFIX
 
 
 class LocalRole(str, Enum):
@@ -130,6 +130,114 @@ def _normalize_directory_name(value: str) -> str:
     return ' '.join(normalized.replace('_', ' ').replace('-', ' ').split())
 
 
+WATCHABLE_OBSERVATION_POLICY = 'safe-watchable-content-v1'
+AUDIO_DISC_DIRECTORY_NAMES = frozenset({'ost', '特典cd', 'audiocd', 'audio cd', 'cd', 'cds', 'bonus cd', 'bonus cds'})
+
+
+def is_audio_disc_directory(value: str) -> bool:
+    """Known CD name, optionally followed by a complete numeric volume marker."""
+    name = _normalize_directory_name(value)
+    name = re.sub(r'\s+(?:\(vol\.\s*\d+\)|vol\.\s*\d+)$', '', name)
+    return name in AUDIO_DISC_DIRECTORY_NAMES
+
+
+@dataclass(frozen=True)
+class WatchableContentObservation:
+    """Classification evidence only: no target, approval or executable decision."""
+    source_path: Path
+    disposition: str
+    reason_codes: tuple[str, ...]
+    policy: str = WATCHABLE_OBSERVATION_POLICY
+
+
+def _observation_relative(path: Path, root: Path) -> Path:
+    if (not path.is_absolute() or not root.is_absolute()
+            or '..' in path.parts or '..' in root.parts):
+        raise ValueError('内容观察来源越界或不是绝对路径')
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError('内容观察来源不属于当前范围') from exc
+    if relative == Path('.'):
+        raise ValueError('内容观察必须指定范围内的一项来源')
+    return relative
+
+
+def observe_watchable_content(path, *, source_root, work_title='', protected_role=None,
+                               linked_video=None, directory_has_video=None, exclude_source_images=False):
+    """Pure bounded-name observation; callers must separately validate/freeze inputs.
+
+    Unlike CONFIRMED_EXTRA, this never treats SP directories or provider-special
+    candidates as permission to omit content. It does no filesystem or Provider IO.
+    """
+    path, root = Path(path), Path(source_root)
+    relative = _observation_relative(path, root)
+    if protected_role not in {None, 'content_version', 'provider_special'}:
+        raise ValueError('未知内容保护观察类型')
+    if directory_has_video is not None and type(directory_has_video) is not bool:
+        raise ValueError('目录视频观察必须明确或未知')
+    if linked_video is not None:
+        video = Path(linked_video)
+        _observation_relative(video, root)
+        if video == path or video.suffix.casefold() not in VIDEO_SUFFIX:
+            raise ValueError('配套关联观察缺少有效视频来源')
+    def result(disposition, code):
+        return WatchableContentObservation(path, disposition, (code,))
+    from .subtitle_labels import SUBTITLE_SUFFIXES
+    suffix = path.suffix.casefold()
+    if linked_video is not None or protected_role is not None and suffix in VIDEO_SUFFIX:
+        return result('keep_candidate', 'existing_content_or_companion_evidence')
+    if suffix in SUBTITLE_SUFFIXES:
+        return result('needs_confirmation', 'unresolved_subtitle_companion')
+    if suffix not in VIDEO_SUFFIX:
+        return result('known_non_watchable', 'not_a_video_companion')
+    semantic = unicodedata.normalize('NFKC', path.stem).casefold()
+    title = unicodedata.normalize('NFKC', str(work_title)).casefold().strip()
+    title_removed = False
+    if title:
+        prefix = re.match(re.escape(title) + r'(?=$|[\s._\-\[\(【<])', semantic)
+        if prefix:
+            semantic = semantic[prefix.end():].strip(' ._-')
+            title_removed = True
+    tag = r'(?:menu|菜单|trailer|teaser|预告|予告編|特報|cm|tv[ -]spot|pv|mv)\d*'
+    promo = rf'(?:各種\s*)?{tag}(?:\s*[・·＆&+/、]\s*{tag})*'
+    stage = r'(?:\d{1,2}月\d{1,2}日)?(?:初日)?(?:舞台挨拶|プレミアムイベント)映像'
+    extra = r'(?:(?:promotion|preview)\d*(?:-\d+)?|review\d+(?:-\d+)?|nc(?:op|ed)\d*(?:[_ -]+ep\d+(?:-\d+)?)?)'
+    misc_label = rf'(?:{promo}|{stage}|{extra})'
+    labels = [content.strip() for match in _BRACKET_PATTERN.finditer(semantic)
+              for content in match.groups() if content is not None]
+    explicit_misc = any(re.fullmatch(misc_label, label) for label in labels)
+    # Release names often use a separate " - Menu [BD ...] - Group" field.
+    # Match the whole field, not words anywhere inside the work title.
+    for field in re.split(r'\s+[-–—]\s+', semantic)[0 if title_removed else 1:]:
+        label = re.split(r'[\[（(【<]', field, maxsplit=1)[0].strip()
+        explicit_misc = explicit_misc or re.fullmatch(misc_label, label) is not None
+    residual = semantic
+    for technical in _TECHNICAL_PATTERNS:
+        residual = re.sub(technical, '', residual, flags=re.IGNORECASE)
+    residual = re.sub(r'[\[\]()【】<>]', ' ', residual)
+    residual = ' '.join(residual.split()).strip(' ._-')
+    explicit_misc = explicit_misc or re.fullmatch(misc_label, residual) is not None
+    content_marker = re.search(r'(?<![a-z0-9])(?:s\d{1,2}e\d{1,3}|ova|oad|cd\d+|\d+\.\d+)(?![a-z0-9])', semantic)
+    if path.suffix.casefold() in VIDEO_SUFFIX:
+        if content_marker and explicit_misc:
+            return result('needs_confirmation', 'conflicting_content_and_misc_evidence')
+        if content_marker:
+            return result('keep_candidate', 'episodic_or_complete_segment_candidate')
+        if explicit_misc:
+            return result('known_non_watchable', 'explicit_non_watchable_video_label')
+        return result('needs_confirmation', 'unresolved_viewable_video')
+
+
+def observe_watchable_sources(paths, *, source_root, work_title='', protected_roles=None, linked_videos=None,
+                              exclude_source_images=False):
+    """Pure observations over a complete frozen source set, never a rescan."""
+    paths, root = tuple(map(Path, paths)), Path(source_root)
+    protected_roles, linked_videos = protected_roles or {}, linked_videos or {}
+    return tuple(observe_watchable_content(path, source_root=root, work_title=work_title,
+        protected_role=protected_roles.get(path), linked_video=linked_videos.get(path)) for path in paths)
+
+
 def _is_inside_extra_directory(item_path: Path) -> bool:
     return any(
         _normalize_directory_name(parent.name) in EXTRA_DIRECTORY_NAMES
@@ -200,8 +308,31 @@ def _extra_tag_evidence(value: str) -> ExtraTagEvidence:
     )
 
 
+def _bracketed_fractional_episode(value: str) -> Optional[int]:
+    normalized = unicodedata.normalize('NFKC', value)
+    bracket_contents = [
+        content.strip()
+        for match in _BRACKET_PATTERN.finditer(normalized)
+        for content in match.groups()
+        if content is not None
+    ]
+    for content in bracket_contents:
+        match = re.fullmatch(
+            r'(\d{1,3})\s*[αβγb]',
+            content,
+            re.IGNORECASE,
+        )
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
 def _episode_like_bonus_number(value: str) -> tuple[bool, Optional[int]]:
     normalized = unicodedata.normalize('NFKC', value)
+    bracketed_fractional_episode = _bracketed_fractional_episode(normalized)
+    if bracketed_fractional_episode is not None:
+        return True, bracketed_fractional_episode
+
     integrated_episode = re.search(
         r'(?<!\d)(\d{1,3})\s*\((?:OVA|OAD)(?:\d{1,3})?\)',
         normalized,
@@ -317,6 +448,18 @@ def preclassify_media(
     files can therefore never steal a normal episode number.
     """
 
+    if item_path.suffix.casefold() not in VIDEO_SUFFIX:
+        supplementary = item_path.suffix.casefold() in {
+            '.bmp', '.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff',
+            '.cue', '.log', '.wav', '.flac', '.mp3', '.ape', '.m4a', '.txt', '.pdf',
+        }
+        return MediaPreclassification(
+            PreclassificationKind.CONFIRMED_EXTRA if supplementary else PreclassificationKind.UNKNOWN,
+            MediaClassification(LocalRole.DISC_EXTRA if supplementary else LocalRole.UNKNOWN,
+                season_id, 'extra' if supplementary else 'unknown', None,
+                'High' if supplementary else 'Low',
+                '非视频附属文件，保留来源分组' if supplementary else '非视频文件不能独立推断分集，须从关联视频派生'))
+
     semantic_context = (
         extra_context_name.strip()
         if extra_context_name is not None and extra_context_name.strip()
@@ -344,9 +487,29 @@ def preclassify_media(
             reason='文件名包含明确的 S00E 特别篇编号',
         ))
 
+    # 独立半集标记不能拆成整数候选；标题剥离后仍有此片段才作为证据。
+    # 保持 UNKNOWN，让所有消费者等待人工编号，不自动归为已确认附加内容。
+    context_tokens = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff/]+', ' ',
+                            unicodedata.normalize('NFKC', semantic_context))
+    for block in _BRACKET_PATTERN.finditer(unicodedata.normalize('NFKC', candidate_name)):
+        token = next(value.strip() for value in block.groups() if value is not None)
+        half = re.fullmatch(r'(\d{1,3})\.5', token)
+        if half and re.search(rf'(?<!\w){half.group(1)}\s+5(?!\w)', context_tokens):
+            return MediaPreclassification(PreclassificationKind.UNKNOWN, MediaClassification(
+                LocalRole.UNKNOWN, season_id, 'unknown', None, 'Low',
+                '小数集尚未确认分集或特别篇身份',
+            ))
+
     is_episode_like_bonus, bonus_episode = _episode_like_bonus_number(
         semantic_context
     )
+    if not is_episode_like_bonus:
+        candidate_fractional_episode = _bracketed_fractional_episode(
+            candidate_name
+        )
+        if candidate_fractional_episode is not None:
+            is_episode_like_bonus = True
+            bonus_episode = candidate_fractional_episode
     if is_episode_like_bonus:
         return MediaPreclassification(PreclassificationKind.CONFIRMED_EXTRA, MediaClassification(
             local_role=LocalRole.EPISODE_LIKE_BONUS,

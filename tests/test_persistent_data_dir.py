@@ -10,7 +10,7 @@ from src.config.config_manager import ConfigManager
 
 
 class PersistentDataDirTests(unittest.TestCase):
-    def test_legacy_media_mount_paths_migrate_to_full_volume1_paths(self):
+    def test_manual_media_mount_paths_remain_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(json.dumps({
@@ -22,10 +22,10 @@ class PersistentDataDirTests(unittest.TestCase):
 
             config = ConfigManager(config_path)
 
-            self.assertEqual("/volume1", config.get_config("docker_mnt"))
-            self.assertEqual("/volume1/Vault/Anime", config.get_config("anime_path"))
+            self.assertEqual("/media", config.get_config("docker_mnt"))
+            self.assertEqual("/media", config.get_config("anime_path"))
             self.assertEqual(
-                "/volume1/Vault/Anime/AnimeMovie",
+                "/media/AnimeMovie",
                 config.get_config("anime_movie_path"),
             )
             self.assertEqual("/volume1/Media/Movie", config.get_config("movie_path"))
@@ -45,7 +45,6 @@ print(json.dumps({
     'task': str(path.TASK_PATH),
     'plan': str(path.PLAN_PATH),
     'review': str(path.PLAN_REVIEW_PATH),
-    'ai': str(path.AI_ANALYSIS_PATH),
 }))
 """
             result = subprocess.run(

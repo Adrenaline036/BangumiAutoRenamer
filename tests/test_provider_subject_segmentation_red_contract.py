@@ -999,8 +999,15 @@ class ProviderSubjectSegmentationPhaseARedContracts(unittest.TestCase):
         self.assertEqual("42509", str(_field(accepted, "tmdb_tv_id") or ""))
         self.assertEqual("reviewable", _field(accepted, "review_disposition"))
         self.assertNotIn("locale_evidence_missing", _reason_codes(accepted))
-        self.assertEqual("blocked", _field(rejected, "review_disposition"))
-        self.assertIn("locale_candidate_conflict", _reason_codes(rejected))
+        self.assertEqual("reviewable", _field(rejected, "review_disposition"))
+        self.assertIsNone(_field(rejected, "tmdb_tv_id"))
+        self.assertEqual(
+            {"10380": 1}, dict(_field(rejected, "season_assignments"))
+        )
+        self.assertIn(
+            "bangumi_primary_tmdb_metadata_ambiguous",
+            _reason_codes(rejected),
+        )
 
     def test_observation_outcomes_authority_and_fingerprints_are_fail_closed(self):
         exact_zh = _query("命运石之门", "zh-CN", candidate=TMDB_STEINS)
@@ -1135,8 +1142,12 @@ class ProviderSubjectSegmentationPhaseARedContracts(unittest.TestCase):
                 relations=(),
                 observations=_batch("10380", (observation,), boundary_complete=False),
             )
-            self.assertNotEqual("reviewable", _field(result, "review_disposition"))
-            self.assertIn(reason, _reason_codes(result))
+            if reason == "subject_candidate_evidence_missing":
+                self.assertEqual("reviewable", _field(result, "review_disposition"))
+                self.assertIsNone(_field(result, "tmdb_tv_id"))
+            else:
+                self.assertNotEqual("reviewable", _field(result, "review_disposition"))
+                self.assertIn(reason, _reason_codes(result))
 
         future_outcome = _observation(
             "10380",

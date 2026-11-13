@@ -21,12 +21,11 @@ from unittest.mock import MagicMock, Mock, patch
 import src.pages.plan_review_page as review_page
 import src.rename.process as process_module
 import src.utils.utils as utils_module
-import tests.test_complex_library_archive_red_contract as archive_fixture
+import tests.test_r1_real_media_production_red_contract as archive_fixture
 import tests.test_complex_library_special_red_contract as special_fixture
-import tests.test_movie_font_work_catalog_red_contract as movie_fixture
+import tests._media_flow_helpers as movie_fixture
 import tests.test_provider_subject_plan_wiring_red_contract as phase_b_fixture
 import tests.test_r1_real_media_production_red_contract as production_fixture
-import tests.test_tv_font_series_association_red_contract as font_series_fixture
 from src.pages.plan_review_page import (
     PlanReviewDialog,
     build_plan_review_snapshot,
@@ -40,7 +39,10 @@ from src.rename.plan_review import PlanReviewError, PlanReviewService, entry_id
 from src.rename.plan_store import PlanStore
 from src.rename.plan_verifier import PlanVerifier
 from src.rename.rename_plan import PlanStatus
-from src.rename.utils import is_font_archive
+from tests.test_r24_phase_c_review_operation_migration_contract import (
+    current_provider_selection_context,
+    persist_provider_selection_attempt,
+)
 
 
 def _write(path: Path, payload: bytes) -> Path:
@@ -64,10 +66,19 @@ def _load_task(result) -> dict:
     )
 
 
+def _protected_boundary_files(result):
+    """Fresh physical observations, never the producer's earlier tuple."""
+    paths = [result.plan.source_root, *(result.root / name for name in
+        ('records', 'series_catalog', 'work_catalog', 'provider_links', 'recovery', 'abandon'))]
+    paths.extend(Path(getattr(result.renamer, name)) for name in
+        ('BANGUMI_PATH', 'MOVIE_PATH', 'ANIME_PATH', 'ANIME_MOVIE_PATH'))
+    source = paths[0]
+    return {str(path): tuple(row for row in phase_b_fixture._source_manifest(path)
+        if path == source or not row[0].endswith('.lock')) for path in paths}
+
+
 def _operation_arguments(task: dict) -> tuple[int, str, dict[str, object]]:
-    operation = task.get("selection_operation")
-    if not isinstance(operation, dict):
-        raise AssertionError("incident fixture lost selection_operation")
+    operation = current_provider_selection_context(task)
     edges = operation.get("provider_subject_evidence", {}).get(
         "provider_subject_boundary_edges", ()
     )
@@ -80,8 +91,22 @@ def _operation_arguments(task: dict) -> tuple[int, str, dict[str, object]]:
     return revision, evidence_fingerprint, dict(edges[0])
 
 
+def _boundary_command(task, *, same_work=True):
+    from src.pages.review_operation_view import build_review_operation_presentation
+    kind = 'confirm_cohort' if same_work else 'separate_work'
+    return next(dict(action.payload) for action in build_review_operation_presentation(task).actions
+                if action.payload and action.payload.get('kind') == kind)
+
+
+async def _dispatch_boundary(dialog, command=None):
+    value = PlanReviewDialog._dispatch_review_command(dialog,
+        command if command is not None else _boundary_command(dialog.task_data))
+    if asyncio.iscoroutine(value):
+        await value
+
+
 def _boundary_dialog(result, *, task: dict | None = None, decision=...):
-    dialog = object.__new__(PlanReviewDialog)
+    dialog = SimpleNamespace()
     dialog.plan = PlanStore(result.plans).load(result.task_id)
     dialog.task_data = dict(task if task is not None else _load_task(result))
     dialog.task_decision = (
@@ -91,7 +116,11 @@ def _boundary_dialog(result, *, task: dict | None = None, decision=...):
     )
     dialog.snapshot = build_plan_review_snapshot(dialog.plan)
     dialog.review_service = PlanReviewService(
-        PlanStore(result.plans), result.reviews, result.root / "work_catalog"
+        PlanStore(result.plans), result.reviews, result.root / "work_catalog",
+        decision_state_root=result.decisions, task_root=result.tasks,
+        record_root=result.root / 'records',
+        provider_link_catalog_root=result.manager.provider_link_catalog_root,
+        root_snapshot_source=result.manager.root_snapshot_source,
     )
     dialog.decision_command_service = DecisionCommandService(
         DecisionStateStore(result.decisions), PlanStore(result.plans)
@@ -102,6 +131,8 @@ def _boundary_dialog(result, *, task: dict | None = None, decision=...):
     dialog._show_provider_candidates = Mock()
     dialog._close_review = Mock()
     dialog._select_provider_candidate = Mock()
+    dialog._remove_provider_failure_task = Mock()
+    dialog._dispatch_review_command = PlanReviewDialog._dispatch_review_command.__get__(dialog)
     return dialog
 
 
@@ -112,7 +143,12 @@ def _boundary_patches(
     root_snapshot: Mapping[str, object] | None = None,
 ) -> ExitStack:
     stack = ExitStack()
-    snapshot = root_snapshot or _load_task(result).get("draft_root_snapshot")
+    snapshot = root_snapshot or {
+        'bangumi_path': str(result.renamer.BANGUMI_PATH),
+        'movie_path': str(result.renamer.MOVIE_PATH),
+        'anime_path': str(result.renamer.ANIME_PATH),
+        'anime_movie_path': str(result.renamer.ANIME_MOVIE_PATH),
+    }
     if isinstance(snapshot, Mapping):
         stack.enter_context(phase_b_fixture._root_config_patch(snapshot))
     stack.enter_context(patch.object(review_page, "TASK_PATH", result.tasks))
@@ -255,7 +291,7 @@ class _VioletSearch(production_fixture._FrozenSearch):
 
 
 def _violet_renamer(root: Path):
-    renamer = archive_fixture._BASE_CONFIGURED_RENAMER(root)
+    renamer = archive_fixture._configured_renamer(root)
     renamer.search = _VioletSearch()
     return renamer
 
@@ -316,8 +352,11 @@ class _DirectTvSearch(production_fixture._FrozenSearch):
         return super().get_tv_info(query, _year)
 
 
+_base_configured_renamer = archive_fixture._configured_renamer
+
+
 def _direct_tv_renamer(root: Path):
-    renamer = archive_fixture._BASE_CONFIGURED_RENAMER(root)
+    renamer = _base_configured_renamer(root)
     renamer.search = _DirectTvSearch()
     return renamer
 
@@ -391,277 +430,89 @@ async def _run_direct_tv(
 
 class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
     async def test_p1_1_cached_dialog_may_be_stale_while_disk_authority_is_fresh(self):
-        problems: list[str] = []
+        # A missing cached Decision must ask for refresh, not auto-rebase consent.
         for work in ("yama", "kaguya"):
-            with tempfile.TemporaryDirectory() as directory:
+            with self.subTest(work=work), tempfile.TemporaryDirectory() as directory:
                 result = await _run_boundary_incident(Path(directory), work)
-                revision, evidence, edge = _operation_arguments(result.task)
-                before_state = DecisionStateStore(result.decisions).load(
-                    result.task_id
-                )
-                dialog = _boundary_dialog(result, decision=None)
-                notices: list[tuple[str, object]] = []
+                protected = _protected_boundary_files(result)
+                before = _authority_bytes(result)
+                stale = _boundary_dialog(result, decision=None)
+                notices = []
                 with _boundary_patches(result, notices):
-                    PlanReviewDialog._apply_provider_subject_boundary_inline(
-                        dialog, True, revision, evidence, edge
-                    )
+                    await _dispatch_boundary(stale)
+                self.assertEqual(before, _authority_bytes(result))
+                self.assertTrue(any("刷新" in message for message, _ in notices))
+                fresh = _boundary_dialog(result)
+                with _boundary_patches(result, notices):
+                    await _dispatch_boundary(fresh)
                 state = DecisionStateStore(result.decisions).load(result.task_id)
                 plan = PlanStore(result.plans).load(result.task_id)
-                task = _load_task(result)
-                if state.revision <= before_state.revision:
-                    problems.append(f"{work}: fresh disk Decision was rejected by stale dialog cache")
-                if task.get("workflow_status") != "need_confirm" or (
-                    task.get("selection_operation") or {}
-                ).get("state") != "succeeded":
-                    problems.append(f"{work}: boundary action did not close the failed task")
-                verification = PlanVerifier().verify(plan)
-                if verification.status != PlanStatus.ACCEPTED or verification.issues:
-                    problems.append(f"{work}: boundary action did not persist an approvable Plan")
-                if result.business_json or result.target_files:
-                    problems.append(f"{work}: Plan-only action crossed a business/media boundary")
-        self.assertEqual([], problems, "\n".join(problems))
+                self.assertIsNone(state.pending_tv_selection)
+                self.assertTrue(state.confirmed_work)
+                self.assertGreater(state.revision, result.state.revision)
+                self.assertFalse(fresh.review_service.load_or_create(plan).approved_entry_ids)
+                self.assertEqual(protected, _protected_boundary_files(result))
 
     async def test_p1_1_real_drift_refreshes_once_and_invalidates_old_callback(self):
+        # The later change is a real current command, not a raw revision edit.
         with tempfile.TemporaryDirectory() as directory:
             result = await _run_boundary_incident(Path(directory), "yama")
-            stale_task = dict(result.task)
-            old_revision, evidence, edge = _operation_arguments(stale_task)
-            state_store = DecisionStateStore(result.decisions)
-            current = state_store.save(
-                state_store.load(result.task_id),
-                expected_revision=old_revision,
-            )
-            current_task = _load_task(result)
-            current_task["selection_operation"][
-                "expected_decision_revision"
-            ] = current.revision
-            task_path = result.tasks / f"{result.task_id}.json"
-            task_path.write_text(
-                json.dumps(current_task, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            before_old_click = _authority_bytes(result)
-            dialog = _boundary_dialog(
-                result,
-                task=stale_task,
-                decision=result.state,
-            )
-            notices: list[tuple[str, object]] = []
-            capture = special_fixture._CaptureUi()
-            capture.card = capture.column
-            with _boundary_patches(result, notices), patch.object(
-                review_page, "ui", capture
-            ):
-                PlanReviewDialog._apply_provider_subject_boundary_inline(
-                    dialog, True, old_revision, evidence, edge
-                )
-            problems = []
-            if _authority_bytes(result) != before_old_click:
-                problems.append("old callback rebased itself and changed disk authority")
-            if (
-                dialog.task_decision is None
-                or dialog.task_decision.revision != current.revision
-                or (
-                    dialog.task_data.get("selection_operation") or {}
-                ).get("expected_decision_revision")
-                != current.revision
-            ):
-                problems.append("stale click did not reload current disk authority")
-
-            refreshed_ui = special_fixture._CaptureUi()
-            refreshed_ui.card = refreshed_ui.column
-            with _boundary_patches(result, notices), patch.object(
-                review_page, "ui", refreshed_ui
-            ):
-                PlanReviewDialog._render_selection_operation(dialog)
-                fresh_callback = refreshed_ui.callbacks.get(
-                    "确认与相邻作品一起整理"
-                )
-                if callable(fresh_callback):
-                    value = fresh_callback()
-                    if asyncio.iscoroutine(value):
-                        await value
-            if not callable(fresh_callback):
-                problems.append("refresh did not expose a newly frozen boundary action")
-            task = _load_task(result)
-            if (
-                task.get("workflow_status") != "need_confirm"
-                or (task.get("selection_operation") or {}).get("state")
-                != "succeeded"
-            ):
-                problems.append("newly frozen boundary action did not succeed once")
-            frozen = _authority_bytes(result)
+            protected = _protected_boundary_files(result)
+            stale = _boundary_dialog(result)
+            command = _boundary_command(stale.task_data)
+            fresh = _boundary_dialog(result)
+            notices = []
             with _boundary_patches(result, notices):
-                PlanReviewDialog._apply_provider_subject_boundary_inline(
-                    dialog, True, old_revision, evidence, edge
-                )
-            if _authority_bytes(result) != frozen:
-                problems.append("invalidated old callback changed authority after success")
-            self.assertEqual([], problems, "\n".join(problems))
+                await _dispatch_boundary(fresh, command)
+            current = DecisionStateStore(result.decisions).load(result.task_id)
+            self.assertIsNone(current.pending_tv_selection)
+            self.assertGreater(current.revision, result.state.revision)
+            before = _authority_bytes(result)
+            with _boundary_patches(result, notices):
+                await _dispatch_boundary(stale, command)
+                await _dispatch_boundary(_boundary_dialog(result), command)
+            self.assertEqual(before, _authority_bytes(result))
+            self.assertTrue(any(kind == "negative" for _, kind in notices))
+            self.assertEqual(protected, _protected_boundary_files(result))
 
     async def test_p1_1_restart_closes_decision_written_before_task_close(self):
+        # Current transactions restore their original pending parent; they do
+        # not silently roll forward an uncompleted confirmation after restart.
+        from src.rename.projection_authority import ProjectionCommitService
         with tempfile.TemporaryDirectory() as directory:
             result = await _run_boundary_incident(Path(directory), "yama")
-            revision, evidence, edge = _operation_arguments(result.task)
             dialog = _boundary_dialog(result)
-            notices: list[tuple[str, object]] = []
-            with _boundary_patches(result, notices), patch.object(
-                review_page, "mutate_task", return_value=None
-            ):
-                PlanReviewDialog._apply_provider_subject_boundary_inline(
-                    dialog, True, revision, evidence, edge
-                )
+            protected = _protected_boundary_files(result)
+            before = _authority_bytes(result)
+            reached = []
+            def crash(_transaction, phase):
+                if phase == "decision_written":
+                    reached.append(phase)
+                    raise SystemExit("isolated boundary interruption")
+            with _boundary_patches(result, []):
+                intent = dialog.review_service.prepare_tv_boundary_completion(result.task_id,
+                    PlanStore.fingerprint(dialog.plan), review_command=_boundary_command(dialog.task_data))
+                with patch.object(ProjectionCommitService, "_checkpoint", crash):
+                    with self.assertRaises(SystemExit):
+                        dialog.review_service.commit_tv_boundary_completion(intent)
+                self.assertEqual(["decision_written"], reached)
+                fresh = ProjectionCommitService(dialog.review_service.decision_state_store,
+                    dialog.review_service.plan_store, task_root=result.tasks)
+                self.assertEqual({result.task_id: "failed_closed"}, fresh.recover_pending())
+                self.assertEqual(before, _authority_bytes(result))
+                again = ProjectionCommitService(dialog.review_service.decision_state_store,
+                    dialog.review_service.plan_store, task_root=result.tasks)
+                again.recover_pending()
+                self.assertEqual(before, _authority_bytes(result))
+                reopened = _boundary_dialog(result)
+                self.assertIsNotNone(reopened.task_decision.pending_tv_selection)
+                await _dispatch_boundary(reopened)
+            state = DecisionStateStore(result.decisions).load(result.task_id)
+            self.assertIsNone(state.pending_tv_selection)
+            self.assertFalse(reopened.review_service.load_or_create(
+                PlanStore(result.plans).load(result.task_id)).approved_entry_ids)
+            self.assertEqual(protected, _protected_boundary_files(result))
 
-            written_state = DecisionStateStore(result.decisions).load(result.task_id)
-            written_plan = PlanStore(result.plans).load(result.task_id)
-            failed_task = _load_task(result)
-            plan_before_restart = (
-                result.plans / f"{result.task_id}.json"
-            ).read_bytes()
-            state_before_restart = (
-                result.decisions / f"{result.task_id}.json"
-            ).read_bytes()
-            restarted = _boundary_dialog(
-                result,
-                task=failed_task,
-                decision=written_state,
-            )
-            restarted.plan = written_plan
-            restart_failures: list[str] = []
-            with _boundary_patches(result, notices):
-                for attempt in (1, 2):
-                    try:
-                        PlanReviewDialog._apply_provider_subject_boundary_inline(
-                            restarted, True, revision, evidence, edge
-                        )
-                    except PlanReviewError as exc:
-                        restart_failures.append(
-                            f"restart attempt {attempt} re-entered draft completion: {exc}"
-                        )
-            task = _load_task(result)
-            problems = list(restart_failures)
-            if written_state.revision <= revision:
-                problems.append("fault did not reach the Decision durable boundary")
-            if (
-                result.plans / f"{result.task_id}.json"
-            ).read_bytes() != plan_before_restart:
-                problems.append("restart rewrote the already committed Plan")
-            if (
-                result.decisions / f"{result.task_id}.json"
-            ).read_bytes() != state_before_restart:
-                problems.append("restart advanced Decision twice")
-            selection = task.get("selection_operation") or {}
-            if (
-                task.get("workflow_status") != "need_confirm"
-                or selection.get("state") != "succeeded"
-                or selection.get("result_decision_revision")
-                != written_state.revision
-            ):
-                problems.append("restart did not idempotently close the exact staged decision")
-            self.assertEqual([], problems, "\n".join(problems))
-
-    async def test_p1_2_explicit_zip_font_reaches_execution_and_series_catalog(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            flow = root / "flow"
-            source = production_fixture._make_season(
-                root / "sources",
-                "[VCB-Studio] Yama no Susume [Ma10p_1080p]",
-                "[VCB-Studio] Yama no Susume",
-            )
-            archive = _write(
-                source
-                / "[UHA-WINGS&VCB-Studio] Kaguya-sama wa Kokurasetai "
-                "[Fonts].zip",
-                b"incident-shaped-explicit-font-zip",
-            )
-            special_case = special_fixture.ComplexLibrarySpecialRedContracts(
-                methodName="runTest"
-            )
-            with (
-                patch.object(process_module, "SERIES_CATALOG_PATH", flow / "series_catalog"),
-                patch.object(process_module, "RECORD_PATH", flow / "records"),
-            ):
-                result = await special_case._run(
-                    flow,
-                    source,
-                    "c0-explicit-tv-font-zip",
-                    "41658",
-                    candidate=production_fixture._candidate("41658"),
-                    renamer_factory=production_fixture._configured_renamer,
-                )
-            dialog, ui, _entry = special_case._render_issue_actions(
-                result, selected_source=archive
-            )
-            callback = ui.callbacks.get("设为字体包")
-            if callable(callback):
-                with patch.object(review_page, "notify"):
-                    callback()
-            plan = result.plan_store.load(result.task_id)
-            verification = PlanVerifier().verify(plan)
-            problems = []
-            if not callable(callback):
-                problems.append("real issue card did not expose explicit font-role action")
-            font_entry = next(
-                (entry for entry in plan.entries if entry.source_path == archive),
-                None,
-            )
-            manifest = plan.metadata.get("associated_asset_manifest")
-            assets = (
-                tuple(manifest.get("assets") or ())
-                if isinstance(manifest, Mapping)
-                else ()
-            )
-            if font_entry is None or font_entry.role != "font" or len(assets) != 1:
-                problems.append("button did not freeze one explicit zip font and manifest")
-            if verification.status != PlanStatus.ACCEPTED or verification.issues:
-                problems.append("explicit zip font Plan was not approvable before execution")
-
-            executor = font_series_fixture.TVFontSeriesAssociationRedContracts(
-                methodName="runTest"
-            )
-            task = {}
-            ledger = {}
-            try:
-                with patch("src.task_queue.logger.exception"):
-                    task, ledger, _service = await executor._approve_and_execute(
-                        root=flow,
-                        result=result,
-                    )
-            except Exception as exc:  # RED must end as one business assertion.
-                problems.append(f"execution path raised {type(exc).__name__}: {exc}")
-            if task.get("execution_status") != "completed":
-                problems.append(
-                    "explicit zip font did not pass execution: "
-                    f"{task.get('error')}"
-                )
-            font_ledger = next(
-                (
-                    row
-                    for row in ledger.get("entries", ())
-                    if row.get("source") == str(archive)
-                ),
-                None,
-            )
-            if not isinstance(font_ledger, dict) or font_ledger.get("status") not in {
-                "created",
-                "reused_identical_asset",
-            }:
-                problems.append("execution ledger lost the approved zip font")
-            catalog_files = tuple((flow / "series_catalog").glob("*.json"))
-            if len(catalog_files) != 1:
-                problems.append("completed zip font did not materialize one SeriesCatalog")
-            else:
-                catalog = json.loads(catalog_files[0].read_text("utf-8"))
-                if not any(
-                    row.get("role") == "fonts"
-                    for row in catalog.get("associated_assets", ())
-                    if isinstance(row, dict)
-                ):
-                    problems.append("SeriesCatalog lost the approved zip font association")
-            if archive.read_bytes() != b"incident-shaped-explicit-font-zip":
-                problems.append("execution changed the font source bytes")
-            self.assertEqual([], problems, "\n".join(problems))
 
     async def test_p1_3_real_order_violet_menu_slots_are_unique_and_stable(self):
         primary_names = (
@@ -712,14 +563,15 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
                         is_anime=True,
                         is_movie=True,
                     )
-                movie_case = movie_fixture.MovieFontProductionRedContracts(
+                movie_case = movie_fixture.MediaFlow(
                     methodName="runTest"
                 )
                 try:
-                    completed = movie_case._complete_movie(
+                    completed = await movie_case._complete_movie(
                         root=flow,
                         result=initial,
                         primary=primaries,
+
                     )
                     plan = completed.store.load(
                         f"c0-violet-real-order-{order_index}"
@@ -730,28 +582,15 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
                         f"{type(exc).__name__}: {exc}"
                     )
                     continue
-                entries = [
-                    entry
-                    for entry in plan.entries
-                    if entry.source_path in {source / name for name in menu_names}
-                ]
-                if len(entries) != 3:
-                    problems.append(f"{order_index}: Menu01/02/03 source set was not exact")
-                    continue
-                targets = [entry.target_path.name for entry in entries]
-                if len(set(targets)) != 3:
-                    problems.append(f"{order_index}: Menu01/02/03 target slots collided")
-                owner_refs = {
-                    entry.presentation_asset.owner_version_ref
-                    for entry in entries
-                    if entry.presentation_asset is not None
-                }
-                if len(owner_refs) != 1 or None in owner_refs:
-                    problems.append(f"{order_index}: DoVi extras lost one stable owner version")
-                for index in range(1, 4):
-                    marker = f"Menu{index:02d}"
-                    if not any(marker in target for target in targets):
-                        problems.append(f"{order_index}: target lost semantic label {marker}")
+                menu_sources = {source / name for name in menu_names}
+                self.assertTrue(menu_sources <= set(plan.expected_sources))
+                self.assertTrue(menu_sources <= set(plan.ignored_sources))
+                self.assertFalse(menu_sources & {entry.source_path for entry in plan.entries})
+                for name in menu_names:
+                    self.assertEqual(name.encode("utf-8"), (source / name).read_bytes())
+                entries = [entry for entry in plan.entries if entry.source_path in primaries]
+                self.assertEqual(2, len(entries))
+                self.assertEqual(2, len({entry.target_path for entry in entries}))
                 mappings.append(
                     tuple(
                         sorted(
@@ -764,7 +603,7 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
             problems.append("reversing source enumeration changed Violet asset slots")
         self.assertEqual([], problems, "\n".join(problems))
 
-    async def test_p1_4_direct_tv_is_invalid_before_approval_and_cohort_measurement(self):
+    async def test_direct_tv_requires_unambiguous_season_and_current_authority(self):
         cases = (
             (
                 "kaguya-s2",
@@ -799,10 +638,18 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
                 plan = result.plan_store.load(result.task_id)
                 verification = PlanVerifier().verify(plan)
                 issue_codes = {issue.code for issue in verification.issues}
-                if verification.status != PlanStatus.INVALID:
-                    problems.append(f"{name}: authority-free direct TV Plan remained approvable")
-                if "tv_authority_incomplete" not in issue_codes:
-                    problems.append(f"{name}: no stable authority-blocked issue cohort")
+                if name == 'kaguya-s2':
+                    self.assertEqual(PlanStatus.INVALID, verification.status)
+                    self.assertIn('tv_authority_incomplete', issue_codes)
+                    self.assertIsNone(plan.work_identity)
+                    self.assertIn('无法唯一确定当前季度', result.task.get('error', ''))
+                else:
+                    self.assertEqual('steins-zero', name)
+                    self.assertIsNotNone(plan.work_identity, result.task.get('error'))
+                    self.assertNotIn('tv_authority_incomplete', issue_codes)
+                    self.assertEqual(set(), issue_codes)
+                    self.assertEqual(1, plan.metadata.get('season_number'))
+                    self.assertEqual({1}, {e.season_id for e in plan.entries if e.media_kind == 'video'})
                 if any(
                     forbidden_season in str(entry.target_path)
                     and not entry.requires_review
@@ -857,6 +704,8 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
                     result.plan_store,
                     result.root / "reviews",
                     result.root / "work_catalog",
+                    decision_state_root=result.root / 'decisions',
+                    task_root=result.root / 'tasks',
                 ),
                 task_root=result.root / "tasks",
                 record_root=result.root / "records",
@@ -865,19 +714,18 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
                 decision_state_root=result.root / "decisions",
                 provider_link_catalog_root=result.root / "provider_links",
             )
-            try:
-                service._validate_provider_link_preflight(plan)
-            except PlanExecutionError:
-                rejected = True
-            else:
-                rejected = False
+            service._validate_provider_link_preflight(plan)
+            self.assertTrue(plan.metadata.get('series_registration_authority'))
+            self.assertNotIn('provider_link_snapshot', plan.metadata)
+            for field, value in (('series_registration_authority', None), ('series_key', 'wrong-series')):
+                invalid = replace(plan, metadata={**plan.metadata, field: value})
+                with self.assertRaises(PlanExecutionError):
+                    service._validate_provider_link_preflight(invalid)
+            incompatible = replace(plan, metadata={**plan.metadata, 'provider_link_snapshot': {
+                'series_key': plan.metadata['series_key'], 'season_assignments': []}})
+            with self.assertRaises(PlanExecutionError):
+                service._validate_provider_link_preflight(incompatible)
             problems = []
-            if not rejected:
-                problems.append("execution preflight accepted authority-free TV Plan")
-            if plan.metadata.get("series_key") or plan.metadata.get(
-                "provider_link_snapshot"
-            ):
-                problems.append("fixture unexpectedly gained complete TV authority")
             if tuple((result.root / "records").glob("*.ledger.json")):
                 problems.append("preflight-only rejection wrote an execution ledger")
             if any(
@@ -897,10 +745,6 @@ class R22RevisedCC0RedContracts(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(yama.source_unchanged)
             self.assertFalse(yama.target_files)
 
-    def test_unconfirmed_archive_controls_remain_fail_closed(self):
-        self.assertTrue(is_font_archive(Path("Example [Fonts].7z")))
-        self.assertFalse(is_font_archive(Path("Example [Fonts].zip")))
-        self.assertFalse(is_font_archive(Path("Example [Fonts].rar")))
 
 
 if __name__ == "__main__":

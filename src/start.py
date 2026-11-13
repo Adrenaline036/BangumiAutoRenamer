@@ -7,6 +7,7 @@ sys.path.append(str(Path(__file__).parents[2]))
 
 from .logger import logger  # noqa: E402
 from .web import ui  # noqa: E402 # type: ignore
+from .connection_runtime import RECONNECT_TIMEOUT, configure_server_loop
 
 if __name__ == '__mp_main__':
     logger.info('程序启动中...')
@@ -18,5 +19,7 @@ ui.run(
     favicon='🍭',
     log_config=None,
     reload=False,
+    loop=configure_server_loop(),
+    reconnect_timeout=RECONNECT_TIMEOUT,
     uvicorn_reload_excludes="*.log",
 )

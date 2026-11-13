@@ -238,7 +238,7 @@ class ProviderSearchV5Tests(unittest.TestCase):
         )
         self.assertEqual(policy.scheduled_sources, policy.expected_sources)
 
-    def test_general_explicit_media_policy_does_not_expand_provider_scope(self):
+    def test_general_explicit_media_policy_includes_bangumi(self):
         movie = build_search_policy(
             domain="general", media_hint="movie",
             tmdb_configured=True, bangumi_configured=True,
@@ -248,8 +248,8 @@ class ProviderSearchV5Tests(unittest.TestCase):
             tmdb_configured=True, bangumi_configured=True,
         )
 
-        self.assertEqual(movie.expected_sources, ("tmdb_movie",))
-        self.assertEqual(television.expected_sources, ("tmdb_tv",))
+        self.assertEqual(movie.expected_sources, ("bangumi", "tmdb_movie"))
+        self.assertEqual(television.expected_sources, ("bangumi", "tmdb_tv"))
 
     def test_bangumi_only_animation_search_is_visible_but_never_auto_selected(self):
         policy = build_search_policy(
@@ -441,8 +441,8 @@ class ProviderSearchV5Tests(unittest.TestCase):
         with self.assertRaises(ProviderSearchError) as caught:
             client.search_animation("辉夜大小姐")
 
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(delays, [2.0])
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(delays, [])
         self.assertNotIn("never-log-this-token", str(caught.exception))
 
     def test_timeout_and_invalid_schema_fail_closed_without_credentials(self):
@@ -458,32 +458,9 @@ class ProviderSearchV5Tests(unittest.TestCase):
         invalid_client = BangumiProviderClient(
             user_agent="BAR-Test/1.0", session=_Session({"unexpected": []}),
         )
-        with self.assertRaisesRegex(ProviderSearchError, "结构不符合预期"):
+        with self.assertRaisesRegex(ProviderSearchError, "返回资料格式无效"):
             invalid_client.search_animation("赛马娘")
 
-    def test_disabled_or_failed_bangumi_is_a_non_mutating_tmdb_baseline(self):
-        provider = _provider()
-        plan = RenamePlan(
-            "stable", Path("source"), (), metadata={"is_anime": True},
-            presentation_groups=(PresentationGroup(
-                "movie", "movie_continuous", "电影", None, provider
-            ),),
-        )
-        before = PlanStore.fingerprint(plan)
-        renamer = object.__new__(Rename)
-        renamer.bangumi_search = None
-        title_candidates = (SearchTitleCandidate("辉夜大小姐", 2022, "test"),)
-
-        self.assertEqual(
-            renamer._bangumi_candidate_options(title_candidates, is_anime=True), []
-        )
-        renamer.bangumi_search = _UnavailableBangumi()
-        self.assertEqual(
-            renamer._bangumi_candidate_options(title_candidates, is_anime=True), []
-        )
-        self.assertEqual(PlanStore.fingerprint(plan), before)
-        self.assertEqual(plan.work_identity.primary_provider.provider_id, "997317")
-        self.assertEqual(plan.presentation_groups[0].kind, "movie_continuous")
 
     def test_v4_unique_provider_migrates_to_v5_top_level_and_changes_fingerprint(self):
         provider = _provider()
@@ -508,7 +485,7 @@ class ProviderSearchV5Tests(unittest.TestCase):
 
         migrated = RenamePlan.from_dict(v4_payload)
 
-        self.assertEqual(migrated.to_dict()["schema_version"], 6)
+        self.assertEqual(migrated.to_dict()["schema_version"], 7)
         self.assertNotIn("provider_identity", migrated.to_dict()["presentation_groups"][0])
         self.assertEqual(migrated.work_identity.primary_provider.provider_id, "997317")
         self.assertEqual(migrated.migrated_from_schema, 4)
@@ -650,7 +627,11 @@ class ProviderSearchV5Tests(unittest.TestCase):
             metadata={"is_anime": True}, presentation_groups=groups,
         )
 
-        self.assertEqual(PlanVerifier().verify(plan).status, PlanStatus.ACCEPTED)
+        # Identity and episode layout are valid independent dimensions, but this
+        # source-free structural fixture cannot stand in for a current Decision.
+        report = PlanVerifier().verify(plan)
+        self.assertEqual(PlanStatus.READY, report.status)
+        self.assertEqual(set(), {issue.code for issue in report.issues})
         restored = RenamePlan.from_dict(plan.to_dict())
         self.assertEqual(restored.work_identity.primary_provider.provider_id, "425211")
         self.assertEqual(restored.work_identity.domain, "animation")

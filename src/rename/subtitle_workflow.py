@@ -236,6 +236,10 @@ def decision_to_plan_contract(decision: SubtitleWorkflowDecision):
 def _apply_batch_conflicts(
     decisions: List[SubtitleWorkflowDecision],
 ) -> List[SubtitleWorkflowDecision]:
+    from .content_associations import subtitle_track_keys
+    tracks = subtitle_track_keys((d.source_subtitle, d.association.associated_video,
+        (d.label.primary_language, d.label.script, d.label.region_hint,
+         d.label.additional_languages, d.label.track_title_tokens, d.label.flags)) for d in decisions)
     target_indexes: Dict[str, List[int]] = {}
     default_indexes: Dict[str, List[int]] = {}
     for index, decision in enumerate(decisions):
@@ -255,7 +259,7 @@ def _apply_batch_conflicts(
             for index in indexes:
                 conflicts.setdefault(index, []).append("TARGET_BATCH_COLLISION")
     for indexes in default_indexes.values():
-        if len(indexes) > 1:
+        if len({tracks[decisions[i].source_subtitle] for i in indexes}) > 1:
             for index in indexes:
                 conflicts.setdefault(index, []).append("TARGET_MULTIPLE_DEFAULT_TRACKS")
 
@@ -272,13 +276,8 @@ def _apply_batch_conflicts(
 
 
 def _format_language(language: str, script: Optional[str]) -> str:
-    if language == "zh":
-        if script not in {"Hans", "Hant"}:
-            raise ValueError("Chinese subtitle script must be Hans or Hant")
-        return f"zh-{script}"
-    if script is not None:
-        raise ValueError("Only Chinese subtitles may carry a script")
-    return language
+    from .subtitle_languages import format_language
+    return format_language(language, script)
 
 
 def _clean_title_token(value: str) -> str:

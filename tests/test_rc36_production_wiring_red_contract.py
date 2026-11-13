@@ -19,16 +19,42 @@ from src.rename.decision_state import (
     DecisionState,
     DecisionStateStore,
 )
-from src.rename.plan_store import PlanStore
+from src.rename.inventory_plan import build_inventory_review_draft
+from src.rename.plan_store import PlanStore, PlanStoreError
+from src.rename.plan_verifier import PlanVerifier
 from src.rename.process import Rename
 from src.rename.provider_link_catalog import ProviderLinkCatalog, ProviderLinkMapping
 from src.rename.provider_link_decision import stage_provider_link_decision
 from src.rename.provider_link_resolver import resolve_provider_link
-from src.rename.rename_plan import ProviderIdentity, RenamePlan, WorkIdentity
+from src.rename.rename_plan import PlanStatus, ProviderIdentity, RenamePlan, WorkIdentity
 from src.rename.series_catalog import SeriesCatalog
+from tests.legacy_series_fixture import write_legacy_series_catalog_fixture
 from src.task_queue import TaskQueueManager
 from src.pages.plan_review_page import PlanReviewDialog
-from tests.projection_test_support import save_plan_fixture
+from tests.projection_test_support import save_plan_fixture, task_source_scope_fixture
+from tests.source_collection_fixture import admit_task
+
+
+def _load_or_materialize_inventory_plan(
+    task_root: Path,
+    plan_root: Path,
+    decision_root: Path,
+    task_id: str,
+):
+    store = PlanStore(plan_root)
+    try:
+        return store.load(task_id)
+    except PlanStoreError:
+        task = json.loads(
+            (task_root / f"{task_id}.json").read_text("utf-8")
+        )
+        draft = build_inventory_review_draft(task, dry_run=True)
+        return save_plan_fixture(
+            store,
+            draft,
+            state_store=DecisionStateStore(decision_root),
+            task_root=task_root,
+        )
 
 
 def _fingerprint(value: object) -> str:
@@ -91,10 +117,11 @@ def _materialized_yama_mapping() -> ProviderLinkMapping:
 
 def _configured_renamer(root: Path) -> Rename:
     renamer = object.__new__(Rename)
+    from tests.test_r1_real_media_production_red_contract import _configured_renamer as transport
+    renamer.bangumi_search = transport(root).bangumi_search
+    renamer.decision_state_root = root / "decisions"
+    renamer.provider_link_catalog_root = root / "provider_links"
     renamer.search = Mock(TMDB_KEY="offline-test-key")
-    renamer.ai_processor = SimpleNamespace(
-        ai_client=SimpleNamespace(is_available=lambda: False)
-    )
     renamer.R = {}
     renamer.ANIME_PATH = root / "Anime"
     renamer.ANIME_MOVIE_PATH = root / "AnimeMovies"
@@ -287,7 +314,7 @@ class Rc36ProductionWiringRedContracts(unittest.TestCase):
             )
             self.assertIsNone(reloaded.library_domain)
 
-    def test_ordinary_tmdb_tv_provider_still_persists_a_plan(self):
+    def test_direct_tmdb_tv_provider_is_valid_for_explicit_general_domain(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "Ordinary Show S01E01.mkv"
@@ -306,6 +333,16 @@ class Rc36ProductionWiringRedContracts(unittest.TestCase):
             )
             tasks = root / "tasks"
             tasks.mkdir()
+            source_scope = task_source_scope_fixture(
+                PlanStore(root / "plans"),
+                RenamePlan(
+                    task_id="ordinary-tv-control",
+                    source_root=source.parent,
+                    entries=(),
+                    expected_sources=(source,),
+                ),
+                task_root=tasks,
+            )
             with (
                 patch("src.rename.process.TASK_PATH", tasks),
                 patch("src.rename.process.PLAN_PATH", root / "plans"),
@@ -317,7 +354,9 @@ class Rc36ProductionWiringRedContracts(unittest.TestCase):
                 result = renamer._process(
                     source,
                     _is_anime=False,
+                    _is_movie=False,
                     _tuuid="ordinary-tv-control",
+                    task_source_scope=source_scope,
                     provider_selection={
                         "namespace": "tmdb",
                         "entity_type": "tv",
@@ -325,13 +364,18 @@ class Rc36ProductionWiringRedContracts(unittest.TestCase):
                         "title": "普通剧集",
                     },
                 )
-                persisted = PlanStore(root / "plans").load(
-                    "ordinary-tv-control"
-                )
 
         self.assertEqual("need_confirm", result)
-        self.assertEqual("tv", persisted.work_identity.primary_provider.entity_type)
-        self.assertNotIn("provider_link_snapshot", persisted.metadata)
+        plan = renamer.last_plan
+        self.assertEqual("general", plan.work_identity.domain)
+        self.assertEqual(
+            ("tmdb", "tv", "4242"),
+            (
+                plan.work_identity.primary_provider.namespace,
+                plan.work_identity.primary_provider.entity_type,
+                plan.work_identity.primary_provider.provider_id,
+            ),
+        )
 
 
 class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
@@ -353,20 +397,19 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
         manager = TaskQueueManager(
             task_root=tasks,
             decision_state_root=decision_root,
+            provider_link_catalog_root=root / "provider_links",
             plan_root=plan_root,
             recovery_abandon_audit_root=root / "abandon_audit",
-            test_mode=False,
+
         )
         fake_dialog = None
+        from tests.test_provider_subject_plan_wiring_red_contract import _root_config_patch
         with (
+            _root_config_patch({'bangumi_path': str(renamer.BANGUMI_PATH), 'movie_path': str(renamer.MOVIE_PATH),
+                                'anime_path': str(renamer.ANIME_PATH), 'anime_movie_path': str(renamer.ANIME_MOVIE_PATH)}),
             patch("src.task_queue.Rename", return_value=renamer),
             patch("src.rename.process.TASK_PATH", tasks),
             patch("src.rename.process.PLAN_PATH", plan_root),
-            patch("src.rename.process.DECISION_STATE_PATH", decision_root),
-            patch(
-                "src.rename.process.PROVIDER_LINK_CATALOG_PATH",
-                root / "provider_links",
-            ),
             patch(
                 "src.rename.process.SERIES_CATALOG_PATH",
                 root / "series_catalog",
@@ -374,20 +417,23 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
         ):
             await manager.start()
             try:
-                await manager.enqueue(
-                    source,
-                    task_id=task_id,
-                    is_anime=is_anime,
-                    is_movie=is_movie,
-                    use_ai=False,
+                # This fixture tests actual manual selection after a no-hit
+                # observation, not reselection of an already auto-confirmed work.
+                with patch.object(renamer.search, 'get_tv_info', return_value=('', None)), \
+                        patch.object(renamer.search, 'get_movie_info', return_value=('', None)):
+                    await admit_task(manager, source, task_id=task_id, is_anime=is_anime,
+                                          is_movie=is_movie)
+                    await asyncio.wait_for(manager._queue.join(), timeout=5)
+                initial_plan = _load_or_materialize_inventory_plan(
+                    tasks, plan_root, decision_root, task_id
                 )
-                await asyncio.wait_for(manager._queue.join(), timeout=5)
-                initial_plan = PlanStore(plan_root).load(task_id)
                 initial_state = DecisionStateStore(decision_root).load(task_id)
                 fake_dialog = SimpleNamespace(
                     task_decision=initial_state,
                     plan=initial_plan,
-                    task_data={},
+                    task_data=json.loads(
+                        (tasks / f"{task_id}.json").read_text("utf-8")
+                    ),
                     close=Mock(),
                 )
                 with (
@@ -446,38 +492,37 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
             manager = TaskQueueManager(
                 task_root=tasks,
                 decision_state_root=decision_root,
+                provider_link_catalog_root=provider_links,
                 plan_root=plan_root,
                 recovery_abandon_audit_root=root / "abandon_audit",
-                test_mode=False,
+
             )
             task_id = "real-yama-provider-selection"
             with (
                 patch("src.task_queue.Rename", return_value=renamer),
                 patch("src.rename.process.TASK_PATH", tasks),
                 patch("src.rename.process.PLAN_PATH", plan_root),
-                patch("src.rename.process.DECISION_STATE_PATH", decision_root),
-                patch(
-                    "src.rename.process.PROVIDER_LINK_CATALOG_PATH",
-                    provider_links,
-                ),
             ):
                 await manager.start()
                 try:
-                    await manager.enqueue(
+                    await admit_task(manager,
                         source,
                         task_id=task_id,
                         is_anime=True,
                         is_movie=False,
-                        use_ai=False,
                     )
                     await asyncio.wait_for(manager._queue.join(), timeout=5)
-                    initial_plan = PlanStore(plan_root).load(task_id)
+                    initial_plan = _load_or_materialize_inventory_plan(
+                        tasks, plan_root, decision_root, task_id
+                    )
                     initial_state = DecisionStateStore(decision_root).load(task_id)
                     renamer.bangumi_search = _FrozenYamaEvidence()
                     fake_dialog = SimpleNamespace(
                         task_decision=initial_state,
                         plan=initial_plan,
-                        task_data={},
+                        task_data=json.loads(
+                            (tasks / f"{task_id}.json").read_text("utf-8")
+                        ),
                         close=Mock(),
                     )
                     with (
@@ -493,6 +538,7 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
                                 "title": "向山进发 Next Summit",
                                 "original_title": "ヤマノススメ Next Summit",
                                 "year": 2022,
+                                "platform": "TV",
                             },
                         )
                     await asyncio.wait_for(manager._queue.join(), timeout=5)
@@ -531,7 +577,7 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("290980", task["provider_selection"]["provider_id"])
             fake_dialog.close.assert_not_called()
 
-    async def test_ordinary_tv_uses_same_add_select_worker_entrypoint(self):
+    async def test_direct_tmdb_tv_remains_primary_for_general_tv_entrypoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "Ordinary Show S01E01.mkv"
@@ -563,10 +609,92 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
                 is_movie=False,
             )
 
-        self.assertEqual("tv", plan.work_identity.primary_provider.entity_type)
+        self.assertIsNotNone(plan.work_identity, task.get('error'))
+        self.assertEqual("general", plan.work_identity.domain)
+        self.assertEqual(
+            ("tmdb", "tv", "4242"),
+            (
+                plan.work_identity.primary_provider.namespace,
+                plan.work_identity.primary_provider.entity_type,
+                plan.work_identity.primary_provider.provider_id,
+            ),
+        )
         self.assertNotIn("provider_link_snapshot", plan.metadata)
+        self.assertNotIn(
+            "task_episode_ownership",
+            plan.metadata,
+            "direct TMDB general-TV must not fabricate Bangumi cohort ownership",
+        )
+        verification = PlanVerifier().verify(plan)
+        self.assertEqual(
+            PlanStatus.INVALID,
+            verification.status,
+            "general-TV identity is ready while the explicit font stage remains pending",
+        )
+        self.assertEqual(set(), {i.code for i in verification.issues})
         self.assertIsNone(state.provider_link_binding)
+        self.assertEqual(
+            ("tmdb", "tv", "4242"),
+            (
+                state.confirmed_work["primary_provider"]["namespace"],
+                state.confirmed_work["primary_provider"]["entity_type"],
+                state.confirmed_work["primary_provider"]["provider_id"],
+            ),
+        )
+        self.assertFalse(
+            any(
+                str(item.get("namespace") or "") == "bangumi"
+                for item in state.linked_provider_identities
+            ),
+            "general-TV control must remain valid without any Bangumi subject",
+        )
         self.assertEqual("4242", task["provider_selection"]["provider_id"])
+        self.assertEqual("need_confirm", task["workflow_status"])
+        dialog.close.assert_not_called()
+
+    async def test_manual_tmdb_tv_freezes_primary_identity_for_animation_tv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "Animation Show S01E01.mkv"
+            source.touch()
+            info = {
+                "id": 4242,
+                "name": "动画剧集",
+                "original_name": "Animation Show",
+                "first_air_date": "2020-01-01",
+                "genres": [{"id": 16, "name": "Animation"}],
+                "seasons": [{"season_number": 1, "name": "Season 1"}],
+            }
+            renamer = _configured_renamer(root)
+            renamer.search.get_tv_info.return_value = ("动画剧集", info)
+            renamer.search.get_movie_info.return_value = ("", None)
+            renamer.search.get_tv_info_by_id.return_value = ("动画剧集", info)
+            plan, state, task, dialog = await self._run_selected_provider_flow(
+                root=root,
+                source=source,
+                task_id="animation-tmdb-reference-only",
+                renamer=renamer,
+                candidate={
+                    "namespace": "tmdb", "entity_type": "tv",
+                    "provider_id": "4242", "title": "动画剧集",
+                },
+                is_anime=True,
+                is_movie=False,
+            )
+
+        self.assertIsNotNone(plan.work_identity, task.get('error'))
+        self.assertEqual('animation', plan.work_identity.domain)
+        self.assertEqual('tmdb', plan.work_identity.primary_provider.namespace)
+        self.assertEqual('4242', plan.work_identity.primary_provider.provider_id)
+        self.assertIsNone(state.provider_link_binding)
+        self.assertNotIn('provider_link_snapshot', plan.metadata)
+        self.assertEqual(plan.work_identity.to_dict(), dict(state.confirmed_work))
+        from src.rename.series_registration import validate_plan_series_registration
+        self.assertEqual('tmdb', validate_plan_series_registration(plan, state).namespace)
+        damaged = replace(plan, metadata={**plan.metadata, 'series_registration_authority': None})
+        with self.assertRaises(ValueError):
+            validate_plan_series_registration(damaged, state)
+        self.assertEqual('4242', str(task['provider_selection']['provider_id']))
         self.assertEqual("need_confirm", task["workflow_status"])
         dialog.close.assert_not_called()
 
@@ -608,10 +736,7 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            SeriesCatalog(root / "series_catalog").register_completed(
-                existing,
-                expected_revision=0,
-            )
+            write_legacy_series_catalog_fixture(SeriesCatalog(root / "series_catalog"), existing)
             renamer.search.get_tv_info.return_value = (
                 "Yama no Susume Next Summit",
                 {**tmdb_info, "name": "Yama no Susume Next Summit"},
@@ -629,6 +754,7 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
                 candidate={
                     "namespace": "bangumi", "entity_type": "subject",
                     "provider_id": "290980", "title": "向山进发 Next Summit",
+                    "platform": "TV",
                 },
                 is_anime=True,
                 is_movie=False,
@@ -639,6 +765,8 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mapping.local_series_key, snapshot["series_key"])
         self.assertEqual(4, plan.metadata["season_number"])
         self.assertEqual(str(canonical_root), plan.metadata["canonical_work_root"])
+        from tests.test_rc54_integration_regressions import assert_bound_videos
+        assert_bound_videos(self, plan, state, canonical_root, 4)
         self.assertEqual(1, plan.metadata["series_catalog_revision"])
         self.assertEqual(
             plan.to_dict()["metadata"]["provider_link_snapshot"],
@@ -716,6 +844,7 @@ class Rc36RealEntrypointE2E(unittest.IsolatedAsyncioTestCase):
                 result = renamer._process(
                     source,
                     _is_anime=False,
+                    _is_movie=True,
                     _tuuid="ordinary-movie-control",
                     provider_selection={
                         "namespace": "tmdb",

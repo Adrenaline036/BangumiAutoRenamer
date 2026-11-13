@@ -11,21 +11,13 @@ from typing import Callable, Mapping, Optional
 
 from .decision_state import DecisionState
 from .plan_store import PlanStore
+from .projection_authority import ProjectionAuthorityError
 from .rename_plan import RenamePlan
 from .work_catalog import WorkCatalog, WorkCatalogError
 from .series_catalog import SeriesCatalog, SeriesCatalogError
-from .asset_collision import (
-    AssetCollisionError,
-    build_reuse_resolution,
-    fingerprint_file,
-    validate_reuse_resolution,
-)
+from .asset_collision import AssetCollisionError, build_reuse_resolution, validate_reuse_resolution
 from .catalog_binding import recovery_binding
-from .utils import is_font_archive
-from .font_archive_contract import (
-    FontArchiveContractError,
-    validate_completed_movie_font_assets,
-)
+
 
 
 @dataclass(frozen=True)
@@ -38,16 +30,35 @@ class RecoverySnapshot:
     allowed_actions: tuple[str, ...] = ()
 
 
+def untrusted_projection_snapshot() -> RecoverySnapshot:
+    """A display-only conflict, never authority to repair historical records."""
+    return RecoverySnapshot(
+        "evidence_conflict",
+        "当前整理计划缺少可信凭据或凭据已失效。已保留现有文件，"
+        "暂停自动恢复；请先核对历史记录。",
+        requires_external_action=True,
+    )
+
+
 class RecoveryService:
     def __init__(
         self, *, catalog_root: Path, record_root: Path,
         series_catalog_root: Optional[Path] = None,
+        rebuild_service=None,
     ):
         self.catalog_root = Path(catalog_root)
         self.record_root = Path(record_root)
+        self.rebuild_service = rebuild_service
         self.series_catalog_root = (
             Path(series_catalog_root) if series_catalog_root is not None else None
         )
+
+    def _inspect_completed_media(self, plan, ledger):
+        from .completed_rebuild import CompletedRebuildService
+        if isinstance(self.rebuild_service, CompletedRebuildService):
+            return self.rebuild_service.inspect_media(plan, ledger)
+        from .completed_history import inspect_completed_media
+        return inspect_completed_media(plan, ledger)
 
     def diagnose(
         self,
@@ -69,6 +80,46 @@ class RecoveryService:
                 "evidence_conflict", "没有与当前 Plan 匹配的 completed execution ledger",
                 requires_external_action=True,
             )
+        if plan.metadata.get('completed_rebuild_observation') is not None:
+            try:
+                from .completed_rebuild import CompletedRebuildService
+                if not isinstance(self.rebuild_service, CompletedRebuildService):
+                    raise ValueError('重建核查缺少明确的历史验证上下文')
+                self.rebuild_service.validate_plan(plan)
+            except (ValueError, RuntimeError, OSError, KeyError) as exc:
+                return RecoverySnapshot('evidence_conflict', str(exc), requires_external_action=True)
+        if plan.metadata.get('completed_rebuild_observation') is not None and all(e.target_path.is_file() for e in plan.entries):
+            try:
+                self._inspect_completed_media(plan, ledger)
+                binding = recovery_binding(plan, decision)
+                if binding is not None and binding.backend == 'work':
+                    from .completed_rebuild_work import validate_work_rebuild_completed
+                    catalog = work_catalog or WorkCatalog(self.catalog_root)
+                    validate_work_rebuild_completed(plan, ledger, catalog, catalog.rebuild_context)
+            except (ValueError, RuntimeError, OSError, KeyError) as exc:
+                return RecoverySnapshot('evidence_conflict', str(exc), requires_external_action=True)
+            return self._diagnose_catalog(decision, plan, completed_ledger=ledger, work_catalog=work_catalog)
+        # A removed registered directory is a materialization observation,
+        # not an instruction to discard Catalog identity. Actual generation
+        # performs the full current task/ownership/peer closure again.
+        if any(not entry.target_path.exists() for entry in plan.entries):
+            try:
+                self._inspect_completed_media(plan, ledger)
+                binding = recovery_binding(plan, decision)
+                proven = False
+                if binding is not None and binding.backend == 'series' and self.series_catalog_root is not None:
+                    match = SeriesCatalog(self.series_catalog_root).load(binding.key)
+                    proven = _series_catalog_materializes_plan(match, plan, completed_ledger=ledger)
+                elif binding is not None and binding.backend == 'work':
+                    from .completed_rebuild_work import _origin_valid
+                    catalog = work_catalog or WorkCatalog(self.catalog_root)
+                    _origin_valid(catalog, catalog.load(binding.key), plan, ledger)
+                    proven = True
+                if proven:
+                    return RecoverySnapshot('materialization_missing', '已登记的目标文件缺失；可核查并生成新的待批准计划',
+                        can_rebuild_plan=True, allowed_actions=('rebuild_plan',))
+            except (ValueError, RuntimeError, OSError, KeyError):
+                pass  # Retain the existing detailed diagnostic, never grant writes.
         targets = [entry.target_path for entry in plan.entries]
         missing_targets = [path for path in targets if not path.is_file()]
         ledger_entries = ledger.get("entries")
@@ -124,19 +175,13 @@ class RecoveryService:
                     "evidence_conflict", f"目标不再是源文件的 hardlink：{entry.target_path}",
                     requires_external_action=True,
                 )
-        try:
-            validate_completed_movie_font_assets(plan, ledger)
-        except FontArchiveContractError as exc:
-            return RecoverySnapshot(
-                "evidence_conflict", str(exc), requires_external_action=True
-            )
         catalog_snapshot = self._diagnose_catalog(
             decision,
             plan,
             completed_ledger=ledger,
             work_catalog=work_catalog,
         )
-        if catalog_snapshot.state in {"catalog_corrupt", "catalog_root_missing"}:
+        if catalog_snapshot.state in {"evidence_conflict", "catalog_corrupt", "catalog_root_missing"}:
             return catalog_snapshot
         if missing_targets:
             if catalog_snapshot.state == "catalog_record_missing":
@@ -167,18 +212,28 @@ class RecoveryService:
         series_registration_conflict = False
         if binding is not None and binding.backend == "series" and self.series_catalog_root is not None:
             path = self.series_catalog_root / f"{binding.key}.json"
-            if not path.is_file():
-                return self._missing_catalog_record()
             try:
-                match = SeriesCatalog(self.series_catalog_root).load(binding.key)
-            except SeriesCatalogError as exc:
+                from .catalog_namespace import writer_scope
+                catalog = SeriesCatalog(self.series_catalog_root)
+                with writer_scope(catalog, binding.key):
+                    catalog.require_namespace_plan(plan, binding.key)
+                    if not path.is_file():
+                        return self._missing_catalog_record()
+                    match = catalog.load(binding.key)
+            except ProjectionAuthorityError:
+                return untrusted_projection_snapshot()
+            except (SeriesCatalogError, ValueError, OSError) as exc:
                 return RecoverySnapshot(
                     "catalog_corrupt",
                     f"SeriesCatalog 记录损坏：{exc}",
                     requires_external_action=True,
                 )
             canonical_root = match.canonical_root
-            if match.revision == binding.revision:
+            if (plan.metadata.get('completed_rebuild_observation') is not None
+                and match.revision == binding.revision
+                and _series_catalog_materializes_plan(match, plan, completed_ledger=completed_ledger)):
+                series_update_pending = False
+            elif match.revision == binding.revision:
                 series_update_pending = True
             elif match.revision == binding.revision + 1:
                 if not _series_catalog_materializes_plan(
@@ -221,7 +276,11 @@ class RecoveryService:
                     "作品登记与当前整理计划的作品身份不一致",
                     requires_external_action=True,
                 )
-            if revision == binding.revision:
+            if (plan.metadata.get('completed_rebuild_observation') is not None
+                and revision == binding.revision and completed_ledger is not None
+                and catalog.materializes_completed_plan(payload, plan, completed_ledger)):
+                series_update_pending = False
+            elif revision == binding.revision:
                 series_update_pending = True
             elif revision == binding.revision + 1:
                 if (
@@ -357,6 +416,7 @@ class RecoveryService:
             if series_catalog is None:
                 raise ValueError("TV 登记恢复缺少 SeriesCatalog")
             with series_catalog.lock(binding.key):
+                series_catalog.require_namespace_plan(plan, binding.key)
                 snapshot = self.diagnose(decision, plan)
                 ledger = self._trusted_ledger(plan)
                 if ledger is None:
@@ -383,6 +443,7 @@ class RecoveryService:
         if binding is None or binding.backend != "work":
             raise ValueError("当前整理计划没有可恢复的电影作品登记")
         with work_catalog.lock(binding.key):
+            work_catalog.require_namespace_plan(plan, binding.key)
             snapshot = self.diagnose(
                 decision, plan, work_catalog=work_catalog
             )
@@ -441,10 +502,11 @@ def _series_catalog_materializes_plan(
     ):
         return False
     expected_provider = plan.work_identity.primary_provider.to_dict()
+    from .season_identity import binding_contains
     expected_source = str(metadata.get("season_source") or "provider")
     binding_found = any(
         isinstance(item, Mapping)
-        and item.get("season_binding_id") == binding_id
+        and binding_contains(item, binding_id)
         and item.get("season_number") == season_number
         and item.get("task_id") == plan.task_id
         and item.get("decision_source") == expected_source
@@ -455,122 +517,6 @@ def _series_catalog_materializes_plan(
     if not binding_found:
         return False
 
-    manifest = metadata.get("associated_asset_manifest")
-    if manifest is None:
-        tv_schema = metadata.get("tv_planning_authority_schema_version")
-        current_tv_authority = (
-            metadata.get("tv_planning_authority_required") is True
-            or metadata.get("tv_authority_required") is True
-            or (
-                isinstance(tv_schema, int)
-                and not isinstance(tv_schema, bool)
-                and tv_schema > 0
-            )
-        )
-        if current_tv_authority:
-            return False
-        font_entries = [
-            entry for entry in plan.entries if is_font_archive(entry.source_path)
-        ]
-        if not font_entries:
-            return True
-        if (
-            len(font_entries) != 1
-            or not isinstance(completed_ledger, Mapping)
-            or completed_ledger.get("status") != "completed"
-            or completed_ledger.get("task_id") != plan.task_id
-            or completed_ledger.get("plan_fingerprint") != PlanStore.fingerprint(plan)
-        ):
-            return False
-        ledger_entries = completed_ledger.get("entries")
-        if not isinstance(ledger_entries, list) or len(ledger_entries) != len(plan.entries):
-            return False
-        entry = font_entries[0]
-        recorded = next(
-            (
-                item for item in ledger_entries
-                if isinstance(item, Mapping)
-                and item.get("source") == str(entry.source_path)
-                and item.get("target") == str(entry.target_path)
-            ),
-            None,
-        )
-        if not isinstance(recorded, Mapping):
-            return False
-        try:
-            source_evidence = fingerprint_file(entry.source_path)
-            target_evidence = fingerprint_file(entry.target_path)
-        except (AssetCollisionError, OSError):
-            return False
-        if (
-            source_evidence.size != target_evidence.size
-            or source_evidence.sha256 != target_evidence.sha256
-        ):
-            return False
-        if entry.collision_resolution is None:
-            try:
-                target_nlink = entry.target_path.stat().st_nlink
-            except OSError:
-                return False
-            if (
-                recorded.get("status") not in {None, "created"}
-                or recorded.get("transfer_type") != "hardlink"
-                or source_evidence.device != target_evidence.device
-                or source_evidence.inode != target_evidence.inode
-                or target_nlink < 2
-            ):
-                return False
-        elif (
-            recorded.get("status") != "reused_identical_asset"
-            or recorded.get("transfer_type") != "reuse_existing"
-        ):
-            return False
-        rows = ({
-            "source_path": str(entry.source_path),
-            "target_path": str(entry.target_path),
-            "source_size": source_evidence.size,
-            "source_sha256": source_evidence.sha256,
-        },)
-    else:
-        if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
-            return False
-        rows = manifest.get("assets")
-        if not isinstance(rows, (list, tuple)):
-            return False
-    fingerprint = PlanStore.fingerprint(plan)
-    for row in rows:
-        if not isinstance(row, Mapping):
-            return False
-        source = _path_key(Path(str(row.get("source_path") or "")))
-        target = _path_key(Path(str(row.get("target_path") or "")))
-        size = row.get("source_size")
-        digest = str(row.get("source_sha256") or "")
-        association_found = False
-        for asset in match.associated_assets:
-            if (
-                not isinstance(asset, Mapping)
-                or _path_key(Path(str(asset.get("target_path") or ""))) != target
-                or asset.get("size") != size
-                or asset.get("sha256") != digest
-            ):
-                continue
-            associations = asset.get("associations")
-            if not isinstance(associations, list):
-                return False
-            association_found = any(
-                isinstance(item, Mapping)
-                and item.get("task_id") == plan.task_id
-                and item.get("season_number") == season_number
-                and item.get("plan_fingerprint") == fingerprint
-                and _path_key(Path(str(item.get("source_path") or ""))) == source
-                and item.get("source_size") == size
-                and item.get("source_sha256") == digest
-                for item in associations
-            )
-            if association_found:
-                break
-        if not association_found:
-            return False
     return True
 
 

@@ -210,16 +210,26 @@ class MovieVersionEvidenceBoundaryRedContracts(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "_infer_movie_version_descriptor"
         ]
-        self.assertEqual(1, len(calls))
-        self.assertEqual(3, len(calls[0].args))
-        self.assertEqual("plan.source_root", ast.unparse(calls[0].args[2]))
-        owner = parents[calls[0]]
-        while owner is not None and not isinstance(
-            owner, (ast.FunctionDef, ast.AsyncFunctionDef)
-        ):
-            owner = parents.get(owner)
-        self.assertIsNotNone(owner)
-        self.assertEqual("complete_inventory_draft", owner.name)
+        self.assertEqual([], calls, 'retired completion no longer observes movie descriptors')
+        expected = {
+            'pages/asset_choice_forms.py': 'self.plan.source_root',
+            'pages/movie_content_actions.py': 'plan.source_root',
+            'rename/default_activation.py': 'plan.source_root',
+            'rename/movie_video_projection.py': 'value.source_root',
+        }
+        observed = set()
+        for path in Path(plan_review_module.__file__).parents[1].rglob('*.py'):
+            nodes = [node for node in ast.walk(ast.parse(path.read_text('utf-8')))
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                     and node.func.id == '_infer_movie_version_descriptor']
+            if nodes:
+                relative = path.relative_to(Path(plan_review_module.__file__).parents[1]).as_posix()
+                observed.add(relative)
+                self.assertEqual(1, len(nodes))
+                self.assertEqual(3, len(nodes[0].args))
+                self.assertIn(relative, expected)
+                self.assertEqual(expected[relative], ast.unparse(nodes[0].args[2]), relative)
+        self.assertEqual(set(expected), observed)
 
         rename_root = Path(plan_review_module.__file__).parent
         for consumer_name in (

@@ -6,7 +6,6 @@ import json
 import hashlib
 import os
 import re
-import time
 import uuid
 from contextlib import contextmanager
 from contextlib import nullcontext
@@ -16,27 +15,34 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
 from ..utils.path import WORK_CATALOG_PATH
-from .file_lock import FileLockBusyError, advisory_file_lock
 from .rename_plan import ProviderIdentity, RenamePlan
 from .plan_store import PlanStore
 from .projection_authority import (
     ProjectionAuthorityError,
     validate_plan_projection_receipt,
 )
-from .asset_collision import AssetCollisionError, fingerprint_file
-from .font_archive_contract import (
-    FontArchiveContractError,
-    validate_completed_movie_font_assets,
-)
+from .asset_collision import AssetCollisionError
+
 
 
 WORK_CATALOG_SCHEMA_VERSION = 4
-_SUPPORTED_WORK_CATALOG_SCHEMAS = {1, 2, 3, WORK_CATALOG_SCHEMA_VERSION}
 _WORK_KEY = re.compile(r"^work-[0-9a-fA-F-]{32,36}$")
 
 
 class WorkCatalogError(RuntimeError):
     pass
+
+
+def require_matching_work_domain(registered_domain, candidate_domain):
+    """Same provider/root is not permission to cross registered libraries."""
+    labels = {'animation': '动画', 'general': '普通影视'}
+    if (registered_domain not in labels or candidate_domain not in labels
+            or registered_domain != candidate_domain):
+        registered = labels.get(registered_domain, '未确认')
+        candidate = labels.get(candidate_domain, '未确认')
+        raise WorkCatalogError(
+            f'作品已登记到{registered}媒体库，当前选择为{candidate}媒体库。'
+            '请核对已登记作品和作品类型后重新生成计划；不能直接跨库追加、换源或迁移。')
 
 
 def catalog_record_fingerprint(payload: Mapping[str, object]) -> str:
@@ -62,11 +68,22 @@ class CatalogMatch:
 
 
 class WorkCatalog:
-    def __init__(self, root: Path = WORK_CATALOG_PATH) -> None:
+    def __init__(self, root: Path = WORK_CATALOG_PATH, *, rebuild_context=None, asset_action_context=None) -> None:
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
         self.lock_root = self.root / ".locks"
-        self.lock_root.mkdir(parents=True, exist_ok=True)
+        self.rebuild_context = rebuild_context
+        self.asset_action_context = asset_action_context
+
+    def _rebuild_context_for(self, plan):
+        """A marker selects a strict validator, never authorizes a bypass."""
+        if plan.metadata.get("completed_rebuild_observation") is None:
+            return None
+        from .completed_rebuild_work import WorkRebuildContext
+        if not isinstance(self.rebuild_context, WorkRebuildContext):
+            raise WorkCatalogError("电影重建缺少明确配置的历史证据上下文")
+        if not isinstance(self.rebuild_context.proof_for_plan(plan), Mapping):
+            raise WorkCatalogError("电影重建恢复证明未通过当前权威验证")
+        return self.rebuild_context
 
     def load(self, work_key: str) -> dict:
         path = self._path(work_key)
@@ -141,68 +158,8 @@ class WorkCatalog:
                 results.append(_as_match(payload))
         return tuple(results)
 
-    def validated_font_locations(self, work_key: str) -> tuple[Path, ...]:
-        """Return every trusted work-scoped font location after byte checks."""
 
-        return tuple(path for _asset, path in self._validated_font_assets(work_key))
 
-    def resolve_font_location(
-        self, work_key: str, *, size: int, digest: str
-    ) -> Optional[Path]:
-        wanted = f"sha256:{int(size)}:{str(digest).casefold()}"
-        matches = [
-            path for asset, path in self._validated_font_assets(work_key)
-            if asset.get("content_key") == wanted
-        ]
-        if len(matches) > 1:
-            raise WorkCatalogError("同一电影字体内容登记了多个位置，必须先人工核查")
-        return matches[0] if matches else None
-
-    def _validated_font_assets(
-        self, work_key: str
-    ) -> tuple[tuple[Mapping[str, object], Path], ...]:
-        payload = self.load(work_key)
-        root = Path(str(payload.get("canonical_root") or ""))
-        results = []
-        locations_by_content: dict[str, set[str]] = {}
-        for asset in _upgrade_assets(payload.get("assets", [])):
-            associations = asset.get("associations")
-            strict = [
-                item for item in associations
-                if isinstance(item, Mapping)
-                and item.get("media_kind") == "associated"
-                and item.get("role") == "font"
-                and item.get("owner_version_ref") == "shared"
-            ] if isinstance(associations, list) else []
-            if not strict:
-                continue
-            content_key = str(asset.get("content_key") or "")
-            size = asset.get("size")
-            digest = str(asset.get("sha256") or "").casefold()
-            target = Path(str(asset.get("target") or ""))
-            if (
-                asset.get("scope") != "shared"
-                or not isinstance(size, int)
-                or isinstance(size, bool)
-                or content_key != f"sha256:{size}:{digest}"
-                or not _is_within(target, root / "Associated")
-                or not target.is_file()
-                or _is_reparse_or_symlink(target)
-            ):
-                raise WorkCatalogError("电影字体登记证据损坏，必须先人工核查")
-            try:
-                evidence = fingerprint_file(target)
-            except AssetCollisionError as exc:
-                raise WorkCatalogError(str(exc)) from exc
-            if evidence.size != size or evidence.sha256 != digest:
-                raise WorkCatalogError("电影字体登记位置的内容已变化，必须先人工核查")
-            locations_by_content.setdefault(content_key, set()).add(
-                os.path.normcase(os.path.abspath(target))
-            )
-            results.append((asset, target))
-        if any(len(paths) != 1 for paths in locations_by_content.values()):
-            raise WorkCatalogError("同一电影字体内容登记了多个位置，必须先人工核查")
-        return tuple(results)
 
     def materializes_completed_plan(
         self,
@@ -212,6 +169,16 @@ class WorkCatalog:
     ) -> bool:
         """Prove that one persisted record exactly contains this completed Plan."""
 
+        if plan.metadata.get("completed_rebuild_observation") is not None:
+            from .completed_rebuild_work import validate_work_rebuild_completed
+            try:
+                current = validate_work_rebuild_completed(
+                    plan, ledger, self, self._rebuild_context_for(plan)
+                )
+                return catalog_record_fingerprint(payload) == catalog_record_fingerprint(current)
+            except (OSError, TypeError, ValueError, RuntimeError):
+                return False
+
         work_key = str(
             plan.metadata.get("catalog_work_key")
             or plan.metadata.get("proposed_work_key")
@@ -219,8 +186,7 @@ class WorkCatalog:
         )
         try:
             self._validate(payload, work_key)
-            fonts = validate_completed_movie_font_assets(plan, ledger)
-        except (WorkCatalogError, FontArchiveContractError):
+        except WorkCatalogError:
             return False
         if any((
             ledger.get("status") != "completed",
@@ -239,8 +205,12 @@ class WorkCatalog:
                 return False
             pair = (str(row.get("source") or ""), str(row.get("target") or ""))
             rows_by_pair.setdefault(pair, []).append(row)
-        assets = _upgrade_assets(payload.get("assets", []))
-        conditional_fonts = _plan_conditional_font_assets(plan)
+        assets = copy_assets(payload.get("assets", []))
+        from .media_file_identity import frozen_sources, verify_recorded_target
+        try:
+            sources = frozen_sources(plan)
+        except ValueError:
+            return False
         for entry in plan.entries:
             contract = entry.presentation_asset
             expected = {
@@ -262,62 +232,35 @@ class WorkCatalog:
             if len(ledger_rows) != 1:
                 return False
             row = ledger_rows[0]
-            if entry.collision_resolution is None:
-                if row.get("status") == "reused_identical_asset":
-                    authority = row.get("conditional_authority")
-                    approved_content = conditional_fonts.get((
-                        _path_key(entry.source_path),
-                        _path_key(entry.target_path),
-                    ))
-                    if not isinstance(authority, Mapping) or any((
-                        approved_content is None,
-                        row.get("action") != "reuse_existing",
-                        row.get("transfer_type") != "reuse_existing",
-                        authority.get("policy") != "completed-sibling-append-v1",
-                        authority.get("work_key") != work_key,
-                        authority.get("content_key") != approved_content,
-                        _path_key(Path(str(authority.get("target_path") or "")))
-                        != _path_key(entry.target_path),
-                    )):
+            replacement = row.get("action") == "replace"
+            if replacement:
+                from .asset_operation import AssetOperation
+                from .asset_replacement import ReplacementEvidence, observe_file
+                try:
+                    operation = AssetOperation.from_mapping(plan.metadata.get("asset_operation")).to_dict()
+                    matches = [ReplacementEvidence.from_dict(item) for item in operation["replaces"]
+                        if item["target"] == str(entry.target_path) and item["source"] == str(entry.source_path)]
+                    if (operation["mode"] != "replace" or len(matches) != 1
+                            or row.get("replacement_evidence") != matches[0].to_dict()
+                            or observe_file(entry.source_path) != matches[0].new_source
+                            or observe_file(entry.target_path) != matches[0].new_source):
                         return False
-                    continue
+                except (OSError, TypeError, ValueError):
+                    return False
+            if entry.collision_resolution is None:
                 if any((
                     row.get("status") != "created",
-                    row.get("action") != "create",
+                    row.get("action") != ("replace" if replacement else "create"),
                     row.get("transfer_type") != "hardlink",
                 )):
                     return False
-                try:
-                    source_stat = entry.source_path.stat()
-                    target_stat = entry.target_path.stat()
-                except OSError:
-                    return False
-                if (
-                    source_stat.st_dev != target_stat.st_dev
-                    or source_stat.st_ino != target_stat.st_ino
-                    or target_stat.st_nlink < 2
-                ):
-                    return False
-                if not _ledger_identity_matches_current(
-                    row, source_stat=source_stat, target_stat=target_stat
-                ):
-                    return False
-            elif any((
-                row.get("status") != "reused_identical_asset",
-                row.get("action") != "reuse_existing",
-                row.get("transfer_type") != "reuse_existing",
-            )):
+            elif any((row.get('status') != 'reused_identical_asset',
+                      row.get('action') != 'reuse_existing', row.get('transfer_type') != 'reuse_existing')):
                 return False
-            else:
-                try:
-                    source_stat = entry.source_path.stat()
-                    target_stat = entry.target_path.stat()
-                except OSError:
-                    return False
-                if not _ledger_identity_matches_current(
-                    row, source_stat=source_stat, target_stat=target_stat
-                ):
-                    return False
+            try:
+                verify_recorded_target(plan, entry, row, sources=sources)
+            except (OSError, ValueError):
+                return False
             contract = entry.presentation_asset
             if contract is not None and contract.asset_role.kind == "content_version":
                 descriptor = contract.version_descriptor
@@ -334,18 +277,6 @@ class WorkCatalog:
                 }
                 if expected_version not in payload.get("versions", []):
                     return False
-        for item in fonts:
-            matching = next(
-                (asset for asset in assets if str(asset.get("target")) == str(item.entry.target_path)),
-                None,
-            )
-            if not isinstance(matching, Mapping) or any((
-                matching.get("content_key") != item.content_key,
-                matching.get("size") != item.size,
-                matching.get("sha256") != item.sha256,
-                matching.get("scope") != "shared",
-            )):
-                return False
         return True
 
     def compatible_base(
@@ -357,6 +288,9 @@ class WorkCatalog:
     ) -> bool:
         """Check immutable work authority before appending a new revision."""
 
+        work = plan.work_identity
+        if work is None or work.status != 'confirmed':
+            return False
         work_key = str(
             plan.metadata.get("catalog_work_key")
             or plan.metadata.get("proposed_work_key")
@@ -364,6 +298,7 @@ class WorkCatalog:
         )
         try:
             self._validate(payload, work_key)
+            require_matching_work_domain(payload.get('domain'), work.domain)
         except WorkCatalogError:
             return False
         group_kinds = {group.kind for group in plan.presentation_groups}
@@ -375,103 +310,25 @@ class WorkCatalog:
             != os.path.normcase(os.path.abspath(expected_root))
         ):
             return False
-        work = plan.work_identity
-        if work is None or work.status != "confirmed":
-            return False
         primary_key = _provider_mapping_key(work.primary_provider.to_dict())
         if primary_key is None:
+            return False
+        from .work_affiliation import from_plan, digest
+        try:
+            affiliation = from_plan(plan)
+        except (ValueError, RuntimeError, TypeError):
             return False
         if primary_key in {
             _provider_mapping_key(item) for item in payload.get("providers", [])
         }:
             return True
-        if not allow_explicit_provider_append:
+        if affiliation is None:
             return False
-        metadata = plan.metadata
-        try:
-            frozen_revision = int(metadata.get("catalog_revision"))
-            current_revision = int(payload.get("revision"))
-        except (TypeError, ValueError):
-            return False
-        return all((
-            metadata.get("catalog_link_decision") == "explicit_user",
-            str(metadata.get("catalog_work_key") or "") == work_key,
-            frozen_revision == current_revision,
-        ))
+        bound = affiliation.to_dict()
+        return (bound['action'] == 'existing' and bound['key'] == work_key
+                and bound['catalog_revision'] == payload.get('revision')
+                and bound['record_fingerprint'] == digest(payload))
 
-    def _approved_completed_sibling_append(
-        self,
-        existing: Mapping[str, object],
-        plan: RenamePlan,
-        ledger: Mapping[str, object],
-        *,
-        expected_revision: Optional[int],
-    ) -> bool:
-        """Allow revision crossing only for one ledger-frozen sibling append."""
-
-        intent = plan.metadata.get("work_font_intent")
-        frozen = existing.get("work_intent")
-        if (
-            expected_revision is None
-            or not isinstance(intent, Mapping)
-            or not isinstance(frozen, Mapping)
-            or intent.get("append_policy") != "completed-sibling-append-v1"
-            or int(existing.get("revision") or 0) <= int(expected_revision)
-        ):
-            return False
-        compared = (
-            "schema_version", "policy_version", "work_key", "group_kind",
-            "content_revision", "primary_content_key",
-            "primary_decision_source", "snapshot_fingerprint", "append_policy",
-        )
-        if (
-            any(frozen.get(key) != intent.get(key) for key in compared)
-            or tuple(frozen.get("content_keys", ()))
-            != tuple(intent.get("content_keys", ()))
-        ):
-            return False
-        rows = ledger.get("entries")
-        if not isinstance(rows, list):
-            return False
-        work_key = str(existing.get("work_key") or "")
-        fingerprint = catalog_record_fingerprint(existing)
-        conditional_fonts = _plan_conditional_font_assets(plan)
-        approved_reuse_pairs = set()
-        for row in rows:
-            if not isinstance(row, Mapping):
-                return False
-            if row.get("status") != "reused_identical_asset":
-                continue
-            authority = row.get("conditional_authority")
-            pair = (
-                _path_key(Path(str(row.get("source") or ""))),
-                _path_key(Path(str(row.get("target") or ""))),
-            )
-            approved_content = conditional_fonts.get(pair)
-            if not isinstance(authority, Mapping) or any((
-                approved_content is None,
-                authority.get("policy") != "completed-sibling-append-v1",
-                authority.get("work_key") != work_key,
-                authority.get("catalog_schema_version") != existing.get("schema_version"),
-                authority.get("catalog_revision") != existing.get("revision"),
-                authority.get("catalog_fingerprint") != fingerprint,
-                authority.get("content_key") != approved_content,
-            )):
-                return False
-            approved_reuse_pairs.add(pair)
-        if not approved_reuse_pairs:
-            return False
-        for entry in plan.entries:
-            if not os.path.lexists(entry.target_path):
-                return False
-            pair = (_path_key(entry.source_path), _path_key(entry.target_path))
-            if (
-                entry.collision_resolution is None
-                and not _samefile(entry.source_path, entry.target_path)
-                and pair not in approved_reuse_pairs
-            ):
-                return False
-        return True
 
     def register_completed(
         self,
@@ -511,8 +368,20 @@ class WorkCatalog:
         canonical_root = Path(canonical_root_value)
         lock_context = nullcontext() if lock_held else self.lock(work_key)
         with lock_context:
+            self.require_namespace_plan(plan, work_key)
             path = self._path(work_key)
             existing = self.load(work_key) if path.exists() else None
+            if plan.metadata.get("completed_rebuild_observation") is not None:
+                from .completed_rebuild_work import validate_work_rebuild_completed
+                try:
+                    restored = validate_work_rebuild_completed(
+                        plan, ledger, self, self._rebuild_context_for(plan)
+                    )
+                    if expected_revision is None or plan.metadata.get("catalog_revision") != expected_revision:
+                        raise ValueError("电影重建登记版本与批准版本不一致")
+                    return restored
+                except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                    raise WorkCatalogError(f"电影重建完成证明不一致：{exc}") from exc
             if existing and existing.get("group_kind") != group_kind:
                 raise WorkCatalogError("既有作品登记的观看形式与当前整理计划不一致")
             if existing is not None and not self.compatible_base(
@@ -520,10 +389,24 @@ class WorkCatalog:
             ):
                 raise WorkCatalogError("既有作品登记与当前整理计划的作品身份不一致")
             current_revision = int(existing.get("revision", 0)) if existing else 0
+            operation = metadata.get("asset_operation")
+            replacing = isinstance(operation, Mapping) and operation.get("mode") == "replace"
+            if replacing:
+                from .asset_actions import AssetActionService
+                if not isinstance(self.asset_action_context, AssetActionService):
+                    raise WorkCatalogError("作品换源缺少类型化资产验证服务")
+            if existing is not None and self.materializes_completed_plan(existing, plan, ledger):
+                return existing
+            if replacing:
+                try:
+                    self.asset_action_context.validate(plan, self.asset_action_context.decisions.load(plan.task_id), completed=True)
+                except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                    raise WorkCatalogError(f"作品换源完成证据不一致：{exc}") from exc
+            from .movie_asset_scope import validate_append
             try:
-                completed_fonts = validate_completed_movie_font_assets(plan, ledger)
-            except FontArchiveContractError as exc:
-                raise WorkCatalogError(str(exc)) from exc
+                scoped_append = validate_append(plan, self, payload=existing) if not replacing else False
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                raise WorkCatalogError(f"电影追加依赖不一致：{exc}") from exc
             if expected_revision is not None and current_revision != expected_revision:
                 if (
                     existing is not None
@@ -531,19 +414,8 @@ class WorkCatalog:
                     and self.materializes_completed_plan(existing, plan, ledger)
                 ):
                     return existing
-                if not (
-                    existing is not None
-                    and self._approved_completed_sibling_append(
-                        existing,
-                        plan,
-                        ledger,
-                        expected_revision=expected_revision,
-                    )
-                ):
+                if not (replacing or scoped_append):
                     raise WorkCatalogError("作品登记已被其他任务更新，请重新生成整理计划")
-            fonts_by_target = {
-                str(item.entry.target_path): item for item in completed_fonts
-            }
             provider = work.primary_provider.to_dict()
             providers = list(existing.get("providers", [])) if existing else []
             if _provider_mapping_key(provider) not in {
@@ -555,7 +427,24 @@ class WorkCatalog:
                 providers.append(provider)
             versions = list(existing.get("versions", [])) if existing else []
             seasons = list(existing.get("seasons", [])) if existing else []
-            assets = _upgrade_assets(existing.get("assets", [])) if existing else []
+            assets = copy_assets(existing.get("assets", [])) if existing else []
+            asset_history = list(existing.get("asset_history", ())) if existing else []
+            if replacing:
+                previous = operation["previous_assets"]
+                new_targets = {str(entry.target_path) for entry in plan.entries}
+                changed = ({row['target_path'] for row in previous}
+                    if operation['policy'] == 'asset-operation-v2' else
+                    {row["target_path"] for row in previous if row["target_path"] in new_targets})
+                selected_refs = {e.presentation_asset.version_descriptor.version_ref for e in plan.entries
+                    if e.presentation_asset and e.presentation_asset.version_descriptor
+                    and e.presentation_asset.asset_role.kind == "content_version"}
+                old_versions = [row for row in versions if row.get("version_ref") in selected_refs
+                    and (operation['policy'] == 'asset-operation-v2' or row.get("target") in changed)]
+                old_assets = [row for row in assets if row.get("target") in changed and row.get('scope') != 'shared']
+                asset_history.append({"task_id": plan.task_id, "plan_fingerprint": PlanStore.fingerprint(plan),
+                    "versions": old_versions, "assets": old_assets})
+                versions = [row for row in versions if row not in old_versions]
+                assets = [row for row in assets if row not in old_assets]
             known_targets = {str(item.get("target")) for item in versions}
             assets_by_target = {str(item.get("target")): item for item in assets}
             for entry in plan.entries:
@@ -572,21 +461,16 @@ class WorkCatalog:
                 }
                 collision = entry.collision_resolution
                 existing_asset = assets_by_target.get(target_key)
-                font = fonts_by_target.get(target_key)
                 if existing_asset is None:
                     existing_asset = {
                         "target": target_key,
                         "content_key": (
-                            font.content_key if font is not None else
-                            f"sha256:{collision.target_size}:{collision.target_sha256}"
-                            if collision is not None else None
+                            collision.content_key if collision is not None else None
                         ),
-                        "size": font.size if font is not None else (
+                        "size": (
                             collision.target_size if collision is not None else None
                         ),
-                        "sha256": font.sha256 if font is not None else (
-                            collision.target_sha256 if collision is not None else None
-                        ),
+                        "xxh3_128": collision.target_xxh3_128 if collision is not None else None,
                         "scope": (
                             "shared"
                             if contract is not None and contract.owner_version_ref == "shared"
@@ -607,31 +491,17 @@ class WorkCatalog:
                         for item in associations if isinstance(item, Mapping)
                     }:
                         associations.append(association)
-                    if collision is not None:
-                        content_key = f"sha256:{collision.target_size}:{collision.target_sha256}"
+                    if collision is not None and collision.evidence_kind == 'hardlink-identity-v1':
+                        existing_asset.update({'content_key': None, 'size': collision.target_size, 'xxh3_128': None})
+                    elif collision is not None:
+                        content_key = collision.content_key
                         recorded = existing_asset.get("content_key")
                         if recorded not in {None, content_key}:
                             raise WorkCatalogError("既有资产内容身份与批准的复用证据冲突")
                         existing_asset.update({
                             "content_key": content_key,
                             "size": collision.target_size,
-                            "sha256": collision.target_sha256,
-                        })
-                    if font is not None:
-                        if existing_asset.get("content_key") not in {None, font.content_key}:
-                            raise WorkCatalogError("既有电影字体位置登记了不同内容")
-                        duplicate = next((
-                            item for item in assets
-                            if item is not existing_asset
-                            and item.get("content_key") == font.content_key
-                        ), None)
-                        if duplicate is not None:
-                            raise WorkCatalogError("同一电影字体内容登记了多个位置")
-                        existing_asset.update({
-                            "content_key": font.content_key,
-                            "size": font.size,
-                            "sha256": font.sha256,
-                            "scope": "shared",
+                            "xxh3_128": collision.target_xxh3_128,
                         })
                     if contract is not None and contract.owner_version_ref == "shared":
                         existing_asset["scope"] = "shared"
@@ -690,16 +560,14 @@ class WorkCatalog:
                 "versions": versions,
                 "assets": assets,
                 "seasons": seasons,
-                "work_intent": _catalog_work_intent(
-                    metadata.get("work_font_intent"),
-                    existing.get("work_intent") if existing else None,
-                ),
                 "updated_at": _utc_now(),
             }
+            if asset_history:
+                payload["asset_history"] = asset_history
             self._validate(payload, work_key)
-            if completed_fonts and not self.materializes_completed_plan(payload, plan, ledger):
-                raise WorkCatalogError("电影字体登记候选未能精确物化已完成计划")
-            _atomic_json_write(path, payload)
+            if (scoped_append or replacing) and not self.materializes_completed_plan(payload, plan, ledger):
+                raise WorkCatalogError("电影登记候选未能精确对应已完成计划")
+            self.write_locked(work_key, payload)
             return payload
 
     def relocate(
@@ -774,7 +642,7 @@ class WorkCatalog:
                 "relocated_from": str(old_root),
                 "updated_at": _utc_now(),
             }
-            _atomic_json_write(self._path(work_key), updated)
+            self.write_locked(work_key, updated)
             return updated
 
     def archive_missing(
@@ -782,6 +650,7 @@ class WorkCatalog:
         work_key: str,
         *,
         task_root: Path,
+        expected_fingerprint: Optional[str] = None,
     ) -> Path:
         """Remove a stale registration without touching any media files.
 
@@ -793,6 +662,11 @@ class WorkCatalog:
 
         with self.lock(work_key):
             path = self._path(work_key)
+            from .catalog_archive import require_archive_fingerprint
+            try:
+                require_archive_fingerprint(path, expected_fingerprint)
+            except ValueError as exc:
+                raise WorkCatalogError(str(exc)) from exc
             record = self.load(work_key)
             canonical_root = Path(str(record["canonical_root"]))
             if os.path.lexists(canonical_root):
@@ -804,6 +678,7 @@ class WorkCatalog:
                 raise WorkCatalogError(
                     f"该作品仍有 {len(active)} 个活动任务，禁止删除登记"
                 )
+            self._require_namespace_candidate(work_key, None)
             archive_root = self.root / ".deleted"
             archive_root.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -832,24 +707,56 @@ class WorkCatalog:
         return active
 
     @contextmanager
-    def lock(self, work_key: str, *, wait_seconds: float = 0.0):
-        self._path(work_key)
-        lock_path = self.lock_root / f"{work_key}.lock"
-        deadline = time.monotonic() + max(0.0, float(wait_seconds))
-        while True:
-            try:
-                with advisory_file_lock(
-                    lock_path,
-                    owner={"kind": "work_catalog", "work_key": work_key},
-                ):
-                    yield
-                    return
-            except FileLockBusyError as exc:
-                if time.monotonic() >= deadline:
-                    raise WorkCatalogError(
-                        "该电影作品已有任务正在执行，请稍后重试"
-                    ) from exc
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    def lock(self, work_key: str, *, wait_seconds: float = 0.0, read_only=False):
+        from .catalog_namespace import locked
+        with locked(self, work_key, wait_seconds=wait_seconds, read_only=read_only) as lease:
+            yield lease
+
+    def namespace_snapshot(self, work_key):
+        from .catalog_namespace import observe
+        return observe(self, work_key)
+
+    def verify_namespace_snapshot(self, work_key, snapshot):
+        from .catalog_namespace import verify
+        verify(self, work_key, snapshot)
+
+    def validate_namespace_candidate(self, work_key, candidate):
+        from .catalog_namespace import validate
+        return validate(self, work_key, candidate)
+
+    def _require_namespace_candidate(self, work_key, candidate):
+        from .catalog_namespace import consume
+        proof = self.validate_namespace_candidate(work_key, candidate)
+        consume(self, work_key, candidate, proof)
+
+    def write_locked(self, work_key, payload):
+        """All work-record writes, including rollback, use this held boundary."""
+        from .catalog_namespace import require_write
+        require_write(self, work_key)
+        self._validate(payload, work_key)
+        self._require_namespace_candidate(work_key, payload)
+        _atomic_json_write(self._path(work_key), payload)
+
+    def require_namespace_plan(self, plan, work_key):
+        """Pre-media namespace check; does not replace approved Plan validation."""
+        from .catalog_namespace import require_lease
+        require_lease(self, work_key)
+        expected_key = plan.metadata.get('catalog_work_key') or plan.metadata.get('proposed_work_key')
+        if expected_key != work_key or plan.work_identity is None or plan.work_identity.status != 'confirmed':
+            raise WorkCatalogError('作品登记命名空间与计划身份不一致')
+        record = self.load(work_key) if self._path(work_key).exists() else {}
+        providers = list(record.get('providers', ()))
+        for provider in (plan.work_identity.primary_provider, *plan.linked_provider_identities):
+            if provider.status == 'confirmed' and _provider_key(provider) not in {
+                    _provider_mapping_key(row) for row in providers}:
+                providers.append(provider.to_dict())
+        root = plan.metadata.get('canonical_work_root')
+        if not root:
+            root = str(_common_work_root(tuple(e.target_path for e in plan.entries), plan.metadata))
+        candidate = {**record, 'schema_version': WORK_CATALOG_SCHEMA_VERSION,
+            'work_key': work_key, 'canonical_root': str(root), 'providers': providers,
+            'versions': record.get('versions', [])}
+        self._require_namespace_candidate(work_key, candidate)
 
     def _path(self, work_key: str) -> Path:
         if not _WORK_KEY.fullmatch(str(work_key)):
@@ -860,7 +767,7 @@ class WorkCatalog:
     def _validate(payload: object, work_key: str) -> None:
         if not isinstance(payload, dict):
             raise WorkCatalogError("作品登记根节点不是对象")
-        if payload.get("schema_version") not in _SUPPORTED_WORK_CATALOG_SCHEMAS:
+        if payload.get("schema_version") != WORK_CATALOG_SCHEMA_VERSION:
             raise WorkCatalogError("作品登记 schema_version 不受支持")
         if payload.get("work_key") != work_key or not _WORK_KEY.fullmatch(work_key):
             raise WorkCatalogError("作品登记 work_key 不匹配")
@@ -870,141 +777,21 @@ class WorkCatalog:
             raise WorkCatalogError("作品登记 assets 列表损坏")
         if not str(payload.get("canonical_root") or "").strip():
             raise WorkCatalogError("作品登记缺少 canonical_root")
-        work_intent = payload.get("work_intent")
-        content_keys = (
-            work_intent.get("content_keys")
-            if isinstance(work_intent, Mapping) else None
-        )
-        if work_intent is not None and (
-            not isinstance(work_intent, Mapping)
-            or work_intent.get("schema_version") != 1
-            or work_intent.get("policy_version") != "work-intent-v1"
-            or work_intent.get("work_key") != work_key
-            or work_intent.get("group_kind") != payload.get("group_kind")
-            or work_intent.get("append_policy") != "completed-sibling-append-v1"
-            or not isinstance(work_intent.get("content_revision"), int)
-            or isinstance(work_intent.get("content_revision"), bool)
-            or int(work_intent.get("content_revision") or 0) < 1
-            or not isinstance(content_keys, list)
-            or not content_keys
-            or any(not isinstance(value, str) for value in content_keys)
-            or content_keys != sorted(set(content_keys))
-            or any(
-                re.fullmatch(r"sha256:\d+:[0-9a-f]{64}", str(value)) is None
-                for value in content_keys
-            )
-            or (
-                work_intent.get("primary_content_key") is not None
-                and work_intent.get("primary_content_key") not in content_keys
-            )
-            or (
-                (work_intent.get("primary_content_key") is None)
-                != (work_intent.get("primary_decision_source") is None)
-            )
-            or re.fullmatch(
-                r"[0-9a-f]{64}",
-                str(work_intent.get("snapshot_fingerprint") or ""),
-            ) is None
-        ):
-            raise WorkCatalogError("作品登记 work_intent 权威损坏")
 
 
-def _plan_conditional_font_assets(
-    plan: RenamePlan,
-) -> dict[tuple[str, str], str]:
-    intent = plan.metadata.get("work_font_intent")
-    assets = intent.get("assets") if isinstance(intent, Mapping) else None
-    if not isinstance(assets, (list, tuple)):
-        return {}
-    result = {}
-    for item in assets:
-        if (
-            not isinstance(item, Mapping)
-            or item.get("action") != "create_or_reuse_registered_identical"
-        ):
-            return {}
-        source = Path(str(item.get("source_path") or ""))
-        target = Path(str(item.get("target_path") or ""))
-        content_key = str(item.get("content_key") or "")
-        if not str(source) or not str(target) or not re.fullmatch(
-            r"sha256:\d+:[0-9a-f]{64}", content_key
-        ):
-            return {}
-        result[(_path_key(source), _path_key(target))] = content_key
-    return result
-
-
-def _catalog_work_intent(
-    raw: object,
-    existing: object,
-) -> Optional[dict[str, object]]:
-    """Project only identity/content authority; never persist source locations."""
-
-    if raw is None:
-        return dict(existing) if isinstance(existing, Mapping) else None
-    if not isinstance(raw, Mapping):
-        raise WorkCatalogError("电影字体 Plan 缺少有效的 work_intent")
-    projection = {
-        "schema_version": raw.get("schema_version"),
-        "policy_version": raw.get("policy_version"),
-        "work_key": raw.get("work_key"),
-        "group_kind": raw.get("group_kind"),
-        "content_revision": raw.get("content_revision"),
-        "content_keys": [str(value) for value in raw.get("content_keys", ())],
-        "primary_content_key": raw.get("primary_content_key"),
-        "primary_decision_source": raw.get("primary_decision_source"),
-        "snapshot_fingerprint": raw.get("snapshot_fingerprint"),
-        "append_policy": raw.get("append_policy"),
-    }
-    if isinstance(existing, Mapping):
-        immutable = (
-            "schema_version", "policy_version", "work_key", "group_kind",
-            "content_revision", "content_keys", "primary_content_key",
-            "primary_decision_source", "snapshot_fingerprint", "append_policy",
-        )
-        if any(existing.get(key) != projection.get(key) for key in immutable):
-            raise WorkCatalogError("电影字体 work_intent 与既有作品登记冲突")
-    return projection
-
-
-def _upgrade_assets(raw_assets: object) -> list[dict]:
-    """Return a writable v2 view without mutating a stored v1 record."""
-
-    if not isinstance(raw_assets, list):
-        raise WorkCatalogError("作品登记 assets 列表损坏")
-    upgraded = []
-    for raw in raw_assets:
-        if not isinstance(raw, Mapping):
-            raise WorkCatalogError("作品登记 asset 条目损坏")
-        associations = raw.get("associations")
-        if isinstance(associations, list):
-            upgraded.append({
-                **raw,
-                "associations": [dict(item) for item in associations if isinstance(item, Mapping)],
-            })
-            continue
-        source = str(raw.get("source") or "")
-        upgraded.append({
-            "target": str(raw.get("target") or ""),
-            "content_key": None,
-            "size": None,
-            "sha256": None,
-            "scope": "version",
-            "associations": [{
-                "source": source,
-                "task_id": str(raw.get("task_id") or ""),
-                "owner_version_ref": None,
-                "media_kind": str(raw.get("media_kind") or ""),
-                "role": str(raw.get("role") or ""),
-            }],
-        })
-    return upgraded
+def copy_assets(raw_assets: object) -> list[dict]:
+    if not isinstance(raw_assets, list) or any(not isinstance(row, Mapping)
+            or not isinstance(row.get('associations'), list)
+            or any(not isinstance(item, Mapping) for item in row['associations']) for row in raw_assets):
+        raise WorkCatalogError('作品登记资产或关联列表损坏')
+    return [{**row, 'associations': [dict(item) for item in row['associations']]} for row in raw_assets]
 
 
 def _ledger_identity_matches_current(
-    row: Mapping[str, object], *, source_stat: os.stat_result, target_stat: os.stat_result
+    row: Mapping[str, object], *, source_stat: os.stat_result, target_stat: os.stat_result,
+    require_identity: bool = False, require_hardlink: bool = True,
 ) -> bool:
-    """Accept complete matching identity evidence or a fully legacy row."""
+    """Match recorded identity; legacy absence is only for ordinary old callers."""
 
     fields = (
         "source_device", "source_inode", "target_device", "target_inode",
@@ -1012,8 +799,10 @@ def _ledger_identity_matches_current(
     )
     present = tuple(row.get(field) is not None for field in fields)
     if not any(present):
-        return True
+        return not require_identity
     if not all(present):
+        return False
+    if require_identity and any(type(row[field]) is not int for field in fields):
         return False
     try:
         return all((
@@ -1021,7 +810,7 @@ def _ledger_identity_matches_current(
             int(row["source_inode"]) == source_stat.st_ino,
             int(row["target_device"]) == target_stat.st_dev,
             int(row["target_inode"]) == target_stat.st_ino,
-            int(row["target_link_count"]) >= 2,
+            int(row["target_link_count"]) >= (2 if require_hardlink else 1),
         ))
     except (KeyError, TypeError, ValueError):
         return False

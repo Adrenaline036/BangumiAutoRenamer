@@ -11,24 +11,32 @@ from src.rename.plan_review import (
 )
 from src.rename.plan_store import PlanStore
 from src.rename.rename_plan import (
+    ExecutionPolicy,
     PlanEntry,
     ProviderIdentity,
     RenamePlan,
     WorkIdentity,
 )
+from src.rename.presentation import build_default_presentation_contracts
 from tests.presentation_fixtures import with_tv_presentation
 from tests.projection_test_support import save_plan_fixture
+from tests.test_plan_execution import _save_registered_tv_fixture
 
 
 class PlanReviewWorkflowTests(unittest.TestCase):
-    def _plan(self) -> RenamePlan:
+    def _plan(self, root: Path) -> RenamePlan:
+        """Explicit ordinary-TV component setup, not a production-entry claim."""
+        source_root = root / "source"
+        source_root.mkdir(parents=True, exist_ok=True)
+        for name in ("01.mkv", "OVA.mkv"):
+            (source_root / name).write_bytes(b"synthetic review source")
         return with_tv_presentation(RenamePlan(
             task_id="review-workflow",
-            source_root=Path("source"),
+            source_root=root / "source",
             entries=(
                 PlanEntry(
-                    Path("source/01.mkv"),
-                    Path("library/Season1/S01E01.mkv"),
+                    root / "source" / "01.mkv",
+                    root / "library" / "Season1" / "S01E01.mkv",
                     season_id=1,
                     episode_id=1,
                     media_kind="video",
@@ -36,8 +44,8 @@ class PlanReviewWorkflowTests(unittest.TestCase):
                     evidence=("rule mapping",),
                 ),
                 PlanEntry(
-                    Path("source/OVA.mkv"),
-                    Path("library/Season1/OVA.mkv"),
+                    root / "source" / "OVA.mkv",
+                    root / "library" / "Season1" / "OVA.mkv",
                     season_id=1,
                     media_kind="video",
                     role="episode_like_bonus",
@@ -46,29 +54,34 @@ class PlanReviewWorkflowTests(unittest.TestCase):
                 ),
             ),
             expected_sources=(
-                Path("source/01.mkv"),
-                Path("source/OVA.mkv"),
+                root / "source" / "01.mkv",
+                root / "source" / "OVA.mkv",
             ),
             metadata={
                 "name": "Example",
-                "target_root": str(Path("library")),
+                "target_root": str(root / "library"),
             },
+            execution_policy=ExecutionPolicy(target_root=root / "library"),
+            work_identity=WorkIdentity("confirmed", "general", "Fixture Show", 2024,
+                ProviderIdentity("confirmed", "tmdb", "tv", "fixture-tv-1",
+                    "Fixture Show", 2024, "provider_unique"), "provider_selection"),
         ))
 
     def test_override_creates_new_version_and_preserves_old_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
             old_fingerprint = store.fingerprint(plan)
 
             revised = service.override_target(
                 task_id=plan.task_id,
                 expected_fingerprint=old_fingerprint,
                 selected_entry_id=entry_id(plan.entries[1]),
-                target_path=Path("library/Season1/OVA - reviewed.mkv"),
+                target_path=root / "library" / "Season1" / "OVA - reviewed.mkv",
                 reason="用户确认 OVA 名称",
             )
             new_fingerprint = store.fingerprint(revised)
@@ -85,7 +98,8 @@ class PlanReviewWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
             provider = ProviderIdentity(
                 status="confirmed",
                 namespace="tmdb",
@@ -95,23 +109,29 @@ class PlanReviewWorkflowTests(unittest.TestCase):
                 year=2024,
                 decision_source="manual",
             )
-            draft = replace(
-                self._plan(),
-                metadata={
-                    "name": "Example",
-                    "target_root": "library",
-                    "mapping_source": "inventory_review_draft",
-                },
+            source = root / "source" / "Movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"synthetic movie history source")
+            target = root / "library" / "Example (2024)" / "Example (2024).mkv"
+            groups, assets = build_default_presentation_contracts(
+                {source: target}, group_id="movie-history", group_kind="movie_continuous",
+                display_name="Example", provider_identity=provider)
+            entry = replace(PlanEntry.from_paths(source, target),
+                            presentation_asset=assets[source])
+            draft = RenamePlan(
+                task_id="movie-history", source_root=source.parent, entries=(entry,),
+                expected_sources=(source,), presentation_groups=groups,
+                execution_policy=ExecutionPolicy(target_root=root / "library"),
+                metadata={"name": "Example", "target_root": str(root / "library"),
+                          "mapping_source": "inventory_review_draft"},
                 work_identity=WorkIdentity(
-                    status="confirmed",
-                    domain="animation",
-                    title="Example",
-                    year=2024,
-                    primary_provider=provider,
-                    domain_source="task_media_type",
-                ),
+                    status="confirmed", domain="animation", title="Example", year=2024,
+                    primary_provider=provider, domain_source="task_media_type"),
             )
             draft = save_plan_fixture(store, draft)
+            self.assertEqual({"movie_continuous"}, {group.kind for group in draft.presentation_groups})
+            self.assertEqual("movie", draft.work_identity.primary_provider.entity_type)
+            self.assertNotIn("font_contribution", draft.metadata)
             draft_fingerprint = store.fingerprint(draft)
             completed = replace(
                 draft,
@@ -148,20 +168,24 @@ class PlanReviewWorkflowTests(unittest.TestCase):
                 ReviewStatus.DRAFT,
                 service.load_or_create(reopened).status,
             )
+            self.assertEqual(draft.work_identity, reopened.work_identity)
+            self.assertEqual(draft.presentation_groups, reopened.presentation_groups)
+            self.assertFalse(target.exists())
 
     def test_override_rederives_season_and_episode_from_new_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
 
             revised = service.override_target(
                 task_id=plan.task_id,
                 expected_fingerprint=store.fingerprint(plan),
                 selected_entry_id=entry_id(plan.entries[1]),
-                target_path=Path("library/Season2/Example S02E03.mkv"),
+                target_path=root / "library" / "Season2" / "Example S02E03.mkv",
                 reason="用户确认应归入第二季第三集",
             )
 
@@ -172,9 +196,10 @@ class PlanReviewWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
 
             with self.assertRaisesRegex(PlanReviewError, "版本"):
                 service.approve_entries(plan.task_id, "0" * 64, ())
@@ -183,7 +208,7 @@ class PlanReviewWorkflowTests(unittest.TestCase):
                     plan.task_id,
                     "0" * 64,
                     entry_id(plan.entries[0]),
-                    Path("library/Season1/changed.mkv"),
+                    root / "library" / "Season1" / "changed.mkv",
                     "stale",
                 )
 
@@ -191,16 +216,17 @@ class PlanReviewWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
 
             with self.assertRaisesRegex(PlanReviewError, "越出"):
                 service.override_target(
                     plan.task_id,
                     store.fingerprint(plan),
                     entry_id(plan.entries[1]),
-                    Path("outside/escaped.mkv"),
+                    root / "outside" / "escaped.mkv",
                     "bad path",
                 )
 
@@ -210,9 +236,10 @@ class PlanReviewWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
             fingerprint = store.fingerprint(plan)
 
             with self.assertRaisesRegex(PlanReviewError, "duplicate_target"):
@@ -230,9 +257,12 @@ class PlanReviewWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(
+                store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task",
+            )
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
             fingerprint = store.fingerprint(plan)
             first_id = entry_id(plan.entries[0])
             second_id = entry_id(plan.entries[1])
@@ -257,9 +287,10 @@ class PlanReviewWorkflowTests(unittest.TestCase):
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
             review_root = root / "review"
-            service = PlanReviewService(store, review_root)
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, review_root, root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
             review_root.mkdir()
             (review_root / f"{plan.task_id}.json").write_text(
                 "{broken", encoding="utf-8"
@@ -279,9 +310,10 @@ class PlanReviewWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = PlanStore(root / "plan")
-            service = PlanReviewService(store, root / "review")
-            plan = self._plan()
-            plan = save_plan_fixture(store, plan)
+            service = PlanReviewService(store, root / "review", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=root / "task")
+            plan = self._plan(root)
+            plan = _save_registered_tv_fixture(store, plan, task_root=root / "task")
             fingerprint = store.fingerprint(plan)
             service.load_or_create(plan)
 

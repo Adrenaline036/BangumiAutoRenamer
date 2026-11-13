@@ -17,7 +17,8 @@ from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple
 
-from .utils import VIDEO_SUFFIX, is_ignored_asset_directory
+from .utils import VIDEO_SUFFIX
+from .subtitle_labels import SUBTITLE_SUFFIXES
 
 
 MOVIE_ASSET_INVENTORY_SCHEMA_VERSION = 1
@@ -31,7 +32,6 @@ SINGLE_VIDEO_LAYOUT = "SINGLE_VIDEO_LAYOUT"
 NO_VIDEO_FILE_FOUND = "NO_VIDEO_FILE_FOUND"
 
 _DISC_DIRECTORY_NAMES = frozenset({"bdmv", "video_ts"})
-_SUBTITLE_SUFFIXES = (".ass", ".ssa", ".srt", ".vtt", ".sup")
 _REPARSE_POINT_FLAG = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
@@ -154,7 +154,7 @@ class MovieAssetInventoryComparison:
 
 def _normalized_suffix(name: str) -> str:
     normalized = unicodedata.normalize("NFKC", name).casefold()
-    for suffix in _SUBTITLE_SUFFIXES:
+    for suffix in SUBTITLE_SUFFIXES:
         if normalized.endswith(suffix):
             return suffix
     return Path(normalized).suffix
@@ -194,7 +194,7 @@ def _entry_type(name: str, mode: int) -> str:
     suffix = _normalized_suffix(name)
     if suffix in VIDEO_SUFFIX:
         return "video"
-    if suffix in _SUBTITLE_SUFFIXES:
+    if suffix in SUBTITLE_SUFFIXES:
         return "subtitle"
     return "associated"
 
@@ -219,10 +219,41 @@ def _fingerprint_payload(
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _explicit_relative_path(path, root_path):
+    if (not isinstance(path, Path) or not path.is_absolute() or '..' in path.parts
+            or not path.is_relative_to(root_path)):
+        raise MovieAssetInventoryError('EXPLICIT_INVENTORY_PATH_OUTSIDE_ROOT')
+    relative = path.relative_to(root_path).as_posix()
+    if any(unicodedata.normalize('NFKC', p.name).casefold() in _DISC_DIRECTORY_NAMES
+           for p in path.parents if p == root_path or p.is_relative_to(root_path)):
+        raise MovieAssetInventoryError(DISC_STRUCTURE_REQUIRES_MANUAL_WORKFLOW, relative)
+    return relative
+
+
+def inventory_from_source_basis(basis) -> MovieAssetInventory:
+    """Project the complete admitted inventory without source access."""
+    from .source_basis import InitialSourceBasis
+    if type(basis) is not InitialSourceBasis:
+        raise MovieAssetInventoryError('INVALID_EXPLICIT_INVENTORY_SCOPE')
+    raw = basis.to_dict()
+    rows = raw['sources']
+    max_entries = 10_000
+    if not rows or len(rows) > max_entries:
+        raise MovieAssetInventoryError('INVALID_EXPLICIT_INVENTORY_SCOPE')
+    root = Path(raw['source_root'])
+    entries = []
+    for row in sorted(rows, key=lambda r: r['source_path'].casefold()):
+        path = Path(row['source_path'])
+        entries.append(MovieAssetEntry(_explicit_relative_path(path, root),
+            _entry_type(path.name, stat.S_IFREG), row['size'], row['mtime_ns']))
+    return _finish_inventory(entries, [], max_entries)
+
+
 def inventory_movie_assets(
     root: Path,
     *,
     max_entries: int = 10_000,
+    source_paths: Optional[Tuple[Path, ...]] = None,
 ) -> MovieAssetInventory:
     """Return a deterministic metadata snapshot without following links.
 
@@ -237,6 +268,10 @@ def inventory_movie_assets(
     ):
         raise MovieAssetInventoryError("INVALID_INVENTORY_ENTRY_LIMIT")
 
+    if source_paths is not None:
+        if (type(source_paths) is not tuple or not source_paths or len(source_paths) > max_entries
+                or not Path(root).is_absolute() or '..' in Path(root).parts):
+            raise MovieAssetInventoryError('INVALID_EXPLICIT_INVENTORY_SCOPE')
     root_path = Path(os.path.abspath(os.fspath(root)))
     root_stat = _safe_lstat(root_path, None)
     if not stat.S_ISDIR(root_stat.st_mode) and not stat.S_ISREG(root_stat.st_mode):
@@ -250,7 +285,31 @@ def inventory_movie_assets(
         unicodedata.normalize("NFKC", root_path.name).casefold()
         in _DISC_DIRECTORY_NAMES
     )
-    if root_is_file:
+    if source_paths is not None:
+        from .path_safety import observe_regular_files
+        from .physical_identity import canonical_location_key
+        if root_is_file:
+            raise MovieAssetInventoryError('INVALID_EXPLICIT_INVENTORY_ROOT')
+        # Validate lexical ownership before touching any explicitly supplied leaf.
+        for path in source_paths:
+            _explicit_relative_path(path, root_path)
+        try:
+            observed = observe_regular_files(source_paths)
+        except (OSError, ValueError) as exc:
+            raise MovieAssetInventoryError('UNTRUSTED_EXPLICIT_INVENTORY_SOURCE') from exc
+        seen = set()
+        for path in sorted(source_paths, key=lambda p: str(p).casefold()):
+            relative = _explicit_relative_path(path, root_path)
+            key = canonical_location_key(path)
+            if key in seen:
+                raise MovieAssetInventoryError('DUPLICATE_EXPLICIT_INVENTORY_PATH', relative)
+            seen.add(key)
+            value = observed[path]
+            if not stat.S_ISREG(value.st_mode):
+                raise MovieAssetInventoryError('EXPLICIT_INVENTORY_NOT_FILE', relative)
+            entries.append(MovieAssetEntry(relative, _entry_type(path.name, value.st_mode),
+                                           value.st_size, value.st_mtime_ns))
+    elif root_is_file:
         entry_type = _entry_type(root_path.name, root_stat.st_mode)
         if entry_type == "unsupported":
             raise MovieAssetInventoryError(
@@ -305,11 +364,6 @@ def inventory_movie_assets(
                 relative = _relative_path(parts)
                 child_path = directory / child.name
                 child_stat = _safe_lstat(child_path, relative)
-                if (
-                    stat.S_ISDIR(child_stat.st_mode)
-                    and is_ignored_asset_directory(child.name)
-                ):
-                    continue
                 entry_type = _entry_type(child.name, child_stat.st_mode)
                 if entry_type == "unsupported":
                     raise MovieAssetInventoryError(
@@ -337,6 +391,10 @@ def inventory_movie_assets(
             # Stack is reversed so the resulting depth-first walk is sorted.
             pending.extend(reversed(child_directories))
 
+    return _finish_inventory(entries, reason_codes, max_entries)
+
+
+def _finish_inventory(entries, reason_codes, max_entries):
     entry_tuple = tuple(entries)
     video_count = sum(entry.entry_type == "video" for entry in entry_tuple)
     if video_count > 1:
@@ -360,10 +418,12 @@ def inventory_movie_assets(
 def compare_movie_asset_inventory(
     root: Path,
     expected: MovieAssetInventory,
+    *,
+    source_paths: Optional[Tuple[Path, ...]] = None,
 ) -> MovieAssetInventoryComparison:
     """Rescan and expose relative-path type/size/mtime drift evidence."""
 
-    current = inventory_movie_assets(root, max_entries=expected.max_entries)
+    current = inventory_movie_assets(root, max_entries=expected.max_entries, source_paths=source_paths)
     expected_by_path = {entry.relative_path: entry for entry in expected.entries}
     current_by_path = {entry.relative_path: entry for entry in current.entries}
     expected_paths = set(expected_by_path)

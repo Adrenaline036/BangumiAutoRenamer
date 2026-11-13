@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import tmdbsimple as tmdb
 import requests
+from .provider_operation import tmdb_info
 
 from ..logger import logger
 from ..config.config_manager import cm, effective_tmdb_api_key
@@ -16,7 +17,11 @@ TMDB_RETRY_DELAY_SECONDS = 2
 
 
 class TMDBRequestError(RuntimeError):
-    """A retryable TMDB transport or HTTP request failure."""
+    """TMDB 请求失败或所需证据无法读取。"""
+
+
+class TMDBResponseError(TMDBRequestError):
+    """已返回的资料结构或身份无效，不能当作可重试的网络故障。"""
 
 
 def _request_failure_name(error: requests.RequestException) -> str:
@@ -207,7 +212,60 @@ def _enrich_tv_alternative_titles(
             break
 
 
+def _complete_tv_subject_evidence(query, results, *, search_truncated):
+    """逐个读取有界候选；排名不能代替身份、类型、季度和别名证据。"""
+    limit = 8
+    if not results:
+        return ('', {'_bar_search_truncated': True, '_bar_search_alternatives': []}) if search_truncated else ('', None)
+    complete = []
+    for item in results[:limit]:
+        identity = item.get('id')
+        if type(identity) is not int or identity <= 0:
+            raise TMDBResponseError('电视剧候选身份无效')
+        television = tmdb.TV(identity)
+        detail = tmdb_info(television, language='zh-CN')
+        if (not isinstance(detail, dict) or type(detail.get('id')) is not int
+                or detail['id'] != identity
+                or not all(isinstance(detail.get(field), (list, tuple))
+                           and all(isinstance(row, dict) for row in detail[field])
+                           for field in ('genres', 'seasons'))
+                or not any(isinstance(detail.get(field), str) and detail[field].strip()
+                           for field in ('name', 'original_name'))):
+            raise TMDBResponseError('电视剧详情身份或季度类型资料无效')
+        aliases = television.alternative_titles()
+        if (not isinstance(aliases, dict)
+                or not isinstance(aliases.get('results'), (list, tuple))
+                or ('id' in aliases and (type(aliases['id']) is not int or aliases['id'] != identity))
+                or any(not isinstance(row, dict) or not isinstance(row.get('title'), str)
+                       for row in aliases['results'])):
+            raise TMDBResponseError('电视剧别名资料无效')
+        # 详情的本地化名称不能抹掉搜索响应中已观察到的标题。
+        titles = tuple(dict.fromkeys(value.strip() for value in (
+            item.get('name'), item.get('original_name'),
+            detail.get('name'), detail.get('original_name'),
+            *(row['title'] for row in aliases['results']),
+        ) if isinstance(value, str) and value.strip()))
+        complete.append({**item, **detail, 'alternative_titles': titles,
+                         '_bar_alternative_titles': titles})
+    target = _select_search_target(query, complete)
+    info = dict(target)
+    info.update(
+        _bar_search_name=target.get('name', ''),
+        _bar_search_original_name=target.get('original_name', ''),
+        _bar_search_alternative_titles=target['alternative_titles'],
+        _bar_search_alternatives=[
+            {**detail, 'name': searched.get('name', ''),
+             'original_name': searched.get('original_name', '')}
+            for searched, detail in zip(results, complete)
+        ] + [dict(item) for item in results[limit:30]],
+        _bar_search_truncated=search_truncated or len(results) > limit,
+    )
+    return str(target.get('name') or target.get('original_name')), info
+
+
 class Search:
+    subject_query_policy = 'tmdb-subject-airing-year-v1'
+
     def __init__(self) -> None:
         # Runtime-only override keeps credentials out of persisted config and
         # is especially useful for isolated local acceptance runs.
@@ -231,7 +289,7 @@ class Search:
         for i in range(TMDB_MAX_ATTEMPTS):
             try:
                 season = tmdb.TV_Seasons(tv_id, season_number)
-                season_info = season.info(language="zh-CN")
+                season_info = tmdb_info(season, language="zh-CN")
 
                 if not season_info:
                     logger.warning(f"[季度信息] 未获取到Season {season_number}的信息")
@@ -285,79 +343,7 @@ class Search:
         logger.error(f"[季度信息] 获取Season {season_number}信息最终失败")
         return None
 
-    def get_tv_info_with_seasons(
-        self, query: str, year: int
-    ) -> tuple[str, Optional[Dict[str, Any]]]:
-        """
-        获取电视剧信息，包含详细的季度和剧集信息
 
-        Args:
-            query: 搜索关键词
-            year: 年份
-
-        Returns:
-            (剧集名称, 包含详细季度信息的tv_info字典)
-        """
-        # 首先获取基本的电视剧信息
-        name, tv_info = self.get_tv_info(query, year)
-
-        if not name or not tv_info:
-            return name, tv_info
-
-        # 填充季度信息
-        tv_info = self.fill_season_info(tv_info)
-        return name, tv_info
-
-    def fill_season_info(self, tv_info: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        填充电视剧信息中的季度信息
-
-        Args:
-            tv_info: 包含电视剧基本信息的字典
-
-        Returns:
-            填充后的tv_info字典
-        """
-        if not tv_info or "id" not in tv_info:
-            logger.error("[季度信息] 无效的电视剧信息，无法填充季度信息")
-            return tv_info
-
-        tv_id = tv_info["id"]
-        seasons = tv_info.get("seasons", [])
-
-        if not seasons:
-            logger.warning("[季度信息] 电视剧没有季度信息，尝试获取...")
-            # 如果没有季度信息，尝试获取
-            name, detailed_tv_info = self.get_tv_info_with_seasons(
-                tv_info["name"], tv_info.get("first_air_date", 0)
-            )
-            if detailed_tv_info:
-                return detailed_tv_info
-            else:
-                logger.error("[季度信息] 获取季度信息失败")
-                return tv_info
-
-        # 获取每个季度的详细信息
-        for season in seasons:
-            season_number = season.get("season_number")
-            if season_number is None:
-                logger.warning(f"[季度信息] 跳过无效季度: {season}")
-                continue
-
-            logger.info(f"[季度信息] 正在获取Season {season_number}的详细信息...")
-            detailed_season = self.get_season_info(tv_id, season_number)
-
-            if detailed_season:
-                season.update(detailed_season)
-            else:
-                logger.warning(
-                    f"[季度信息] Season {season_number}获取详细信息失败，使用原始数据"
-                )
-
-        logger.info(
-            f'[季度信息] 电视剧《{tv_info["name"]}》的季度信息填充完成，共{len(seasons)}个季度'
-        )
-        return tv_info
 
     def get_movie_info(
         self,
@@ -377,7 +363,7 @@ class Search:
                     target = target_list[0]
                     name = target['title']
                     movie = tmdb.Movies(target['id'])
-                    movie.info()
+                    tmdb_info(movie, language='zh-CN')
                     movie.__dict__['_bar_search_name'] = target.get('title', '')
                     movie.__dict__['_bar_search_original_name'] = target.get(
                         'original_title',
@@ -417,7 +403,7 @@ class Search:
         for i in range(TMDB_MAX_ATTEMPTS):
             try:
                 movie = tmdb.Movies(int(provider_id))
-                payload = movie.info(language='zh-CN') or movie.__dict__
+                payload = tmdb_info(movie, language='zh-CN') or movie.__dict__
                 info = dict(movie.__dict__)
                 info.update(payload if isinstance(payload, dict) else {})
                 name = str(info.get('title') or info.get('original_title') or '')
@@ -451,7 +437,7 @@ class Search:
         query: str,
         year: int,
     ):
-        """Return bounded TV evidence without skipping remaining query variants."""
+        """按条目播出年份读取完整候选；整剧首播年份由普通搜索处理。"""
 
         return self._get_tv_info(query, year, complete_evidence=True)
 
@@ -469,11 +455,26 @@ class Search:
                 search_truncated = False
                 for query_variant in _search_query_variants(query):
                     search = tmdb.Search()
+                    year_filter = (
+                        {'year': year} if year else {}
+                    ) if complete_evidence else {
+                        'first_air_date_year': year if year != 0 else None,
+                    }
                     search.tv(
                         query=query_variant,
                         language='zh-CN',
-                        first_air_date_year=year if year != 0 else None,
+                        **year_filter,
                     )
+                    if complete_evidence and (
+                        not isinstance(search.__dict__.get('results'), list)
+                        or any(not isinstance(item, dict) or type(item.get('id')) is not int
+                               or item['id'] <= 0 for item in search.__dict__['results'])
+                        or any(type(search.__dict__.get(field)) is not int or search.__dict__[field] < 0
+                               for field in ('total_results', 'total_pages'))
+                        or search.__dict__['total_results'] < len(search.__dict__['results'])
+                        or (search.__dict__['results'] and search.__dict__['total_pages'] < 1)
+                    ):
+                        raise TMDBResponseError('电视剧搜索候选资料无效')
                     logger.info(
                         f'[电视剧搜索] 查询变体={query_variant!r}；'
                         f'返回数={len(search.__dict__["results"])}'
@@ -523,6 +524,10 @@ class Search:
                         ):
                             break
 
+                if complete_evidence:
+                    return _complete_tv_subject_evidence(
+                        query, target_list, search_truncated=search_truncated,
+                    )
                 if not target_list:
                     return '', None
 
@@ -536,7 +541,7 @@ class Search:
                 )
                 name = target['name']
                 tv = tmdb.TV(target['id'])
-                tv.info(language='zh-CN')
+                tmdb_info(tv, language='zh-CN')
                 tv.__dict__['_bar_search_name'] = target.get('name', '')
                 tv.__dict__['_bar_search_original_name'] = target.get(
                     'original_name',
@@ -587,7 +592,7 @@ class Search:
         for i in range(TMDB_MAX_ATTEMPTS):
             try:
                 television = tmdb.TV(int(provider_id))
-                payload = television.info(language='zh-CN') or television.__dict__
+                payload = tmdb_info(television, language='zh-CN') or television.__dict__
                 info = dict(television.__dict__)
                 info.update(payload if isinstance(payload, dict) else {})
                 name = str(info.get('name') or info.get('original_name') or '')

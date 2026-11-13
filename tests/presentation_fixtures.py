@@ -6,6 +6,7 @@ from src.rename.presentation import (
     build_default_presentation_contracts,
     provider_identity_from_metadata,
 )
+from src.rename.provider_special_evidence import ProviderSpecialObservation
 from src.rename.rename_plan import RenamePlan
 
 
@@ -36,7 +37,22 @@ def with_tv_presentation(plan: RenamePlan) -> RenamePlan:
         )
         for entry in plan.entries
     )
-    return replace(plan, entries=entries, presentation_groups=groups)
+    metadata = dict(plan.metadata)
+    metadata.setdefault(
+        "provider_special_observation",
+        ProviderSpecialObservation.build(
+            state="completed_empty",
+            provider_namespace="tmdb",
+            provider_entity_type="tv",
+            provider_id=provider.provider_id,
+        ).to_dict(),
+    )
+    return replace(
+        plan,
+        entries=entries,
+        presentation_groups=groups,
+        metadata=metadata,
+    )
 
 
 def with_movie_presentation(plan: RenamePlan) -> RenamePlan:

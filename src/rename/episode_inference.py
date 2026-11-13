@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .canonical_naming import canonicalize_media_leaf
 from .utils import VIDEO_SUFFIX
 
 
@@ -449,4 +450,6 @@ def normalize_target_stem(value: str, series_title: Optional[str] = None) -> str
         cleaned = cleaned[:year_match.start()] + ' ' + cleaned[year_match.end():]
     cleaned = re.sub(r'\s+', ' ', cleaned).strip(' ._-')
     cleaned = re.sub(r'\s+[-–—]\s+', ' - ', cleaned)
-    return f"{cleaned.strip(' ._-')}{subtitle_language_suffix}"
+    return canonicalize_media_leaf(
+        f"{cleaned.strip(' ._-')}{subtitle_language_suffix}"
+    )

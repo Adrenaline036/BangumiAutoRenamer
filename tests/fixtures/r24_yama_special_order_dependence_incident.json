@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "incident_id": "ERR-20260903-025",
+  "provider": {
+    "namespace": "tmdb",
+    "entity_type": "tv",
+    "provider_id": "53918",
+    "season_number": 0
+  },
+  "season_zero_rows": [
+    {
+      "id": 910001,
+      "episode_number": 1,
+      "name": "Sanitized official special 1",
+      "air_date": "2013-05-01",
+      "runtime": 15
+    },
+    {
+      "id": 910002,
+      "episode_number": 2,
+      "name": "Sanitized official special 2",
+      "air_date": "2014-10-01",
+      "runtime": 15
+    }
+  ],
+  "orders": [
+    {
+      "sequence": ["s1", "s2"],
+      "producer": {
+        "alias": "s1",
+        "bangumi_subject_id": "41658",
+        "season_number": 1,
+        "folder": "Yama Season 1",
+        "regular_episodes": [1, 2],
+        "special_files": [
+          "Yama Season 1 [13(OVA)].mkv"
+        ],
+        "expected_special_videos": 1
+      }
+    },
+    {
+      "sequence": ["s2", "s1"],
+      "producer": {
+        "alias": "s2",
+        "bangumi_subject_id": "86670",
+        "season_number": 2,
+        "folder": "Yama Season 2",
+        "regular_episodes": [1, 2],
+        "special_files": [
+          "Yama Season 2 [06.5(OVA)].mkv",
+          "Yama Season 2 [25(OVA)].mkv"
+        ],
+        "expected_special_videos": 2
+      }
+    }
+  ],
+  "required_observation_states": [
+    "completed_with_rows",
+    "completed_empty",
+    "not_run",
+    "unavailable_or_error"
+  ],
+  "privacy": {
+    "contains_credentials": false,
+    "contains_real_absolute_media_paths": false,
+    "contains_raw_provider_response": false
+  }
+}

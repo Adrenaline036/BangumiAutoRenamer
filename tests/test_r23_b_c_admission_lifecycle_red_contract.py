@@ -1,6 +1,8 @@
 """R23 B/C contracts for admission, identity, and lifecycle authority."""
 
 from __future__ import annotations
+from tests.queue_fixture import TaskQueueManager as ControlledQueue
+from tests.source_collection_fixture import collected_identity
 
 import ast
 import inspect
@@ -29,7 +31,7 @@ from tests.projection_test_support import reserve_active_batch_fixture
 
 
 def _manager(root: Path) -> TaskQueueManager:
-    return TaskQueueManager(
+    return ControlledQueue(
         task_root=root / "tasks",
         decision_state_root=root / "decisions",
         recovery_abandon_audit_root=root / "abandon",
@@ -66,7 +68,6 @@ class TypedAdmissionIncidentRedContracts(unittest.IsolatedAsyncioTestCase):
                 (first, second),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -90,7 +91,6 @@ class TypedAdmissionIncidentRedContracts(unittest.IsolatedAsyncioTestCase):
                 (first, second),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -121,7 +121,6 @@ class TypedAdmissionIncidentRedContracts(unittest.IsolatedAsyncioTestCase):
                 (source,),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -161,7 +160,6 @@ class TypedAdmissionIncidentRedContracts(unittest.IsolatedAsyncioTestCase):
                     (first, second),
                     is_anime=True,
                     is_movie=False,
-                    use_ai=False,
                     source="ui",
                     preview_only=True,
                 )
@@ -188,7 +186,7 @@ class CanonicalPhysicalIdentityIncidentRedContracts(unittest.TestCase):
             root = Path(directory)
             source = _write(root / "source.mkv")
             manager = _manager(root)
-            batch = manager._batch_source_identity(source)
+            batch = collected_identity(source)
             projection = ProjectionSourceIdentity.from_path(
                 source, inventory_fingerprint="a" * 64
             )
@@ -216,7 +214,7 @@ class CanonicalPhysicalIdentityIncidentRedContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = _write(root / "source.mkv")
-            identity = _manager(root)._batch_source_identity(source)
+            identity = collected_identity(source)
             self.assertRegex(identity.physical_key, r"inode:[1-9][0-9]*$")
 
 
@@ -250,7 +248,6 @@ class LifecycleAuthorityIncidentRedContracts(
                 (source,),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -278,7 +275,6 @@ class LifecycleAuthorityIncidentRedContracts(
                 (source,),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -319,7 +315,6 @@ class LifecycleAuthorityIncidentRedContracts(
                 (source,),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -384,7 +379,6 @@ class LifecycleAuthorityIncidentRedContracts(
                 (source,),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )
@@ -426,7 +420,6 @@ class LifecycleAuthorityIncidentRedContracts(
                 (source,),
                 is_anime=True,
                 is_movie=False,
-                use_ai=False,
                 source="ui",
                 preview_only=True,
             )

@@ -1,6 +1,15 @@
 """Responsive NiceGUI review workspace for persisted rename plans."""
 
 from __future__ import annotations
+from ..queue_runtime import ui_disk_call
+
+from .tv_content_actions import await_result
+
+from .progress_view import bar_progress
+
+from src.component.dialog_frame import dialog_card
+
+from ..rename.provider_selection_authority import is_confirmed_movie_plan
 
 import asyncio
 from dataclasses import dataclass, replace
@@ -8,18 +17,19 @@ import hashlib
 import json
 import os
 import re
-import unicodedata
 import uuid
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..config.config_manager import cm, effective_tmdb_api_key
 
+from .plan_completion_status import completion_status, entry_status
 from nicegui import ui
 
 from ..logger import logger
+from ..rename.asset_operation import reuse_display_asset_reads
 
 from ..component.local_file_picker import local_file_picker
 from ..element.red import notify
@@ -30,8 +40,11 @@ from ..rename.plan_review import (
     entry_id,
 )
 from ..rename.plan_execution import PlanExecutionError
+from ..rename import plan_execution as plan_execution_contract
 from ..rename.plan_store import PlanStore, PlanStoreError
+from ..rename.special_catalog import plain
 from ..rename.projection_authority import (
+    ProjectionAuthorityError,
     RecognitionDecisionInput,
     TaskEpisodeOwnership,
     TaskTerminalMutation,
@@ -54,43 +67,56 @@ from ..rename.tv_planning_authority import (
     TVPlanningAuthorityInput,
     TVPlanningUserDecision,
 )
-from ..rename.execution_recovery import requires_execution_reapproval
 from ..rename.decision_state import (
     DecisionCommandService,
     DecisionStateError,
     DecisionStateStore,
 )
 from ..rename.series_catalog import SeriesCatalog, SeriesCatalogError
-from ..rename.recovery_service import RecoveryService
+from ..rename.recovery_service import RecoveryService, untrusted_projection_snapshot
 from ..rename.recovery_transaction import (
     CatalogDetachService,
     RecoveryTransactionError,
     RecoveryTransactionStore,
 )
 from ..rename.plan_verifier import PlanVerifier
-from ..rename.provider_search import ProviderSearchError, resolve_provider_item_url
+from ..rename.provider_search import resolve_provider_item_url
+from ..rename.provider_selection_authority import (
+    provider_candidate_group_kind,
+    provider_selection_capability,
+    task_library_domain_from_task,
+    task_media_kind_from_context,
+)
 from ..rename.provider_link_decision import (
-    apply_source_episode_projection,
-    build_provider_subject_boundary_failure,
-    build_provider_subject_cohort_preview,
-    provider_subject_cohort_request_fingerprint,
+    build_provider_identity_selection_receipt, build_provider_subject_boundary_failure,
+    is_provider_identity_boundary, provider_subject_cohort_request_fingerprint,
     provider_link_review_summary,
     resolve_provider_subject_boundary_decision,
-    stage_provider_link_series_decision,
+    selected_provider_special_observation, stage_provider_link_series_decision,
 )
 from ..rename.provider_link_resolver import (
     ProviderCohortAnchorError,
     trusted_relation_tmdb_anchor,
 )
+from ..rename import provider_special_evidence as provider_special
+from ..rename.review_operation import (
+    TaskWorkflowState,
+    build_review_operation,
+    current_provider_selection_review_operation,
+    provider_selection_awaits_user,
+    provider_selection_command_is_capable,
+)
+from ..rename.successor_authority import (
+    CohortAuthorityDraft,
+    SuccessorAuthorityError,
+)
 from ..rename.inventory_plan import InventoryDraftError, build_inventory_review_draft
 from ..rename.trans import is_dry_run_enabled
 from ..rename.rename_plan import (
     RenamePlan,
-    SubtitleOverrideScope,
     WorkIdentity,
 )
 from ..rename.presentation import provider_identity_from_metadata
-from ..rename.rename_plan import UnknownTokenAction, UnknownTokenDisposition
 from ..utils.path import (
     DECISION_STATE_PATH,
     PLAN_PATH,
@@ -101,10 +127,48 @@ from ..utils.path import (
     TASK_PATH,
     WORK_CATALOG_PATH,
 )
-from ..utils.utils import get_task, mutate_task, write_task
-from ..task_queue import is_ui_test_mode, task_queue
+from ..utils.utils import (
+    get_task,
+    mutate_task as update_task_record,
+    write_task as save_task_record,
+)
+from ..task_queue import task_queue
 from .add_task_page import MEDIA_OPTIONS, media_flags
+from .exceptional_episode_review import (
+    EXCEPTIONAL_ISSUE_GUIDANCE,
+    render_cross_work_partition_action as _render_cross_work_partition_action,
+)
+from .review_operation_view import (
+    ReviewOperationCallbacks,
+    render_review_operation,
+)
 from .ui_terms import RENAME_PLAN_TERM, localize_plan_term
+
+
+# Compatibility patch points for older incident-shaped tests.
+mutate_task = update_task_record
+write_task = save_task_record
+
+
+def _update_task_record(*args, **kwargs):
+    return globals()["mutate_task"](*args, **kwargs)
+def _save_task_record(*args, **kwargs):
+    return globals()["write_task"](*args, **kwargs)
+def _provider_selection_task_media_kind(dialog: object) -> str:
+    plan = getattr(dialog, "plan", None)
+    return task_media_kind_from_context(getattr(dialog, "task_data", {}), getattr(plan, "metadata", {}))
+
+
+def _candidate_capability(dialog, candidate):
+    from ..rename.provider_selection_authority import selection_task_context, task_media_kind_from_task
+    task = getattr(dialog, 'task_data', {})
+    selected = selection_task_context(task, getattr(dialog, 'plan', None),
+                                      getattr(dialog, 'task_decision', None), candidate)
+    return provider_selection_capability(candidate,
+        group_kind=provider_candidate_group_kind(candidate) or '',
+        task_media_kind=(task_media_kind_from_task(selected) if selected is not task
+                         else _provider_selection_task_media_kind(dialog)),
+        task_library_domain=task_library_domain_from_task(selected))
 
 
 MEDIA_LABELS = {
@@ -220,98 +284,6 @@ def _collect_tv_task_source_scope(
     return scope
 
 
-def _tv_font_observation(
-    plan: RenamePlan,
-    *,
-    task_source_scope: TaskSourceScope,
-    series_title: str,
-    series_year: Optional[int],
-) -> Optional[dict[str, object]]:
-    """Freeze one series font archive from the reserved source inventory."""
-
-    def has_independent_fonts_token(path: Path) -> bool:
-        stem = unicodedata.normalize("NFKC", path.stem).casefold()
-        token = "[fonts]"
-        start = stem.find(token)
-        while start >= 0:
-            before = stem[start - 1] if start else ""
-            end = start + len(token)
-            after = stem[end] if end < len(stem) else ""
-            if (not before or not before.isalnum()) and (
-                not after or not after.isalnum()
-            ):
-                return True
-            start = stem.find(token, start + 1)
-        return False
-
-    expected_locations = {
-        str(Path(source).resolve(strict=False)).casefold()
-        for source in plan.expected_sources
-    }
-    candidates = tuple(
-        Path(identity.source_path)
-        for identity in task_source_scope.source_identities
-        if identity.location_key in expected_locations
-        and has_independent_fonts_token(Path(identity.source_path))
-    )
-    if not candidates:
-        return None
-    unsupported = tuple(
-        path for path in candidates if path.suffix.casefold() not in {".7z", ".zip"}
-    )
-    if unsupported:
-        raise TVPlanningAuthorityError("TV 字体归档只支持7z/zip，拒绝rar")
-    if len(candidates) != 1 or not series_title or not isinstance(series_year, int):
-        raise TVPlanningAuthorityError("TV series font authority 不唯一或缺少系列名")
-    source = candidates[0].resolve(strict=True)
-    frozen = next(
-        (
-            identity for identity in task_source_scope.source_identities
-            if identity.location_key == str(source).casefold()
-        ),
-        None,
-    )
-    if frozen is None:
-        raise TVPlanningAuthorityError("TV 字体归档不属于冻结source scope")
-    stat_result = source.stat()
-    frozen_stat = (
-        frozen.physical_key,
-        frozen.size,
-        frozen.mtime_ns,
-    )
-    current_stat = (
-        f"device:{int(stat_result.st_dev)}:inode:{int(stat_result.st_ino)}",
-        int(stat_result.st_size),
-        int(stat_result.st_mtime_ns),
-    )
-    if frozen_stat != current_stat:
-        raise TVPlanningAuthorityError("TV 字体归档stat与冻结source scope不一致")
-    digest = hashlib.sha256()
-    with source.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    after_hash_stat = source.stat()
-    if (
-        int(after_hash_stat.st_dev),
-        int(after_hash_stat.st_ino),
-        int(after_hash_stat.st_size),
-        int(after_hash_stat.st_mtime_ns),
-    ) != (
-        int(stat_result.st_dev),
-        int(stat_result.st_ino),
-        int(stat_result.st_size),
-        int(stat_result.st_mtime_ns),
-    ):
-        raise TVPlanningAuthorityError("TV 字体归档在hash期间发生漂移")
-    return {
-        "source": str(source),
-        "series_title": series_title,
-        "series_year": series_year,
-        "size": int(stat_result.st_size),
-        "content_sha256": digest.hexdigest(),
-    }
-
-
 def _regular_tv_entry_episode(
     plan: RenamePlan,
     entry,
@@ -370,6 +342,8 @@ def _bind_regular_sources_to_ranges(
             continue
         episode = _regular_tv_entry_episode(plan, entry)
         if episode is None:
+            if entry.media_kind == "subtitle":
+                continue
             raise TVPlanningAuthorityError("普通分集source缺少可冻结的episode identity")
         matching = [
             segment for segment in segments
@@ -399,6 +373,7 @@ def _with_task_episode_ownership(
 ) -> RenamePlan:
     """Project frozen per-source segments into the canonical Plan envelope."""
 
+    has_source_projection = "source_episode_projection" in plan.metadata
     projection_rows = plan.metadata.get("source_episode_projection", {})
     source_episode_by_path = {}
     if isinstance(projection_rows, Mapping):
@@ -412,6 +387,14 @@ def _with_task_episode_ownership(
         }
     ranges = tuple(authority.episode_range_ownership)
     ownership = []
+    primary = authority.work_identity.get("primary_provider", {})
+    work_identity_key = ":".join(
+        str(primary.get(field) or "")
+        for field in ("namespace", "entity_type", "provider_id")
+    )
+    work_identity_fingerprint = hashlib.sha256(
+        work_identity_key.encode("utf-8")
+    ).hexdigest()
     for entry in plan.entries:
         if entry.media_kind != "video" or not _entry_is_regular_tv_source(entry):
             continue
@@ -423,19 +406,34 @@ def _with_task_episode_ownership(
         if len(matches) != 1:
             raise TVPlanningAuthorityError("普通视频没有唯一冻结source segment")
         row = matches[0]
-        source_episode = source_episode_by_path.get(
-            str(entry.source_path), target_episode
-        )
+        source_episode = source_episode_by_path.get(str(entry.source_path))
+        if source_episode is None and not has_source_projection:
+            source_episode = target_episode
+        if source_episode is None:
+            raise TVPlanningAuthorityError(
+                "普通视频缺少冻结source episode projection"
+            )
         start = int(row.get("episode_start", 0))
         end = int(row.get("episode_end", 0))
         subject_id = str(row.get("bangumi_subject_id") or "")
         season_number = int(row.get("season_number", -1))
+        if season_number != entry.season_id:
+            raise TVPlanningAuthorityError(
+                "普通视频target season与冻结source segment不一致"
+            )
+        if source_episode < start or source_episode > end:
+            raise TVPlanningAuthorityError(
+                "普通视频source episode越出冻结source segment"
+            )
+        if source_episode != target_episode:
+            raise TVPlanningAuthorityError(
+                "普通视频target episode与冻结source episode不一致"
+            )
         record = TaskEpisodeOwnership(
             source_path=entry.source_path,
             bangumi_subject_id=subject_id,
-            tmdb_tv_id=str(authority.work_identity.get("primary_provider", {}).get(
-                "provider_id"
-            ) or ""),
+            work_identity_key=work_identity_key,
+            work_identity_fingerprint=work_identity_fingerprint,
             season_number=season_number,
             source_episode=source_episode,
             target_episode=target_episode,
@@ -465,11 +463,13 @@ def _build_cohort_tv_planning_authority(
     request_fingerprint: str,
     expected_revision: int,
     selected_subject_id: str,
-    tmdb_tv_id: str,
+    tmdb_tv_id: Optional[str],
     season_assignments: Mapping[str, int],
     display_title: str,
     title_source: Mapping[str, object],
     series_year: Optional[int],
+    primary_provider_identity: Optional[Mapping[str, object]] = None,
+    metadata_provider_identities: Sequence[Mapping[str, object]] = (),
 ) -> TVPlanningAuthority:
     """The sole production cohort-confirmation call to the canonical Builder."""
 
@@ -524,12 +524,6 @@ def _build_cohort_tv_planning_authority(
         "tmdb_tv_id": tmdb_tv_id,
         "source_owned_segments": source_segments,
         "non_regular_files": [],
-        "font_archive": _tv_font_observation(
-            plan,
-            task_source_scope=scope,
-            series_title=display_title,
-            series_year=series_year,
-        ),
     }
     observation_body["evidence_fingerprint"] = _tv_observation_fingerprint(
         observation_body
@@ -537,9 +531,25 @@ def _build_cohort_tv_planning_authority(
     blob_ref = ObservationBlobStore(
         Path(DECISION_STATE_PATH).parent / "tv_observation_blobs"
     ).put(observation_body)
+    effective_primary = dict(primary_provider_identity or {
+        "namespace": "bangumi",
+        "entity_type": "subject",
+        "provider_id": selected_subject_id,
+    })
+    effective_metadata = tuple(
+        dict(item) for item in metadata_provider_identities
+    ) or (({
+        "namespace": "tmdb",
+        "entity_type": "tv",
+        "provider_id": str(tmdb_tv_id),
+        "status": "confirmed",
+    },) if tmdb_tv_id else ())
     decisions = TVPlanningUserDecision.from_mapping({
         "decision_revision": expected_revision + 1,
-        "confirmed_identity": ("tmdb", "tv", tmdb_tv_id),
+        "confirmed_identity": tuple(
+            str(effective_primary.get(field) or "")
+            for field in ("namespace", "entity_type", "provider_id")
+        ),
         "confirmed_display_title": display_title,
         "title_source": (
             str(title_source.get("namespace") or ""),
@@ -547,6 +557,9 @@ def _build_cohort_tv_planning_authority(
             str(title_source.get("provider_id") or ""),
         ),
         "season_assignments": dict(season_assignments),
+        "metadata_provider_identities": [
+            dict(item) for item in effective_metadata
+        ],
         "cohort_action": "same_work",
         "request_token": request_fingerprint,
     })
@@ -583,6 +596,10 @@ SECONDARY_TOGGLE_PROPS = (
     "toggle-text-color=white no-caps"
 )
 
+
+def render_cross_work_partition_action(on_click: Callable[[], object]) -> None:
+    _render_cross_work_partition_action(ui, on_click)
+    ui.label('仅核对所选视频及配套；确认后创建新卡，原已排除内容不进入新卡。').classes('bar-help')
 
 ISSUE_GUIDANCE = {
     "work_identity_unconfirmed": (
@@ -663,6 +680,7 @@ ISSUE_GUIDANCE = {
         "请确认该标签应保留、忽略还是改成已知含义；系统不会自行丢弃未知信息。",
     ),
 }
+ISSUE_GUIDANCE.update(EXCEPTIONAL_ISSUE_GUIDANCE)
 
 
 @dataclass(frozen=True)
@@ -685,6 +703,11 @@ ISSUE_DEFINITIONS = {
     for code, (title, detail) in ISSUE_GUIDANCE.items()
 }
 ISSUE_DEFINITIONS.update({
+    "mixed_presentation_requires_partition": IssueDefinition(
+        "电影连续版与剧集分集版需要分开整理",
+        "请在下方文件列表勾选同一种观看形式的视频，再点击“作为独立作品整理”；原文件不会移动。",
+        "inline", "作为独立作品整理",
+    ),
     "presentation_asset_role_unknown": IssueDefinition(
         *ISSUE_GUIDANCE["presentation_asset_role_unknown"],
         "inline", "在此确认文件用途",
@@ -707,9 +730,16 @@ ISSUE_DEFINITIONS.update({
         "jump", "打开字幕关联修正",
     ),
 })
+ISSUE_DEFINITIONS.update({
+    code: IssueDefinition(*guidance, "inline", "在此确认异常视频归属")
+    for code, guidance in EXCEPTIONAL_ISSUE_GUIDANCE.items()
+})
 
 
 def issue_definition(code: str, message: str) -> IssueDefinition:
+    if code == 'asset_replace_choice_required':
+        return IssueDefinition(message, '请在“已登记的同一作品”卡片中点击“换源”，核对文件差异后生成待批准计划。',
+                               'jump', '核对换源范围')
     return ISSUE_DEFINITIONS.get(
         code,
         IssueDefinition(
@@ -758,8 +788,11 @@ def summarize_plan_issues(
     return list(by_code.values())
 
 
+from .asset_choice_forms import visible_plan_issues, visible_role_rows
+
+
 def normalize_provider_candidates(metadata: Dict[str, object]) -> List[Dict[str, object]]:
-    """Accept both the legacy group->candidate map and candidate lists."""
+    """Return independent JSON snapshots for legacy groups and candidate lists."""
 
     raw = metadata.get("provider_candidates") or {}
     normalized: List[Dict[str, object]] = []
@@ -774,7 +807,7 @@ def normalize_provider_candidates(metadata: Dict[str, object]) -> List[Dict[str,
         for candidate in candidates:
             if not isinstance(candidate, Mapping):
                 continue
-            item = dict(candidate)
+            item = plain(candidate)
             item["group_kind"] = str(item.get("group_kind") or group_kind)
             normalized.append(item)
     return normalized
@@ -849,7 +882,8 @@ def candidate_type_warning(
     if requested_is_movie not in {True, False} or not candidates:
         return ""
     expected = "movie" if requested_is_movie is True else "tv"
-    if any(str(item.get("entity_type")) == expected for item in candidates):
+    expected_group = "movie_continuous" if requested_is_movie is True else "tv_episodes"
+    if any(provider_candidate_group_kind(item) == expected_group for item in candidates):
         return ""
     expected_label = "电影" if expected == "movie" else "电视剧"
     found = "、".join(dict.fromkeys(
@@ -859,19 +893,45 @@ def candidate_type_warning(
     return f"按当前信息没有找到正确的{expected_label}匹配；以下是可能相关的{found or '其他类型'}结果，请确认。"
 
 
+def _provider_selection_alive(owner) -> bool:
+    """Both link lookup and queued selection stop updating a closed view."""
+    if any(getattr(owner, name, False) for name in
+           ('is_deleted', 'exit_requested', '_provider_link_closed')):
+        return False
+    if not getattr(owner, '_provider_link_lifecycle', False):
+        client = getattr(owner, 'client', None)
+        if callable(getattr(client, 'on_disconnect', None)):
+            client.on_disconnect(lambda: setattr(owner, '_provider_link_closed', True))
+        if callable(getattr(owner, 'on_value_change', None)):
+            owner.on_value_change(lambda event: setattr(owner, '_provider_link_closed', True)
+                                  if not event.value else None)
+        owner._provider_link_lifecycle = True
+    return True
+
+
 def can_execute_approved_plan(
     decision_status: ReviewStatus,
     task_status: str,
     *,
-    test_mode: bool,
+    execution_policy,
     preview_only: bool = False,
 ) -> bool:
-    return (
+    if not (
         decision_status == ReviewStatus.APPROVED
         and task_status == "approved"
-        and not test_mode
         and not preview_only
-    )
+    ):
+        return False
+    try:
+        plan_execution_contract.require_approved_execution_policy(execution_policy)
+    except PlanExecutionError as exc:
+        if exc.code in {
+            plan_execution_contract.DRY_RUN_PLAN_RETRY_CODE,
+            plan_execution_contract.MISSING_EXECUTION_POLICY_CODE,
+        }:
+            return False
+        raise
+    return True
 
 
 def can_approve_plan(plan_status: str) -> bool:
@@ -884,11 +944,11 @@ def workflow_status_for_plan(plan_status: str) -> str:
 
 def _task_terminal_for_projected_plan(task_id: str) -> TaskTerminalMutation:
     def update(_decision, projected, current):
-        snapshot = build_plan_review_snapshot(projected)
+        status = PlanVerifier().verify(projected).status.value
         current.update({
-            "workflow_status": workflow_status_for_plan(snapshot.plan_status),
-            "plan_status": snapshot.plan_status,
-            "plan_entry_count": len(snapshot.rows),
+            "workflow_status": workflow_status_for_plan(status),
+            "plan_status": status,
+            "plan_entry_count": len(projected.entries),
             "completed_at": None,
         })
         if (
@@ -912,8 +972,255 @@ class PlanReviewSnapshot:
     presentation_groups: Tuple[Dict[str, object], ...]
     work_identity: Dict[str, object]
     linked_provider_identities: Tuple[Dict[str, object], ...]
+    opening_context: Optional[Tuple[object, object]] = None
+    display_context: object = None
 
 
+def _inventory_draft_for_completion(plan, service) -> RenamePlan:
+    mapping_source = str(plan.metadata.get("mapping_source") or "")
+    if mapping_source == "inventory_review_draft":
+        return plan
+    if mapping_source == "inventory_smart_completion":
+        return service.reopen_inventory_draft(
+            plan.task_id,
+            PlanStore.fingerprint(plan),
+            reason="用户修订整理计划",
+            persist_revision=False,
+        )
+    raise PlanReviewError("当前整理计划不能修订，请重新识别")
+
+
+def _series_binding_for_tv(plan, state, catalog, target_root: Path) -> dict:
+    if state is None or plan.work_identity is None:
+        raise DecisionStateError("缺少剧集系列决策上下文")
+    from ..rename import series_registration
+    if plan.work_identity.domain == "animation":
+        series_registration.validate_plan_series_registration(plan, state)
+        return dict(state.series_binding)
+    from ..rename.canonical_naming import (
+        CanonicalNamingError,
+        build_canonical_work_root,
+        decision_from_work_identity,
+        read_naming_decision,
+    )
+
+    try:
+        raw = plan.metadata.get("canonical_naming_decision")
+        naming_decision = (
+            read_naming_decision(raw)
+            if raw is not None
+            else decision_from_work_identity(plan.work_identity)
+        )
+        canonical_root = build_canonical_work_root(
+            resolved_target_root=target_root,
+            decision=naming_decision,
+            year=plan.work_identity.year,
+        )
+    except CanonicalNamingError as exc:
+        raise DecisionStateError(str(exc)) from exc
+    return series_registration.manual_tv_binding(plan.work_identity, catalog, canonical_root)
+
+
+def _complete_inventory_plan(plan, state, service, command, catalog, group_id, group_kind,
+                             snapshot, domain, selected_season):
+    """消费点击时冻结的输入；后台计算仍通过原决策命令提交。"""
+    from ..rename.target_routing import resolve_target_root
+    draft = _inventory_draft_for_completion(plan, service)
+    target_root = resolve_target_root(
+        domain,
+        group_kind,
+        snapshot,
+    )
+    completion_kwargs = {}
+    decision_changes = {
+        "library_domain": domain,
+        "layout_mode": (
+            "tv_episodes" if group_kind == "tv_episodes" else "movie_segments"
+        ),
+        "recovery_state": "healthy",
+    }
+    if group_kind == "tv_episodes":
+        from ..rename.series_registration import SeriesRegistrationAuthority
+        if not is_confirmed_movie_plan(draft):
+            series_binding = _series_binding_for_tv(plan, state, catalog, target_root)
+            decision_changes["series_binding"] = series_binding
+            decision_changes["catalog_link_intent"] = None
+            completion_kwargs.update({
+                "series_key": str(series_binding["series_key"]),
+                "series_registration_authority": SeriesRegistrationAuthority.from_mapping(series_binding['registration_authority']),
+                "season_binding_id": None,
+                "series_catalog_revision": int(series_binding.get("catalog_revision") or 0),
+            })
+        if selected_season is not None:
+            completion_kwargs["season_number"] = selected_season
+            completion_kwargs["season_source"] = "explicit_user"
+            from ..rename.season_identity import confirmed_season_binding
+            decision_changes["season_binding"] = confirmed_season_binding(
+                draft.work_identity.primary_provider.to_dict(), int(selected_season),
+                'explicit_user', previous=state)
+        elif state.season_binding is not None:
+            completion_kwargs["season_number"] = int(
+                state.season_binding["season_number"]
+            )
+            completion_kwargs["season_source"] = str(
+                state.season_binding.get("decision_source")
+                or "provider"
+            )
+        else:
+            raise DecisionStateError("尚未确认季度，不能生成剧集 Plan")
+        binding = decision_changes.get("season_binding") or state.season_binding
+        completion_kwargs["season_binding_id"] = str(
+            binding["season_binding_id"]
+        )
+    if group_kind == "movie_continuous":
+        completion_kwargs["confirmed_segment_sources"] = tuple(
+            entry.source_path
+            for entry in draft.entries
+            if entry.media_kind == "video"
+        )
+    revised = service.complete_inventory_draft(
+        draft.task_id,
+        PlanStore.fingerprint(draft),
+        group_id=group_id,
+        group_kind=group_kind,
+        target_root=target_root,
+        reason=(
+            "用户选择按季和集播放并确认智能生成"
+            if group_kind == "tv_episodes"
+            else "用户选择连续电影播放并确认智能生成"
+        ),
+        root_snapshot=snapshot.to_dict(),
+        work_domain=domain,
+        persist_revision=False,
+        _source_plan=draft,
+        _revision_parent_fingerprint=PlanStore.fingerprint(plan),
+        **completion_kwargs,
+    )
+    if group_kind == "movie_continuous" or is_confirmed_movie_plan(draft):
+        revised_metadata = (
+            revised.metadata
+            if isinstance(revised.metadata, Mapping) else {}
+        )
+        work_key = str(
+            revised_metadata.get("catalog_work_key")
+            or revised_metadata.get("proposed_work_key")
+            or ""
+        ).strip()
+        decision_changes.update({
+            "series_binding": None,
+            "catalog_link_intent": (
+                {
+                    "work_key": work_key,
+                    "catalog_revision": int(
+                        revised_metadata.get("catalog_revision") or 0
+                    ),
+                }
+                if work_key else None
+            ),
+        })
+    decision_changes['movie_version_selection']=(
+        service.movie_selection_for_completion(revised))
+    saved_state, projected = command.update(
+        plan.task_id,
+        expected_revision=state.revision,
+        changes=decision_changes,
+        planner=lambda _state: revised,
+        task_terminal=_task_terminal_for_projected_plan(plan.task_id),
+    )
+    if projected is None:
+        raise DecisionStateError("未生成 DecisionState 对应的 Plan")
+    return projected
+
+def _prepare_catalog_display(plan, state, task, review, series, detach, recovery):
+    """一次展示内的登记观察；不作为后续命令的权威或长期缓存。"""
+    result = dict(pending=None, match=None, error=None, recovery=None, suggestions=(), present=False)
+    try:
+        result['pending'] = detach.pending_transaction(plan.task_id)
+    except (ProjectionAuthorityError, ValueError, RuntimeError, OSError) as exc:
+        result['pending'] = exc
+        return result
+    if result['pending'] is not None and result['pending'].phase != 'completed':
+        return result
+    kinds = {g.kind for g in plan.presentation_groups}
+    kind = next(iter(kinds)) if len(kinds) == 1 else None
+    if kind not in {'movie_continuous', 'tv_episodes'}:
+        return result
+    if (plan.metadata.get('mapping_source') == 'inventory_review_draft'
+            and not task.get('execution_status') and kind != 'movie_continuous'):
+        return result
+    backend, key = catalog_backend_for_plan(plan, state)
+    frozen = catalog_lookup_uses_frozen_key(state, backend, key)
+    work = plan.work_identity
+    if (work is None or work.status != 'confirmed') and not frozen:
+        return result
+    from ..rename.work_affiliation import from_plan
+    affiliation = from_plan(plan)
+    try:
+        if backend == 'series':
+            match = (series.load(str(key)) if key and (frozen
+                or affiliation is not None and affiliation.to_dict()['action'] == 'existing'
+                or task.get('execution_status') in {'completed', 'catalog_update_pending'})
+                else series.find_by_provider(work.primary_provider.to_dict()))
+        else:
+            match = (review.work_catalog.get_match(str(key)) if key else
+                     review.work_catalog.find_exact(work.primary_provider, group_kind=kind))
+        result['match'] = match
+        if match is not None:
+            result['present'] = match.canonical_root.is_dir()
+        elif backend != 'series' and not frozen and affiliation is None:
+            result['suggestions'] = review.work_catalog.suggestions(work.title, work.year,
+                work.primary_provider.aliases, group_kind=kind, include_related_series=kind == 'tv_episodes')
+    except Exception as exc:
+        result['error'] = exc
+        if not is_fresh_unexecuted_task(task, state) and state is not None:
+            result['recovery'] = recovery.diagnose(state, plan)
+    return result
+
+
+@reuse_display_asset_reads
+def _prepare_revision_display(plan, review, series, detach, recovery, task_fallback):
+    from ..utils.utils import read_task_at
+    snapshot = build_plan_review_snapshot(plan)
+    state = review.decision_state_store.load_optional(plan.task_id)
+    task = read_task_at(review.task_root, plan.task_id) or task_fallback
+    decision = review.load_or_create(plan)
+    catalog = _prepare_catalog_display(plan, state, task, review, series, detach, recovery)
+    current = review.plan_store.load(plan.task_id)
+    if PlanStore.fingerprint(current) != PlanStore.fingerprint(plan):
+        raise ValueError('整理计划已更新，不采用过期的页面结果')
+    return snapshot, state, decision, task, catalog
+
+
+@reuse_display_asset_reads
+def prepare_plan_review_open(plan: RenamePlan) -> PlanReviewSnapshot:
+    """Read display data in the worker; no UI or authoritative writes here."""
+    from ..rename.work_catalog import WorkCatalog
+    snapshot = build_plan_review_snapshot(plan)
+    decisions = DecisionStateStore(DECISION_STATE_PATH)
+    state = decisions.load_optional(plan.task_id)
+    service = CatalogDetachService(
+        transaction_store=RecoveryTransactionStore(RECOVERY_TRANSACTION_PATH),
+        decision_store=decisions, plan_store=PlanStore(PLAN_PATH),
+        work_catalog=WorkCatalog(WORK_CATALOG_PATH),
+        series_catalog=SeriesCatalog(SERIES_CATALOG_PATH), task_root=TASK_PATH,
+    )
+    from ..rename.initial_movie_completion import RootSnapshotSource
+    from ..rename.target_routing import snapshot_from_config_manager
+    from ..rename.recognition_queue_admission import capture_workspace_open
+    review = PlanReviewService(PlanStore(PLAN_PATH), PLAN_REVIEW_PATH,
+        decision_state_root=DECISION_STATE_PATH, task_root=TASK_PATH,
+        root_snapshot_source=RootSnapshotSource(lambda: snapshot_from_config_manager(cm)))
+    task = get_task(plan.task_id) or {}
+    recovery = RecoveryService(catalog_root=WORK_CATALOG_PATH, record_root=RECORD_PATH,
+        series_catalog_root=SERIES_CATALOG_PATH, rebuild_service=review.rebuild_service)
+    catalog = _prepare_catalog_display(plan, state, task, review, service.series_catalog, service, recovery)
+    decision = review.load_or_create(plan)
+    evidence = capture_workspace_open(task_queue, plan.task_id, task)
+    return replace(snapshot, opening_context=(state, catalog['pending']),
+                   display_context=(decision, task, catalog, evidence))
+
+
+@reuse_display_asset_reads
 def build_plan_review_snapshot(plan: RenamePlan) -> PlanReviewSnapshot:
     verification = PlanVerifier().verify(plan)
     presentation_groups_by_id = {
@@ -931,6 +1238,7 @@ def build_plan_review_snapshot(plan: RenamePlan) -> PlanReviewSnapshot:
             "target": str(entry.target_path),
             "season": entry.season_id,
             "episode": entry.episode_id,
+            "episode_end": entry.episode_end,
             "media_kind": entry.media_kind,
             "role": entry.role,
             "requires_review": entry.requires_review,
@@ -1147,10 +1455,6 @@ def filter_plan_rows(
     return filtered
 
 
-def export_plan_json(plan: RenamePlan) -> str:
-    return json.dumps(plan.to_dict(), indent=2, ensure_ascii=False)
-
-
 def catalog_backend_for_plan(
     plan: RenamePlan, decision: Optional[object]
 ) -> tuple[str, Optional[str]]:
@@ -1200,19 +1504,76 @@ def _dialog_mount_context():
     return ui.context.client.content
 
 
-class PlanReviewDialog(ui.dialog):
-    def __init__(self, plan: RenamePlan, task_data: Dict[str, object]):
+from .plan_file_list import PlanFileListMixin
+
+
+class PlanReviewDialog(PlanFileListMixin, ui.dialog):
+    def __init__(self, plan: Optional[RenamePlan], task_data: Dict[str, object], *, snapshot=None, loading=False, recovery_error=None):
         super().__init__()
         self.props("persistent")
         self.exit_requested = False
+        self.queue = task_queue
         self.plan = plan
+        self.recovery_error = recovery_error
         self.task_data = task_data
-        self.snapshot = build_plan_review_snapshot(plan)
+        self.task_id = plan.task_id if plan is not None else str(task_data['uuid'])
+        from ..rename.recognition_queue_admission import capture_workspace_open
+        self.retry_open_evidence = capture_workspace_open(task_queue, self.task_id, task_data)
+        with self:
+            self.body = ui.card().classes('bar-dialog bar-review-dialog bar-modal-fixed')
+        if loading:
+            with self.body:
+                with ui.column().classes('bar-modal-header w-full'):
+                    ui.label('整理任务').classes('bar-dialog-title')
+                with ui.column().classes('bar-modal-body w-full gap-3'):
+                    bar_progress(ui)
+                    ui.label('正在读取整理计划').classes('bar-help')
+                with ui.row().classes('bar-modal-footer w-full justify-end'):
+                    self._render_close_action()
+        elif plan is None:
+            operation, _ = build_review_operation(task_data)
+            self.provider_selection_expanded = not bool(operation.context.get('candidate'))
+            self._build_regions()
+            with self.summary_region:
+                self._render_header()
+            with self.selection_region:
+                self.groups_container = ui.column().classes('w-full gap-3')
+                if recovery_error is not None:
+                    ui.label('当前整理记录无法读取，请核对后再继续：' + str(recovery_error)).classes('bar-task-feedback bar-error-text')
+                self._render_initial_selection()
+                from ..rename.input_directory_discovery import source_group_pending
+                if not source_group_pending(task_data):
+                    self._render_recognition_options()
+            with self.plan_region:
+                from .task_source_files_view import render_task_source_files
+                self.source_file_list = render_task_source_files(task_data)
+            with self.actions_region:
+                self.render_actions()
+            self.client.on_disconnect(lambda: setattr(self, 'exit_requested', True) if self.plan is None else None)
+            self.on_value_change(lambda event: setattr(self, 'exit_requested', True) if not event.value else None)
+        else:
+            self._load_plan_view(plan, snapshot=snapshot)
+
+    def _load_plan_view(self, plan: RenamePlan, *, snapshot=None) -> None:
+        """Hydrate the same dialog from an actual persisted plan, never a stub."""
+        first_hydration = self.plan is None
+        self.plan = plan
+        if snapshot is not None and snapshot.display_context is not None:
+            self.task_data = snapshot.display_context[1]
+        else:
+            self.task_data = get_task(self.task_id) or self.task_data
+        if first_hydration and (snapshot is None or snapshot.display_context is None):
+            from ..rename.recognition_queue_admission import capture_workspace_open
+            self.retry_open_evidence = capture_workspace_open(task_queue, self.task_id, self.task_data)
+        self.snapshot = snapshot if snapshot is not None else build_plan_review_snapshot(plan)
+        from ..rename.initial_movie_completion import RootSnapshotSource
+        from ..rename.target_routing import snapshot_from_config_manager
         self.review_service = PlanReviewService(
             PlanStore(PLAN_PATH),
             PLAN_REVIEW_PATH,
             decision_state_root=DECISION_STATE_PATH,
             task_root=TASK_PATH,
+            root_snapshot_source=RootSnapshotSource(lambda: snapshot_from_config_manager(cm)),
         )
         self.decision_state_store = DecisionStateStore(DECISION_STATE_PATH)
         self.decision_command_service = DecisionCommandService(
@@ -1223,6 +1584,7 @@ class PlanReviewDialog(ui.dialog):
             catalog_root=WORK_CATALOG_PATH,
             record_root=RECORD_PATH,
             series_catalog_root=SERIES_CATALOG_PATH,
+            rebuild_service=self.review_service.rebuild_service,
         )
         self.recovery_transaction_store = RecoveryTransactionStore(
             RECOVERY_TRANSACTION_PATH
@@ -1237,8 +1599,15 @@ class PlanReviewDialog(ui.dialog):
         )
         # Read-only projection: opening the dialog never creates or migrates
         # authoritative state. Legacy tasks get it on explicit re-recognition.
-        self.task_decision = self.decision_state_store.load_optional(plan.task_id)
-        self.decision = self.review_service.load_or_create(plan)
+        self.task_decision = (self.snapshot.opening_context[0]
+                              if self.snapshot.opening_context is not None
+                              else self.decision_state_store.load_optional(plan.task_id))
+        if self.snapshot.display_context is None:
+            self.decision = self.review_service.load_or_create(plan)
+            self._catalog_display = _prepare_catalog_display(plan, self.task_decision, self.task_data,
+                self.review_service, self.series_catalog, self.catalog_detach_service, self.recovery_service)
+        else:
+            self.decision, self.task_data, self._catalog_display, self.retry_open_evidence = self.snapshot.display_context
         self.query = ""
         self.review_only = False
         self.subtitle_only = False
@@ -1253,81 +1622,193 @@ class PlanReviewDialog(ui.dialog):
         self.provider_selection_expanded = False
         self.pending_library_domain: Optional[str] = None  # form-only legacy
 
-        with self, ui.card().classes("bar-dialog bar-review-dialog"):
+        self.body.clear()
+        self._build_regions()
+        with self.summary_region:
             self._render_header()
-            with ui.expansion(
-                "重新识别设置", icon="refresh"
-            ).classes("bar-confirm-card w-full"):
-                self._render_rerecognition_settings()
-            self.completion_container = ui.column().classes("w-full gap-2")
+        self.snapshot = replace(self.snapshot, opening_context=None)
+        with self.selection_region:
+            self.groups_container = ui.column().classes('w-full gap-3')
+            self._render_groups()
+            if not self._replacement_unfinished():
+                self._render_recognition_options()
+            if not self._replacement_unfinished():
+                self._render_matched_seasons()
+        if self._replacement_unfinished() or self.plan.metadata.get('pending_work_affiliation') is not None:
+            with self.plan_region:
+                if self.plan.metadata.get('pending_work_affiliation') is not None:
+                    from .work_affiliation_view import render
+                    render(self, ui=ui, notify=notify)
+                from .task_source_files_view import render_task_source_files
+                self.source_file_list = render_task_source_files(self.task_data)
+            with self.actions_region:
+                self.render_actions()
+            return
+        with self.plan_region:
+            self.catalog_container = ui.column().classes('w-full gap-2')
+            self._render_catalog_context()
+            self.completion_container = ui.column().classes('w-full gap-2')
             self._render_completion_workflow()
-            self.issues_container = ui.column().classes("w-full")
+            self.issues_container = ui.column().classes('w-full')
             self._render_issues()
+            self._render_plan_tools()
             self._render_toolbar()
-            self.entries_container = ui.column().classes(
-                "bar-review-entries w-full gap-2"
-            )
+            self.entries_container = ui.column().classes('bar-review-entries w-full gap-2')
             self._render_entries()
-            with ui.expansion(
-                "高级手动修正（通常不需要）", icon="tune"
-            ).classes("bar-advanced-review w-full"):
-                ui.label(
-                    "只有候选作品选择或自动判断无法解决时，才需要使用以下工具。"
-                ).classes("bar-help")
+            self._render_manual_corrections()
+        with self.actions_region:
+            self.render_actions()
+
+    def _build_regions(self):
+        """区域由页面显式组织；状态刷新只更新区域内部。"""
+        with self.body:
+            self.summary_region = ui.column().classes('bar-modal-header bar-review-summary w-full gap-3')
+            with ui.column().classes('bar-modal-body w-full gap-5'):
+                self.selection_region = ui.column().classes('bar-review-section w-full gap-3')
+                with self.selection_region:
+                    ui.label('作品与季度确认').classes('text-lg font-bold')
+                self.plan_region = ui.column().classes('bar-review-section w-full gap-3')
+                with self.plan_region:
+                    ui.label('计划预览' if self.plan is not None and not self._replacement_unfinished() and self.plan.metadata.get('pending_work_affiliation') is None else '来源文件').classes('text-lg font-bold')
+            self.actions_region = ui.column().classes('bar-modal-footer w-full gap-2')
+
+    def _render_recognition_options(self):
+        with ui.expansion('重新识别设置', icon='o_refresh').classes('w-full') as options:
+            self._render_rerecognition_settings()
+        self.initial_options = options
+
+    def _render_initial_selection(self):
+        self.groups_container.clear()
+        with self.groups_container:
+            from ..rename.input_directory_discovery import source_group_pending
+            if source_group_pending(self.task_data):
+                ui.label('请核对本任务的来源文件，确认后继续识别。').classes('bar-help')
+                ui.button('继续识别来源', icon='o_arrow_forward', on_click=self._confirm_source_group).classes('bar-review-action').props('color=green-7')
+                return
+            operation, _ = build_review_operation(self.task_data)
+            selected = operation.context.get('candidate')
+            title = selected.get('title') if isinstance(selected, Mapping) else ''
+            ui.label(f'已选择作品：{title}' if title else '尚未选择作品').classes('text-subtitle1 font-bold')
+            with ui.column().classes('bar-review-feedback w-full gap-2'):
+                render_review_operation(ui, self.task_data, self._review_callbacks(), common_actions=False)
+
+            if title:
+                self._render_work_actions(operation.context)
+            picker = ui.column().classes('bar-review-picker w-full gap-2')
+            picker.set_visibility(self.provider_selection_expanded or not title)
+            with picker:
+                self._render_provider_link_input()
+                candidates = normalize_provider_candidates(self.task_data)
+                if candidates:
+                    with ui.element('div').classes('bar-provider-grid w-full gap-4'):
+                        self.render_provider_column('bangumi', candidates)
+                        self.render_provider_column('tmdb', candidates)
+            self.season_container = ui.column().classes('bar-review-season w-full gap-2')
+            with self.season_container:
+                self._render_season_placeholder('')
+
+    def _review_callbacks(self):
+        return ReviewOperationCallbacks(
+            select_provider_candidate=self._select_provider_candidate,
+            dispatch_review_command=self._dispatch_review_command,
+            show_provider_candidates=self._show_provider_candidates,
+            remove_provider_failure_task=self._remove_provider_failure_task,
+            close_review=self._close_review)
+
+    def _render_work_actions(self, context):
+        from ..rename.provider_recovery import can_refresh_selection
+        from ..rename.special_catalog import plain
+        candidate = context.get('candidate')
+        with ui.row().classes('bar-review-work-actions w-full items-center gap-2'):
+            ui.button('选择／更换作品', icon='o_swap_horiz', on_click=self._show_provider_candidates).props('outline color=blue-7')
+            refresh = ui.button('重新读取资料', icon='o_refresh',
+                on_click=lambda: self._select_provider_candidate(plain(candidate))).props('outline color=blue-7')
+            if not can_refresh_selection(context):
+                refresh.disable()
+                refresh.tooltip('当前没有可重试的资料读取；可更换作品或展开重新识别设置。')
+
+    def _render_season_placeholder(self, reason):
+        from .season_choice import season_choice
+        if reason:
+            ui.label(reason).classes('bar-help')
+        selected = season_choice(ui, (), label='季度')
+        for control in (selected.manual, selected.picker, selected.custom):
+            control.disable()
+        with selected.controls_row:
+            ui.button('确认季度并继续', icon='o_check').props('color=blue-7').disable()
+
+    def _render_manual_corrections(self) -> None:
+        if self.plan.metadata.get('content_selection') is None:
+            with ui.expansion('旧任务高级手动修正', icon='o_tune').classes('bar-advanced-review w-full'):
                 self._render_presentation_override()
                 self._render_override()
-                self._render_subtitle_override()
-            self._render_actions()
+        # Language, subtitle owner and token decisions remain necessary. They
+        # are structured content commands, not arbitrary target overrides.
+
+    def _pre_admission_selection(self):
+        from .provider_selection_work import current_work, _matches_result
+        work = current_work(task_queue, self.task_id)
+        return work if work is not None and not work.admitted and not work.cancelled and _matches_result(work, self.task_data) else None
+
+    def _replacement_unfinished(self):
+        operation, _ = build_review_operation(self.task_data)
+        context = operation.context
+        return bool(self.plan is not None and self.task_decision is not None and self.task_decision.confirmed_work
+            and (self._pre_admission_selection() is not None or (context.get('kind') == 'provider_selection'
+            and context.get('lifecycle') in {'pending', 'failed', 'awaiting_season'})))
 
     def _render_header(self) -> None:
+        unresolved = self.plan is None or self._replacement_unfinished()
         with ui.row().classes("bar-dialog-header w-full items-start gap-4"):
             with ui.column().classes("bar-dialog-header-content gap-1"):
                 ui.label("整理任务").classes("bar-dialog-title")
-                ui.label("批准和人工覆盖只记录决定，不执行文件操作。" ).classes(
-                    "bar-muted"
-                )
             with ui.row().classes("bar-dialog-header-actions items-center gap-2 flex-wrap justify-end"):
                 self.plan_badge = ui.badge(
                     PLAN_STATUS_LABELS.get(
                         self.snapshot.plan_status, self.snapshot.plan_status
-                    ),
+                    ) if not unresolved else PlanReviewDialog._header_recognition_text(self),
                     color="orange-8"
-                    if self.snapshot.plan_status == "need_confirm"
+                    if unresolved or self.snapshot.plan_status == "need_confirm"
                     else "green-7",
                 )
+                self.plan_badge.set_visibility(entry_status(self.plan, self.task_data) != "已整理")
                 self.review_badge = ui.badge(
-                    REVIEW_STATUS_LABELS[self.decision.status], color="blue-7"
+                    (completion_status(self.plan, self.task_data) or REVIEW_STATUS_LABELS[self.decision.status]) if not unresolved else '尚未生成计划', color="blue-7"
                 )
 
         with ui.row().classes("bar-confirm-card w-full gap-5 flex-wrap"):
             authoritative_title = ""
-            if self.task_decision is not None:
+            if not unresolved and self.task_decision is not None:
                 authoritative_title = str(
                     self.task_decision.confirmed_work.get("title") or ""
                 ).strip()
-            if not authoritative_title and self.plan.work_identity is not None:
+            if not unresolved and not authoritative_title and self.plan.work_identity is not None:
                 authoritative_title = str(self.plan.work_identity.title or "").strip()
             self.header_title_value = _meta_item(
-                "作品", authoritative_title or "未记录"
+                "作品", authoritative_title or PlanReviewDialog._pending_work_title(self)
             )
             self.header_season_value = _meta_item(
-                "季度", PlanReviewDialog._header_season_text(self)
+                "季度", '待确认' if unresolved else PlanReviewDialog._header_season_text(self)
             )
             self.header_recognition_value = _meta_item(
                 "识别状态", PlanReviewDialog._header_recognition_text(self)
             )
             self.header_entry_count_value = _meta_item(
-                f"{RENAME_PLAN_TERM}条目", str(len(self.snapshot.rows))
+                f"{RENAME_PLAN_TERM}条目", '尚未生成' if unresolved else str(len(self.plan.entries))
             )
-            _meta_item("任务 ID", self.plan.task_id[:8], monospace=True)
-        ui.label(f"源目录：{self.snapshot.source_root}").classes("bar-path-text")
+            _meta_item("任务 ID", self.task_id[:8], monospace=True)
+        ui.label(f"源目录：{self.task_data.get('path', '') if unresolved else self.snapshot.source_root}").classes("bar-path-text")
+        if unresolved:
+            return
+
+    def _render_matched_seasons(self):
         provider_link = provider_link_review_summary(
             self.plan.metadata.get("provider_link_snapshot")
         )
         if provider_link is not None:
             with ui.expansion(
                 "已匹配作品季度",
-                icon="account_tree",
+                icon='o_account_tree',
                 value=True,
             ).classes("bar-confirm-card w-full"):
                 ui.label(
@@ -1335,45 +1816,22 @@ class PlanReviewDialog(ui.dialog):
                 ).classes("font-bold")
                 for assignment in provider_link["assignments"]:
                     ui.label(str(assignment)).classes("bar-help")
-                ui.label(str(provider_link["pending_notice"])).classes(
-                    "bar-help text-orange-8"
-                )
-        if self.plan.migrated_from_schema == 4:
-            with ui.row().classes(
-                "bar-callout bar-callout-warning w-full items-start gap-2"
-            ):
-                ui.icon("warning", size="20px")
-                with ui.column().classes("gap-1"):
-                    ui.label("此整理计划已从 schema v4 转换").classes(
-                        "font-bold text-orange-9"
-                    )
-                    ui.label(
-                        "旧批准已经失效，必须重新处理并批准。原始 v4 历史不会被覆盖；"
-                        "只有保存新版后才会产生新的 v5 版本。"
-                    ).classes("bar-help")
-                    if self.plan.migration_source_fingerprint:
-                        ui.label(
-                            "原始版本标识："
-                            f"{self.plan.migration_source_fingerprint[:16]}…"
-                        ).classes("bar-help font-mono")
+                if not completion_status(self.plan, self.task_data):
+                    ui.label(str(provider_link["pending_notice"])).classes("bar-help text-orange-8")
 
-        self.groups_container = ui.column().classes("w-full gap-2")
-        self._render_groups()
-        self.catalog_container = ui.column().classes("w-full gap-2")
-        self._render_catalog_context()
 
     def _render_rerecognition_settings(self) -> None:
         """Keep the legacy edit fields inside the single task workspace."""
 
         ui.label(
-            "只有当前识别结果不对或来源目录已变化时才需要修改。保存后会重新生成整理计划，旧批准不会沿用。"
+            "重新识别保留当前任务及来源文件，按本次类型、名称和季度重新检索。旧计划、批准和手动归属将退出。"
         ).classes("bar-help")
         current_media_type = _media_type_from_flags(
             self.task_data.get("is_anime"), self.task_data.get("is_movie")
         )
         self.rerecognition_path = ui.input(
-            "来源目录", value=str(self.task_data.get("path") or self.plan.source_root)
-        ).props("outlined dense").classes("w-full")
+                "来源目录", value=str(self.task_data.get("path") or (self.plan.source_root if self.plan else ''))
+        ).props("outlined dense readonly").classes("w-full")
         with ui.row().classes("w-full items-end gap-3 flex-wrap"):
             self.rerecognition_media_type = ui.select(
                 MEDIA_OPTIONS, value=current_media_type, label="媒体类型"
@@ -1384,56 +1842,49 @@ class PlanReviewDialog(ui.dialog):
             self.rerecognition_season = ui.number(
                 "季度", value=self.task_data.get("season_id")
             ).props("outlined dense clearable").classes("w-32")
-            self.rerecognition_use_ai = ui.checkbox(
-                "允许 AI 辅助", value=bool(self.task_data.get("use_ai", False))
-            )
         with ui.row().classes("w-full gap-3 flex-wrap"):
             ui.button(
-                icon="folder_open", on_click=self._pick_rerecognition_source
-            ).props('outline color=blue-8 aria-label="从文件夹树选择来源目录"').tooltip(
-                "从文件夹树选择来源目录"
-            )
-            ui.button(
-                "保存并重新识别", icon="refresh", on_click=self._restart_recognition
+                "保存并重新识别", icon='o_refresh', on_click=self._restart_recognition
             ).props("outline color=blue-8")
-
-    async def _pick_rerecognition_source(self) -> None:
-        current = str(self.rerecognition_path.value or cm.get_config("docker_mnt") or "/volume1")
-        result = await local_file_picker(current, multiple=False, title="选择来源目录")
-        if isinstance(result, (list, tuple)) and result:
-            self.rerecognition_path.value = str(result[0])
-            self.rerecognition_path.update()
 
     async def _restart_recognition(self) -> None:
         saved = await _reenqueue_from_workspace(
-            self.plan.task_id,
+            self.task_id,
             self.task_data,
             path_value=self.rerecognition_path.value,
             media_type=self.rerecognition_media_type.value,
             name_value=self.rerecognition_name.value,
             season_value=self.rerecognition_season.value,
-            use_ai=bool(self.rerecognition_use_ai.value),
+            opened_evidence=self.retry_open_evidence,
         )
         if saved:
             self._close_review()
 
     def _render_catalog_context(self) -> None:
         self.catalog_container.clear()
+        self._asset_choice_embedded = False
         with self.catalog_container:
-            self._render_catalog_context_content()
+            with ui.card().classes('bar-confirm-card w-full'):
+                ui.label('已登记的同一作品').classes('font-bold')
+                self._render_catalog_context_content()
 
-    def _recover_missing_catalog(self) -> None:
+    async def _recover_missing_catalog(self) -> None:
+        from ..rename.replacement_completion import uses_completion_policy
+        if uses_completion_policy(self.plan.metadata.get('asset_operation')):
+            from .asset_recovery_view import open_asset_recovery
+            await open_asset_recovery(task_queue, self.plan.task_id, self._close_review)
+            return
         if self.task_decision is None:
             notify("旧任务缺少权威决策状态，请重新识别", type="warning")
             return
         try:
-            self.recovery_service.rebuild_catalog(
+            await ui_disk_call(self.recovery_service.rebuild_catalog,
                 self.task_decision,
                 self.plan,
                 self.review_service.work_catalog,
                 self.series_catalog,
             )
-            self.task_decision, projected = self.decision_command_service.update(
+            self.task_decision, projected = await ui_disk_call(self.decision_command_service.update,
                 self.plan.task_id,
                 expected_revision=self.task_decision.revision,
                 changes={"recovery_state": "healthy"},
@@ -1447,42 +1898,51 @@ class PlanReviewDialog(ui.dialog):
         except Exception as exc:
             notify(f"无法重建作品登记：{exc}", type="negative")
             return
-        self._adopt_revision(projected)
+        await await_result(self._adopt_revision(projected))
         notify("已依据历史记录和现存文件重建作品登记", type="positive")
 
-    def _recover_missing_materialization(self) -> None:
+    async def _recover_missing_materialization(self) -> None:
         if self.task_decision is None:
             notify("旧任务缺少权威决策状态，请重新识别", type="warning")
             return
-        try:
-            revised = self.recovery_service.rebuild_missing_materialization_plan(
-                self.task_decision,
-                self.plan,
-                PlanStore(PLAN_PATH),
-            )
-            self.task_decision, projected = self.decision_command_service.update(
-                self.plan.task_id,
-                expected_revision=self.task_decision.revision,
-                changes={"recovery_state": "materialization_missing"},
-                planner=lambda _state: revised,
-                task_terminal=_task_terminal_for_projected_plan(
-                    self.plan.task_id
-                ),
-            )
-            if projected is None:
-                raise DecisionStateError("未生成恢复 Plan")
-        except (DecisionStateError, ValueError) as exc:
-            notify(f"无法生成恢复计划：{exc}", type="negative")
-            return
-        self._adopt_revision(projected)
-        notify("已生成新的未批准整理计划；重新批准执行前不会创建文件", type="positive")
+        from .completed_rebuild_view import open_rebuild_dialog
+        execution = task_queue.execution_service
+        service = execution.rebuild_service
+        async def adopt(projected):
+            self.task_decision = service.decisions.load_readonly(self.plan.task_id)
+            await await_result(self._adopt_revision(projected))
+        await open_rebuild_dialog(self.plan.task_id, manager=task_queue, on_generated=adopt)
 
     def _render_catalog_context_content(self) -> None:
         """Show human-readable prior media state without exposing work UUIDs."""
 
+        try:
+            pending_detach = self._catalog_display['pending']
+            if isinstance(pending_detach, Exception):
+                raise pending_detach
+        except ProjectionAuthorityError:
+            ui.label(untrusted_projection_snapshot().detail).classes('bar-help')
+            return
+        except (ValueError, RuntimeError, OSError) as exc:
+            ui.label(f'作品登记恢复记录需核查：{exc}').classes('bar-help')
+            return
+        if pending_detach is not None and pending_detach.phase != 'completed':
+            self._render_detach_transaction_recovery(pending_detach.catalog_backend, pending_detach.catalog_key)
+            return
+
+        from .work_affiliation_view import render as render_affiliation
+        with ui.row().classes('w-full items-center gap-3') as work_actions:
+            if render_affiliation(self, ui=ui, notify=notify):
+                return
+            from .asset_actions_view import render_repair_choice
+            render_repair_choice(self)
+        from ..rename.work_affiliation import from_plan as affiliation_from_plan
+        affiliation = affiliation_from_plan(self.plan)
+
         if (
             self.plan.metadata.get("mapping_source") == "inventory_review_draft"
             and not self.task_data.get("execution_status")
+            and {g.kind for g in self.plan.presentation_groups} != {'movie_continuous'}
         ):
             return
         work = self.plan.work_identity
@@ -1492,7 +1952,7 @@ class PlanReviewDialog(ui.dialog):
             return
         if self.plan.metadata.get("recovery_reason") == "catalog_detached":
             with ui.row().classes("bar-callout bar-callout-warning w-full gap-2"):
-                ui.icon("warning")
+                ui.icon('o_warning')
                 with ui.column().classes("gap-1"):
                     ui.label("作品登记已解除，当前目标路径不能继续使用").classes(
                         "font-bold"
@@ -1504,7 +1964,7 @@ class PlanReviewDialog(ui.dialog):
                     ui.button(
                         "重新生成整理计划",
                         on_click=self._restart_recognition,
-                    ).props("outline color=blue-7 no-caps")
+                    icon='o_refresh').props("outline color=blue-7 no-caps")
             return
         is_tv = group_kind == "tv_episodes"
         media_label = "剧集" if is_tv else "电影"
@@ -1527,36 +1987,15 @@ class PlanReviewDialog(ui.dialog):
         if (work is None or work.status != "confirmed") and not frozen_failure_key:
             return
         try:
-            if catalog_backend == "series":
-                match = (
-                    self.series_catalog.load(str(catalog_key))
-                    if catalog_key and (
-                        frozen_failure_key
-                        or self.task_data.get("execution_status") in {
-                            "completed", "catalog_update_pending"
-                        }
-                    )
-                    else self.series_catalog.find_by_provider(
-                        work.primary_provider.to_dict()
-                    )
-                )
-            else:
-                match = (
-                    self.review_service.work_catalog.get_match(str(catalog_key))
-                    if catalog_key
-                    else self.review_service.work_catalog.find_exact(
-                        work.primary_provider, group_kind=group_kind
-                    )
-                )
-        except Exception as exc:
+            if self._catalog_display['error'] is not None:
+                raise self._catalog_display['error']
+            match = self._catalog_display['match']
+        except Exception:
             if is_fresh_unexecuted_task(self.task_data, self.task_decision):
                 return
-            recovery = (
-                self.recovery_service.diagnose(self.task_decision, self.plan)
-                if self.task_decision is not None else None
-            )
+            recovery = self._catalog_display['recovery']
             with ui.row().classes("bar-callout bar-callout-warning w-full gap-2"):
-                ui.icon("warning")
+                ui.icon('o_warning')
                 with ui.column().classes("gap-1"):
                     ui.label(user_recovery_detail(
                         recovery.detail if recovery is not None
@@ -1568,19 +2007,19 @@ class PlanReviewDialog(ui.dialog):
                     if recovery is not None and recovery.can_rebuild_catalog:
                         ui.button(
                             "从历史记录重建作品登记",
-                            icon="restore",
+                            icon='o_restore',
                             on_click=self._recover_missing_catalog,
                         ).props("outline color=blue-7 no-caps")
                     elif recovery is not None and recovery.can_rebuild_plan:
                         ui.button(
-                            "生成新的未批准整理计划",
-                            icon="refresh",
+                            "核查缺失内容并选择恢复方式",
+                            icon='o_refresh',
                             on_click=self._recover_missing_materialization,
                         ).props("outline color=blue-7 no-caps")
                     else:
                         ui.button(
                             "恢复或重新选择源目录",
-                            icon="folder_open",
+                            icon='o_folder_open',
                             on_click=self._restart_recognition,
                         ).props("outline color=blue-7 no-caps")
             return
@@ -1595,24 +2034,23 @@ class PlanReviewDialog(ui.dialog):
                 ui.label("已登记的同一系列").classes("font-bold")
                 ui.label(match.canonical_display_name)
                 ui.label(f"目录：{match.canonical_root}").classes("bar-path-text")
-                seasons = [
-                    str(item.get("season_number"))
-                    for item in match.season_bindings
-                ]
+                seasons = [str(number) for number in sorted({item.get('season_number')
+                    for item in match.season_bindings if type(item.get('season_number')) is int})]
                 ui.label(
                     "已登记季度：" + ("、".join(seasons) if seasons else "尚无")
                 ).classes("bar-help")
-            if not match.canonical_root.is_dir():
-                self._render_series_catalog_recovery_actions(
-                    match.series_key, media_label
-                )
+                from .asset_actions_view import render_asset_choice
+                render_asset_choice(self, embedded=True, action_row=work_actions)
+                self._asset_choice_embedded = True
+            if not self._catalog_display['present']:
+                ui.label('目标目录当前缺失；请点“核查并补齐”，核对本次文件后生成待批准计划。系列登记保留。').classes('bar-help')
             return
         if match is None:
             if frozen_failure_key:
                 with ui.row().classes(
                     "bar-callout bar-callout-warning w-full gap-2"
                 ):
-                    ui.icon("warning")
+                    ui.icon('o_warning')
                     with ui.column().classes("gap-1"):
                         ui.label(
                             "整理计划引用的作品登记不存在，不能只显示错误后结束。"
@@ -1624,7 +2062,7 @@ class PlanReviewDialog(ui.dialog):
                         if self.task_decision is not None:
                             ui.button(
                                 "从历史记录重建作品登记",
-                                icon="restore",
+                                icon='o_restore',
                                 on_click=self._recover_missing_catalog,
                             ).props("outline color=blue-7 no-caps")
                 return
@@ -1632,11 +2070,10 @@ class PlanReviewDialog(ui.dialog):
                 f"本地作品登记：尚未发现同一资料条目的已整理{media_label}；"
                 "本次真实执行成功后才会建立登记。"
             ).classes("bar-help")
-            suggestions = self.review_service.work_catalog.suggestions(
-                work.title, work.year, work.primary_provider.aliases,
-                group_kind=group_kind,
-                include_related_series=is_tv,
-            )
+            if affiliation is not None:
+                # The shared chooser reads registrations only when opened.
+                return
+            suggestions = self._catalog_display['suggestions']
             if suggestions:
                 ui.label(
                     f"发现标题和年份相符的既有{media_label}，但资料来源不同。"
@@ -1668,15 +2105,14 @@ class PlanReviewDialog(ui.dialog):
                             ).classes("bar-help")
                         ui.button(
                             ("确认归入此系列" if is_tv else "确认是同一电影，追加到此目录"),
-                            icon="merge_type",
+                            icon='o_merge_type',
                             on_click=partial(
                                 self._link_existing_catalog_work,
                                 suggestion.work_key,
                             ),
                         ).props("outline color=blue-8")
         else:
-            with ui.card().classes("bar-confirm-card w-full"):
-                ui.label("已登记的同一系列" if is_tv else "已登记的同一电影").classes("font-bold")
+            with ui.column().classes("w-full"):
                 ui.label(
                     f"{match.title}{f' ({match.year})' if match.year else ''}"
                 )
@@ -1694,10 +2130,12 @@ class PlanReviewDialog(ui.dialog):
                     ui.label(
                         "现有正片版本：" + ("、".join(labels) if labels else "尚无")
                     ).classes("bar-help")
-                ui.label(
-                    ("确认后，本任务会归入这个系列目录并写入相应 Season 目录。"
-                     if is_tv else "确认后，本任务会向这个目录追加新规格，不会创建第二个同名目录。")
-                ).classes("bar-help text-blue-8")
+                from .asset_actions_view import render_asset_choice
+                render_asset_choice(self, embedded=True, movie_work_key=match.work_key if not is_tv else None,
+                                    action_row=work_actions)
+                self._asset_choice_embedded = True
+                if is_tv:
+                    ui.label("确认后，本任务会归入这个系列目录并写入相应 Season 目录。").classes("bar-help text-blue-8")
                 try:
                     from ..rename.target_routing import (
                         resolve_target_root,
@@ -1722,55 +2160,64 @@ class PlanReviewDialog(ui.dialog):
                     ).classes("bar-help text-orange-8 font-bold")
                     ui.button(
                         "继续添加到已登记目录",
-                        icon="drive_file_move",
+                        icon='o_drive_file_move',
                         on_click=partial(
                             self._link_existing_catalog_work, match.work_key
                         ),
                     ).props("outline color=orange-8")
-                with ui.card().classes("bar-confirm-card w-full"):
-                    with ui.row().classes("items-center gap-2"):
-                        ui.icon("drive_file_move", color="blue-8")
-                        ui.label("原目录已移动").classes("font-bold")
-                    ui.label(
-                        "BAR 不会替你移动文件。粘贴完整目录或从文件夹树选择；系统只读核对"
-                        "全部登记资产和 hardlink inode，全部通过后仅更新本地作品登记。"
-                    ).classes("bar-help")
-                    with ui.row(wrap=False).classes("w-full items-center gap-2"):
-                        self.catalog_relocation_input = ui.input(
-                            label=f"移动后的完整{media_label}目录（可直接粘贴）"
-                        ).props("outlined clearable").classes("flex-grow")
+                try:
+                    directory_available = match.canonical_root.is_dir()
+                except OSError:
+                    directory_available = False
+                if not directory_available:
+                    ui.label('无法确认已登记目录仍然存在，请核查下方目录维护选项。').classes(
+                        'bar-help text-orange-8 font-bold')
+                with ui.expansion('作品登记维护', icon='o_settings',
+                                  value=is_tv or not directory_available).classes('w-full'):
+                    with ui.card().classes("bar-confirm-card w-full"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon('o_drive_file_move', color="blue-8")
+                            ui.label("原目录已移动").classes("font-bold")
+                        ui.label(
+                            "BAR 不会替你移动文件。粘贴完整目录或从文件夹树选择；系统只读核对"
+                            "全部登记资产和 hardlink inode，全部通过后仅更新本地作品登记。"
+                        ).classes("bar-help")
+                        with ui.row(wrap=False).classes("w-full items-center gap-2"):
+                            self.catalog_relocation_input = ui.input(
+                                label=f"移动后的完整{media_label}目录（可直接粘贴）"
+                            ).props("outlined clearable").classes("flex-grow")
+                            ui.button(
+                                icon='o_folder_open',
+                                on_click=self._pick_catalog_relocation_directory,
+                            ).props(
+                                'flat round color=blue-8 aria-label="从文件夹树选择移动后的目录"'
+                            ).tooltip("从文件夹树选择")
+                        with ui.row().classes("w-full gap-2 flex-wrap"):
+                            ui.button(
+                                "核对并重新定位登记",
+                                icon='o_verified',
+                                on_click=partial(
+                                    self._relocate_catalog_work, match.work_key
+                                ),
+                            ).props("outline color=blue-8")
+                    with ui.card().classes("bar-confirm-card w-full"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon('o_delete_outline', color="red-7")
+                            ui.label("原目录已删除").classes("font-bold")
+                        ui.label(
+                            "仅删除这条失效的本地作品登记，并保存内部归档；"
+                            "不会删除、移动或修改 NAS 中的任何文件。"
+                        ).classes("bar-help")
+                        self.catalog_delete_confirmation = ui.checkbox(
+                            f"我确认原{media_label}目录已经不存在"
+                        )
                         ui.button(
-                            icon="folder_open",
-                            on_click=self._pick_catalog_relocation_directory,
-                        ).props(
-                            'flat round color=blue-8 aria-label="从文件夹树选择移动后的目录"'
-                        ).tooltip("从文件夹树选择")
-                    with ui.row().classes("w-full gap-2 flex-wrap"):
-                        ui.button(
-                            "核对并重新定位登记",
-                            icon="verified",
+                            "删除失效的作品登记",
+                            icon='o_delete_forever',
                             on_click=partial(
-                                self._relocate_catalog_work, match.work_key
+                                self._archive_missing_catalog_work, match.work_key
                             ),
-                        ).props("outline color=blue-8")
-                with ui.card().classes("bar-confirm-card w-full"):
-                    with ui.row().classes("items-center gap-2"):
-                        ui.icon("delete_outline", color="red-7")
-                        ui.label("原目录已删除").classes("font-bold")
-                    ui.label(
-                        "仅删除这条失效的本地作品登记，并保存内部归档；"
-                        "不会删除、移动或修改 NAS 中的任何文件。"
-                    ).classes("bar-help")
-                    self.catalog_delete_confirmation = ui.checkbox(
-                        f"我确认原{media_label}目录已经不存在"
-                    )
-                    ui.button(
-                        "删除失效的作品登记",
-                        icon="delete_forever",
-                        on_click=partial(
-                            self._archive_missing_catalog_work, match.work_key
-                        ),
-                    ).props("outline color=red-7")
+                        ).props("outline color=red-7")
 
         frozen = str(
             self.plan.metadata.get("target_root_config_fingerprint") or ""
@@ -1786,39 +2233,28 @@ class PlanReviewDialog(ui.dialog):
                 with ui.row().classes(
                     "bar-callout bar-callout-warning w-full items-start gap-2"
                 ):
-                    ui.icon("info")
+                    ui.icon('o_info')
                     ui.label(
                         "路径配置已在此整理计划生成后改变。当前计划仍使用已确认目录；"
                         "如需采用新目录，请返回任务点击“重试”生成并重新处理。"
                     )
 
-    def _link_existing_catalog_work(self, work_key: str) -> None:
-        try:
-            revised = self.review_service.link_existing_catalog_work(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                work_key=work_key,
-                reason="用户确认不同资料来源指向同一本地作品",
-            )
-        except PlanReviewError as exc:
-            notify(localize_plan_term(exc), type="negative")
-            return
-        self._adopt_revision(revised)
-        self._render_catalog_context()
-        notify("已关联既有作品目录；尚未创建或移动任何文件", type="positive")
+    async def _link_existing_catalog_work(self, work_key: str) -> None:
+        from .work_affiliation_view import show
+        await show(self, ui=ui, notify=notify, selected_key=work_key)
 
     def _render_series_catalog_recovery_actions(
         self, series_key: str, media_label: str
     ) -> None:
         with ui.row().classes("bar-callout bar-callout-warning w-full gap-2"):
-            ui.icon("warning")
+            ui.icon('o_warning')
             ui.label(
                 "作品登记目录不存在。请选择原目录已移动或原目录已删除；"
                 "BAR 不会替你移动或删除任何媒体文件。"
             )
         with ui.card().classes("bar-confirm-card w-full"):
             with ui.row().classes("items-center gap-2"):
-                ui.icon("drive_file_move", color="blue-8")
+                ui.icon('o_drive_file_move', color="blue-8")
                 ui.label("原目录已移动").classes("font-bold")
             ui.label(
                 "粘贴完整目录或从文件夹树选择。系统会按所有已登记季度的历史记录"
@@ -1829,19 +2265,19 @@ class PlanReviewDialog(ui.dialog):
                     label=f"移动后的完整{media_label}目录（可直接粘贴）"
                 ).props("outlined clearable").classes("flex-grow")
                 ui.button(
-                    icon="folder_open",
+                    icon='o_folder_open',
                     on_click=self._pick_catalog_relocation_directory,
                 ).props(
                     'flat round color=blue-8 aria-label="从文件夹树选择移动后的目录"'
                 ).tooltip("从文件夹树选择")
             ui.button(
                 "核对并重新定位登记",
-                icon="verified",
+                icon='o_verified',
                 on_click=partial(self._relocate_series_catalog, series_key),
             ).props("outline color=blue-8")
         with ui.card().classes("bar-confirm-card w-full"):
             with ui.row().classes("items-center gap-2"):
-                ui.icon("delete_outline", color="red-7")
+                ui.icon('o_delete_outline', color="red-7")
                 ui.label("原目录已删除").classes("font-bold")
             ui.label(
                 "仅归档这条失效的系列登记并清除本任务的旧系列绑定；"
@@ -1852,11 +2288,11 @@ class PlanReviewDialog(ui.dialog):
             )
             ui.button(
                 "删除失效的作品登记",
-                icon="delete_forever",
+                icon='o_delete_forever',
                 on_click=partial(self._archive_missing_series_catalog, series_key),
             ).props("outline color=red-7")
 
-    def _relocate_series_catalog(self, series_key: str) -> None:
+    async def _relocate_series_catalog(self, series_key: str) -> None:
         value = str(getattr(self.catalog_relocation_input, "value", "") or "").strip()
         if not value:
             notify("请先填写移动后的完整作品目录", type="warning")
@@ -1875,7 +2311,7 @@ class PlanReviewDialog(ui.dialog):
             allowed_root = resolve_target_root(
                 domain, "tv_episodes", snapshot_from_config_manager(cm)
             )
-            self.series_catalog.relocate(
+            await ui_disk_call(self.series_catalog.relocate,
                 series_key,
                 Path(value),
                 allowed_root=allowed_root,
@@ -1892,16 +2328,16 @@ class PlanReviewDialog(ui.dialog):
             type="positive",
         )
 
-    def _archive_missing_series_catalog(self, series_key: str) -> None:
+    async def _archive_missing_series_catalog(self, series_key: str) -> None:
         confirmed = bool(
             getattr(self.catalog_delete_confirmation, "value", False)
         )
         if not confirmed:
             notify("请先确认原作品目录已经不存在", type="warning")
             return
-        self._detach_missing_catalog("series", series_key)
+        await self._detach_missing_catalog("series", series_key)
 
-    def _relocate_catalog_work(self, work_key: str) -> None:
+    async def _relocate_catalog_work(self, work_key: str) -> None:
         value = str(getattr(self.catalog_relocation_input, "value", "") or "").strip()
         if not value:
             notify("请先填写移动后的完整作品目录", type="warning")
@@ -1923,7 +2359,7 @@ class PlanReviewDialog(ui.dialog):
             allowed_root = resolve_target_root(
                 domain, next(iter(group_kinds)), snapshot_from_config_manager(cm)
             )
-            self.review_service.work_catalog.relocate(
+            await ui_disk_call(self.review_service.work_catalog.relocate,
                 work_key,
                 Path(value),
                 allowed_root=allowed_root,
@@ -1932,6 +2368,9 @@ class PlanReviewDialog(ui.dialog):
         except (PlanReviewError, TypeError, ValueError, RuntimeError) as exc:
             notify(localize_plan_term(exc), type="negative")
             return
+        self._catalog_display = await ui_disk_call(_prepare_catalog_display, self.plan,
+            self.task_decision, self.task_data, self.review_service, self.series_catalog,
+            self.catalog_detach_service, self.recovery_service)
         self._render_catalog_context()
         notify("作品登记已更新；BAR 未移动、复制或删除任何媒体文件", type="positive")
 
@@ -1950,21 +2389,21 @@ class PlanReviewDialog(ui.dialog):
             self.catalog_relocation_input.value = str(result[0])
             self.catalog_relocation_input.update()
 
-    def _archive_missing_catalog_work(self, work_key: str) -> None:
+    async def _archive_missing_catalog_work(self, work_key: str) -> None:
         confirmed = bool(
             getattr(self.catalog_delete_confirmation, "value", False)
         )
         if not confirmed:
             notify("请先确认原电影目录已经不存在", type="warning")
             return
-        self._detach_missing_catalog("work", work_key)
+        await self._detach_missing_catalog("work", work_key)
 
-    def _detach_missing_catalog(self, backend: str, catalog_key: str) -> None:
+    async def _detach_missing_catalog(self, backend: str, catalog_key: str) -> None:
         if self.task_decision is None:
             notify("旧任务缺少权威决策状态，请重新识别", type="warning")
             return
         try:
-            decision, revised, transaction = self.catalog_detach_service.execute(
+            decision, revised, transaction = await ui_disk_call(self.catalog_detach_service.execute,
                 self.plan.task_id,
                 catalog_backend=backend,
                 catalog_key=catalog_key,
@@ -1983,7 +2422,7 @@ class PlanReviewDialog(ui.dialog):
             notify("作品登记恢复事务尚未完成，执行仍被阻断", type="warning")
             return
         self.task_decision = decision
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         notify(
             "失效作品登记已安全归档，NAS 文件未被删除；"
             "已生成新的未批准整理计划，请重新检查并批准",
@@ -1994,7 +2433,7 @@ class PlanReviewDialog(ui.dialog):
         self, backend: str, catalog_key: str
     ) -> None:
         with ui.row().classes("bar-callout bar-callout-warning w-full gap-2"):
-            ui.icon("warning")
+            ui.icon('o_warning')
             with ui.column().classes("gap-1"):
                 ui.label("作品登记删除事务尚未完成").classes("font-bold")
                 ui.label(
@@ -2002,32 +2441,44 @@ class PlanReviewDialog(ui.dialog):
                     "请先按 Catalog 与内部归档证据对账。"
                 ).classes("bar-help")
                 try:
-                    transaction = self.recovery_transaction_store.load_optional(
-                        self.plan.task_id
-                    )
+                    transaction = self._catalog_display['pending']
+                    if isinstance(transaction, Exception):
+                        raise transaction
                 except RecoveryTransactionError:
                     transaction = None
                 if transaction is None:
                     ui.button(
                         "对账并继续删除登记",
-                        icon="rule",
+                        icon='o_rule',
                         on_click=partial(
                             self._reconcile_catalog_detach, backend, catalog_key
                         ),
                     ).props("outline color=orange-8 no-caps")
+                elif transaction.phase == 'prepared':
+                    ui.button('取消旧事务', icon='o_refresh', on_click=self._cancel_prepared_detach).classes(
+                        'bar-review-action').props('outline color=blue-7 no-caps')
                 else:
                     ui.button(
                         "继续删除登记事务",
-                        icon="play_arrow",
+                        icon='o_play_arrow',
                         on_click=partial(
                             self._detach_missing_catalog, backend, catalog_key
                         ),
                     ).props("outline color=blue-8 no-caps")
 
-    def _reconcile_catalog_detach(self, backend: str, catalog_key: str) -> None:
+    async def _cancel_prepared_detach(self):
+        try:
+            decision, revised = await ui_disk_call(self.catalog_detach_service.cancel_prepared, self.plan.task_id)
+            self.task_decision = decision
+            await await_result(self._adopt_revision(revised))
+            notify('已取消未执行的旧登记事务，媒体和登记保持不变', type='positive')
+        except (OSError, ValueError, RuntimeError) as exc:
+            notify(str(exc), type='negative')
+
+    async def _reconcile_catalog_detach(self, backend: str, catalog_key: str) -> None:
         try:
             decision, revised, transaction = (
-                self.catalog_detach_service.reconcile_and_execute(
+                await ui_disk_call(self.catalog_detach_service.reconcile_and_execute,
                     self.plan.task_id,
                     catalog_backend=backend,
                     catalog_key=catalog_key,
@@ -2044,7 +2495,7 @@ class PlanReviewDialog(ui.dialog):
             notify(localize_plan_term(exc), type="negative")
             return
         self.task_decision = decision
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         if transaction is None:
             notify("Catalog 仍完整，已安全取消待处理删除事务", type="positive")
         else:
@@ -2056,1123 +2507,123 @@ class PlanReviewDialog(ui.dialog):
     def _render_groups(self) -> None:
         self.groups_container.clear()
         with self.groups_container:
-            self._render_selection_operation()
-            candidates = normalize_provider_candidates(dict(self.plan.metadata))
+            from ..rename.input_directory_discovery import source_group_pending
+            if source_group_pending(self.task_data):
+                ui.label('请核对本任务的来源文件，确认后继续识别。').classes('bar-help')
+                ui.button('继续识别来源', icon='o_arrow_forward', on_click=self._confirm_source_group).classes('bar-review-action').props('color=green-7')
+                return
+            operation, _ = build_review_operation(self.task_data)
+            pending_read = self._pre_admission_selection()
+            selected = pending_read.candidate if pending_read is not None else operation.context.get('candidate')
             work = self.snapshot.work_identity
-            unresolved_work = str(work.get("status")) != "confirmed"
-            if not unresolved_work and not self.provider_selection_expanded:
-                self._render_selected_provider_identity()
-            elif candidates or unresolved_work:
-                if self.plan.metadata.get("presentation_assignment_state") == "placeholder":
-                    ui.label(
-                        "系统无法仅凭目录结构确定作品与呈现形式。请先从下列候选中确认；"
-                        "当前文件分组只是安全占位，不会被自动执行。"
-                    ).classes("bar-help text-orange-8")
-                warning = (
-                    candidate_type_warning(
-                        self.task_data.get("is_movie", self.plan.metadata.get("is_movie")),
-                        candidates,
-                    )
-                    if candidates else ""
-                )
-                if warning:
-                    with ui.row().classes("bar-callout bar-callout-warning w-full"):
-                        ui.icon("warning", size="20px")
-                        ui.label(warning)
-                ui.label("选择正确的作品").classes("text-subtitle2")
-                with ui.row().classes("w-full items-start gap-4 flex-wrap"):
-                    self._render_provider_column("bangumi", candidates)
-                    self._render_provider_column("tmdb", candidates)
-            if self.snapshot.presentation_groups:
-                ui.label("当前作品信息").classes("text-subtitle2")
-                with ui.card().classes("bar-group-summary w-full"):
-                    ui.label(
-                        str(work.get("title") or "尚未确认作品")
-                    ).classes("bar-evidence font-bold")
-                    if not unresolved_work:
-                        domain = str(work.get("domain") or "")
-                        group_kind = str(
-                            self.snapshot.presentation_groups[0].get("kind") or ""
-                        )
-                        if domain not in {"animation", "general"}:
-                            kind_text = "保存位置待确认"
-                        elif group_kind == "tv_episodes":
-                            kind_text = "动画剧集" if domain == "animation" else "普通剧集"
-                        else:
-                            kind_text = "动画电影" if domain == "animation" else "普通电影"
-                        ui.label(f"作品类型：{kind_text}").classes("bar-help")
+            unresolved = str(work.get('status')) != 'confirmed' or self._replacement_unfinished()
+            title = selected.get('title') if isinstance(selected, Mapping) else ''
+            ui.label(('已选择作品：' + str(title)) if unresolved and title else
+                     ('已确认作品：' + str(work.get('title'))) if not unresolved else '尚未选择作品').classes('text-subtitle1 font-bold')
+            with ui.column().classes('w-full gap-2') as summary:
+                self.current_work_summary = summary
+                if not unresolved:
+                    self._render_selected_provider_identity(operation.context)
+                elif title:
+                    ui.label('作品选择已保存，等待完成本次确认。').classes('bar-help')
+                for group in self.snapshot.presentation_groups:
+                    ui.label(str(group['display_name'])).classes('bar-evidence')
+                    if group['preferred_version_ref']:
+                        ui.label(f"偏好版本：{group['preferred_version_ref']}").classes('bar-help')
+            with ui.column().classes('bar-review-feedback w-full gap-2'):
+                self._render_selection_operation()
+
+            if title and unresolved:
+                self._render_work_actions(operation.context)
+            if self.provider_selection_expanded or (unresolved and not title) or (self._replacement_unfinished() and operation.context.get('lifecycle') == 'failed'):
+                candidates = normalize_provider_candidates(dict(self.plan.metadata))
+                if not candidates and not getattr(self.task_decision, 'confirmed_work', None):
+                    candidates = normalize_provider_candidates(self.task_data)
+                with ui.column().classes('bar-review-picker w-full gap-2'):
+                    if title or not unresolved:
+                        ui.label('选择正确的作品').classes('text-subtitle2')
+                    warning = candidate_type_warning(self.task_data.get('is_movie', self.plan.metadata.get('is_movie')), candidates) if candidates else ''
+                    if warning:
+                        ui.label(warning).classes('bar-help text-orange-8')
+                    self._render_provider_link_input()
+                    with ui.element('div').classes('bar-provider-grid w-full gap-4'):
+                        self.render_provider_column('bangumi', candidates)
+                        self.render_provider_column('tmdb', candidates)
+            self.season_container = ui.column().classes('bar-review-season w-full gap-2')
+            with self.season_container:
+                from .general_season_view import render_unresolved_tmdb_season
+                rendered = render_unresolved_tmdb_season(self, ui) if self.plan.metadata.get('content_policy') is not None else False
+                if not rendered:
+                    if not unresolved and self._general_tv_provider() is not None:
+                        self._render_general_tv_season()
+                    elif unresolved:
+                        self._render_season_placeholder('选择作品后，可以独立整理并手动指定季度。')
                     else:
-                        ui.label("请从上方候选中确认作品；不会影响观看形式选择。").classes(
-                            "bar-help text-orange-8"
-                        )
-                    if self.snapshot.linked_provider_identities:
-                        linked_text = "；".join(
-                            f"{str(item.get('namespace') or '资料').title()} "
-                            f"#{item.get('provider_id') or '?'}"
-                            for item in self.snapshot.linked_provider_identities
-                        )
-                        linked_label = (
-                            "季度资料" if group_kind == "tv_episodes" else "关联资料"
-                        )
-                        ui.label(f"{linked_label}：{linked_text}").classes("bar-help")
-                ui.label("当前呈现分组").classes("text-subtitle2")
-                with ui.row().classes("w-full gap-2 flex-wrap"):
-                    for group in self.snapshot.presentation_groups:
-                        with ui.card().classes("bar-group-summary grow"):
-                            ui.label(str(group["display_name"])).classes("bar-evidence")
-                            if group["preferred_version_ref"]:
-                                ui.label(
-                                    f"偏好版本：{group['preferred_version_ref']}"
-                                ).classes("bar-help")
+                        self.season_container.set_visibility(False)
+
+    render_groups = _render_groups
+
+    def _general_tv_provider(self):
+        from .general_season_view import general_tv_provider
+        return general_tv_provider(self)
+
+    def _render_general_tv_season(self):
+        from .general_season_view import render_general_tv_season
+        render_general_tv_season(self, ui)
+
+    async def _change_general_tv_season(self):
+        from .general_season_view import change_general_tv_season
+        await change_general_tv_season(self, ui)
 
     def _render_selection_operation(self) -> None:
-        operation = self.task_data.get("selection_operation")
-        if not isinstance(operation, Mapping):
+        if self.plan.metadata.get('content_policy') is None:
+            ui.label('旧季度确认入口已停用。请安全结束此任务后重新添加来源；源文件不会删除。').classes('bar-help')
             return
-        state = str(operation.get("state") or "")
-        if state == "pending":
-            with ui.row().classes("bar-callout w-full items-center gap-2"):
-                ui.spinner(size="20px")
-                ui.label("正在更新作品信息，请稍候…").classes("font-bold")
-            return
-        if state not in {"failed", "interrupted", "awaiting_user"}:
-            return
-        reasons = {
-            "provider_unavailable": "暂时无法读取作品资料",
-            "relation_unresolved": "没有找到可靠的季度关系",
-            "save_failed": "更新结果未能安全保存",
-            "stale_request": "页面内容已经更新",
-            "app_restarted": "处理期间应用重新启动",
-            "selection_failed": "未能应用所选作品",
-        }
-        code = str(operation.get("failure_code") or "selection_failed")
-        candidate = operation.get("candidate")
-        reason_codes = {
-            str(item) for item in operation.get("reason_codes", ()) or ()
-        }
-        refresh_required = bool(operation.get("retry_requires_refresh"))
-        boundary_required = "subject_candidate_evidence_missing" in reason_codes
-        boundary_edges = ()
-        evidence = operation.get("provider_subject_evidence")
-        if boundary_required and isinstance(evidence, Mapping):
-            raw_edges = evidence.get("provider_subject_boundary_edges")
-            if isinstance(raw_edges, (list, tuple)):
-                boundary_edges = tuple(
-                    dict(item) for item in raw_edges if isinstance(item, Mapping)
-                )
-        expected_revision = operation.get("expected_decision_revision")
-        evidence_fingerprint = str(operation.get("evidence_fingerprint") or "")
-        cohort_preview = operation.get("provider_subject_cohort_preview")
-        boundary_failure = operation.get("boundary_resolution_failure")
-        if (
-            not isinstance(cohort_preview, Mapping)
-            and isinstance(evidence, Mapping)
-            and isinstance(expected_revision, int)
-            and len(boundary_edges) == 1
-        ):
-            try:
-                cohort_preview = build_provider_subject_cohort_preview(
-                    evidence,
-                    expected_decision_revision=expected_revision,
-                    boundary_edge=boundary_edges[0],
-                    target_root_snapshot=self.task_data.get(
-                        "draft_root_snapshot"
-                    ),
-                    target_root_config_fingerprint=self.task_data.get(
-                        "draft_root_config_fingerprint"
-                    ),
-                    work_domain="animation",
-                    group_kind="tv_episodes",
-                )
-            except (TypeError, ValueError) as preview_error:
-                boundary_failure = build_provider_subject_boundary_failure(
-                    evidence, preview_error
-                )
-        with ui.card().classes("bar-callout bar-callout-warning w-full"):
-            ui.label("这次选择未生效").classes("font-bold text-orange-9")
-            ui.label(reasons.get(code, reasons["selection_failed"])).classes("bar-help")
-            if isinstance(cohort_preview, Mapping):
-                ui.label("本次确认将整理以下季度：").classes(
-                    "font-bold text-blue-9"
-                )
-                for row in cohort_preview.get("season_assignments", ()) or ():
-                    if not isinstance(row, Mapping):
-                        continue
-                    title = str(row.get("title") or "作品")
-                    season_number = row.get("season_number")
-                    ui.label(f"{title} → 第 {season_number} 季").classes(
-                        "bar-help"
-                    )
-                outside = tuple(
-                    str(item) for item in cohort_preview.get(
-                        "outside_subject_titles", ()
-                    ) or () if str(item)
-                )
-                if outside:
-                    ui.label(
-                        "仍需单独处理：" + "、".join(outside)
-                    ).classes("bar-help text-orange-9")
-                resolved_target_root = str(
-                    cohort_preview.get("resolved_target_root") or ""
-                ).strip()
-                if resolved_target_root:
-                    ui.label(
-                        "整理目标：" + resolved_target_root
-                    ).classes("bar-help text-blue-9")
-            if isinstance(boundary_failure, Mapping):
-                ui.label(
-                    str(
-                        boundary_failure.get("public_title")
-                        or "无法安全确定季度边界"
-                    )
-                ).classes("font-bold text-red-8")
-                affected = tuple(
-                    str(item) for item in boundary_failure.get(
-                        "affected_subject_titles", ()
-                    ) or () if str(item)
-                )
-                if affected:
-                    ui.label("涉及：" + "、".join(affected)).classes(
-                        "bar-help"
-                    )
-                summary = str(
-                    boundary_failure.get("technical_summary") or ""
-                ).strip()
-                if summary:
-                    ui.label(summary).classes("bar-help text-grey-8")
-            with ui.row().classes("items-center gap-2 flex-wrap"):
-                if isinstance(candidate, dict) and refresh_required:
-                    ui.button(
-                        "重新获取资料",
-                        on_click=partial(self._select_provider_candidate, candidate),
-                        icon="refresh",
-                    ).props("unelevated color=blue-7 no-caps")
-                if isinstance(expected_revision, int) and len(boundary_edges) == 1:
-                    for edge in boundary_edges:
-                        ui.button(
-                            "确认与相邻作品一起整理",
-                            on_click=partial(
-                                self._apply_provider_subject_boundary_inline,
-                                True,
-                                expected_revision,
-                                evidence_fingerprint,
-                                edge,
-                            ),
-                            icon="link",
-                        ).props("outline color=blue-7 no-caps")
-                        ui.button(
-                            "分开整理",
-                            on_click=partial(
-                                self._apply_provider_subject_boundary_inline,
-                                False,
-                                expected_revision,
-                                evidence_fingerprint,
-                                edge,
-                            ),
-                            icon="call_split",
-                        ).props("outline color=blue-7 no-caps")
-                ui.button(
-                    "换一个作品",
-                    on_click=self._show_provider_candidates,
-                    icon="swap_horiz",
-                ).props("outline color=blue-7 no-caps")
-                ui.button(
-                    "移除任务",
-                    on_click=self._remove_provider_failure_task,
-                    icon="delete_outline",
-                ).props("flat color=red-7 no-caps")
-                ui.button("关闭", on_click=self._close_review).props(
-                    "flat color=grey-8"
-                )
-
-    def _reload_provider_subject_authority(self) -> bool:
-        """Atomically replace the dialog cache from the three disk authorities."""
-
-        task_id = self.plan.task_id
-        plan_store = PlanStore(PLAN_PATH)
-        decision_store = DecisionStateStore(DECISION_STATE_PATH)
-        try:
-            task = get_task(task_id)
-            plan = plan_store.load(task_id)
-            decision = decision_store.load(task_id)
-        except (
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
-            PlanStoreError,
-            DecisionStateError,
-            TypeError,
-            ValueError,
-        ):
-            return False
-        if not task or str(task.get("uuid") or "") != task_id:
-            return False
-        self.task_data = task
-        self.plan = plan
-        self.snapshot = build_plan_review_snapshot(plan)
-        self.task_decision = decision
-        self.decision_state_store = decision_store
-        self.decision_command_service = DecisionCommandService(
-            decision_store, plan_store
+        from .tv_content_actions import revision_progress
+        progress = revision_progress(self)
+        render_review_operation(
+            ui,
+            self.task_data,
+            ReviewOperationCallbacks(
+                select_provider_candidate=self._select_provider_candidate,
+                dispatch_review_command=self._dispatch_review_command,
+                show_provider_candidates=self._show_provider_candidates,
+                remove_provider_failure_task=self._remove_provider_failure_task,
+                close_review=self._close_review,
+            ),
+            progress=progress, common_actions=False,
         )
-        return True
+        proof = self.task_decision.pending_tv_selection if self.task_decision is not None else None
+        if proof is not None:
+            from .tv_content_actions import run_revision
+            fingerprint, revision = PlanStore.fingerprint(self.plan), self.task_decision.revision
+            request_id, task_id = proof.to_dict()['request_id'], self.plan.task_id
+            service = self.review_service
+            ui.button('取消本次季度关系确认', on_click=lambda: run_revision(self,
+                submit=lambda: service.cancel_tv_boundary_completion(task_id, fingerprint, request_id=request_id),
+                expected_revision=revision, expected_fingerprint=fingerprint, notify=notify,
+                message='已取消本次关系确认，原内容取舍已保留。'), icon='o_close').props('flat').bind_enabled_from(
+                    progress, 'running', backward=lambda busy: not busy)
 
-    def _render_reloaded_provider_subject_authority(self) -> None:
-        """Invalidate old controls and expose only callbacks frozen from disk."""
+    def _dispatch_review_command(
+        self, review_command: Mapping[str, object]
+    ) -> Awaitable[None] | None:
+        """Dispatch one frozen command once; explanations never grant access."""
 
-        instance_renderer = self.__dict__.get("_render_groups")
-        if callable(instance_renderer):
-            instance_renderer()
-        elif getattr(self, "groups_container", None) is not None:
-            self._render_groups()
-
-    def _provider_subject_receipt_matches(
-        self,
-        *,
-        request_fingerprint: str,
-        expected_revision: int,
-    ) -> bool:
-        receipt = self.plan.metadata.get(
-            "provider_subject_boundary_selection_receipt"
-        )
-        if not isinstance(receipt, Mapping) or self.task_decision is None:
-            return False
-        decision_revision = self.task_decision.revision
-        valid = bool(
-            receipt.get("schema_version") in {1, 2, 3}
-            and receipt.get("request_fingerprint") == request_fingerprint
-            and receipt.get("expected_decision_revision") == expected_revision
-            and receipt.get("result_decision_revision") == decision_revision
-            and decision_revision == expected_revision + 1
-            and self.plan.metadata.get("decision_state_revision")
-            == decision_revision
-            and self.plan.metadata.get("decision_state_fingerprint")
-            == DecisionStateStore.fingerprint(self.task_decision)
-        )
-        if receipt.get("schema_version") in {2, 3}:
-            valid = bool(
-                valid
-                and receipt.get("result_decision_fingerprint")
-                == DecisionStateStore.fingerprint(self.task_decision)
-            )
-        if receipt.get("schema_version") == 3:
-            valid = bool(
-                valid
-                and receipt.get("target_root_config_fingerprint")
-                == self.plan.metadata.get("target_root_config_fingerprint")
-                and receipt.get("resolved_target_root")
-                == self.plan.metadata.get("target_root")
-            )
-        return valid
-
-    def _persist_provider_subject_boundary_failure(
-        self,
-        *,
-        expected_revision: int,
-        evidence_fingerprint: str,
-        evidence: Mapping[str, object],
-        error: BaseException,
-    ) -> Optional[dict]:
-        failure = build_provider_subject_boundary_failure(evidence, error)
-
-        def persist(task: dict) -> Optional[dict]:
-            operation = task.get("selection_operation")
-            if (
-                not isinstance(operation, dict)
-                or operation.get("state") not in {"failed", "awaiting_user"}
-                or operation.get("expected_decision_revision")
-                != expected_revision
-                or str(operation.get("evidence_fingerprint") or "")
-                != evidence_fingerprint
-            ):
-                return None
-            revised = dict(operation)
-            revised["boundary_resolution_failure"] = failure
-            task["selection_operation"] = revised
-            return task
-
-        updated = mutate_task(self.plan.task_id, persist)
-        if updated is not None:
-            self.task_data = updated
-        return updated
-
-    def _persist_tv_planning_authority_failure(
-        self,
-        *,
-        expected_revision: int,
-        evidence_fingerprint: str,
-    ) -> Optional[dict]:
-        occurred_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        operation_id = uuid.uuid4().hex
-        failure = {
-            "operation_id": operation_id,
-            "code": "tv_planning_authority_unavailable",
-            "phase": "tv_planning_authority",
-            "decision_revision": expected_revision,
-            "authority_fingerprint": None,
-            "outcome": "failed",
-            "occurred_at": occurred_at,
-            "safe_actions": ["retry", "replan", "safe_abandon"],
-        }
-
-        def persist(task: dict) -> Optional[dict]:
-            operation = task.get("selection_operation")
-            if (
-                not isinstance(operation, dict)
-                or operation.get("expected_decision_revision")
-                != expected_revision
-                or str(operation.get("evidence_fingerprint") or "")
-                != evidence_fingerprint
-            ):
-                return None
-            revised = dict(operation)
-            revised.update({
-                "state": "failed",
-                "failure_code": "tv_planning_authority_unavailable",
-                "reason_codes": ["tv_planning_authority_unavailable"],
-                "retryable": True,
-            })
-            task["selection_operation"] = revised
-            history_value = task.get("operation_history", ())
-            history = (
-                [dict(item) for item in history_value]
-                if isinstance(history_value, (list, tuple))
-                and all(isinstance(item, Mapping) for item in history_value)
-                else []
-            )
-            history.append({
-                key: value for key, value in failure.items()
-                if key != "safe_actions"
-            })
-            task["operation_history"] = history
-            task["operation_history_state"] = "current"
-            task["current_operation_failure"] = failure
-            task["workflow_status"] = "invalid"
-            task["error"] = "TV 规划依据未能安全保存，请重试或重新生成计划"
-            task["completed_at"] = occurred_at
-            return task
-
-        updated = mutate_task(self.plan.task_id, persist)
-        if updated is not None:
-            self.task_data = updated
-        return updated
-
-    def _close_provider_subject_selection(
-        self,
-        *,
-        expected_revision: int,
-        evidence_fingerprint: str,
-        result_revision: int,
-    ) -> Optional[dict]:
-        def close_selection(task: dict) -> Optional[dict]:
-            current = task.get("selection_operation")
-            if (
-                not isinstance(current, dict)
-                or current.get("state") not in {"failed", "awaiting_user"}
-                or current.get("expected_decision_revision")
-                != expected_revision
-                or str(current.get("evidence_fingerprint") or "")
-                != evidence_fingerprint
-            ):
-                return None
-            updated_operation = dict(current)
-            updated_operation.update({
-                "state": "succeeded",
-                "result_decision_revision": result_revision,
-                "failure_code": None,
-                "reason_codes": [],
-                "retryable": False,
-            })
-            updated_operation.pop("boundary_resolution_failure", None)
-            task["selection_operation"] = updated_operation
-            task.pop("provider_selection_failure", None)
-            task["workflow_status"] = "need_confirm"
-            task["error"] = None
-            task["completed_at"] = None
-            return task
-
-        updated_task = mutate_task(self.plan.task_id, close_selection)
-        if updated_task is not None:
-            self.task_data = updated_task
-        return updated_task
-
-    def _apply_provider_subject_boundary_inline(
-        self,
-        same_work: bool,
-        expected_revision: int,
-        evidence_fingerprint: str,
-        boundary_edge: Mapping[str, object],
-    ) -> None:
-        if not self._reload_provider_subject_authority():
-            notify("无法读取当前任务状态，请关闭后重新打开审核", type="negative")
-            return
-        operation = self.task_data.get("selection_operation")
-        evidence = (
-            operation.get("provider_subject_evidence")
-            if isinstance(operation, Mapping) else None
-        )
-        cohort_preview = (
-            operation.get("provider_subject_cohort_preview")
-            if isinstance(operation, Mapping) else None
-        )
-        if (
-            same_work
-            and isinstance(operation, Mapping)
-            and operation.get("state") == "succeeded"
-            and not isinstance(cohort_preview, Mapping)
-        ):
-            self._render_reloaded_provider_subject_authority()
-            notify("页面内容已经更新，请按当前状态重新选择", type="warning")
-            return
-        if same_work and not isinstance(cohort_preview, Mapping):
-            if not isinstance(evidence, Mapping):
-                self._render_reloaded_provider_subject_authority()
-                notify("页面内容已经更新，请按当前状态重新选择", type="warning")
+        if self.plan.metadata.get('content_policy') is not None:
+            if self.task_decision is None:
+                notify('页面已经更新，请刷新后重新选择。', type='warning')
                 return
-            try:
-                cohort_preview = build_provider_subject_cohort_preview(
-                    evidence,
-                    expected_decision_revision=expected_revision,
-                    boundary_edge=boundary_edge,
-                    target_root_snapshot=self.task_data.get(
-                        "draft_root_snapshot"
-                    ),
-                    target_root_config_fingerprint=self.task_data.get(
-                        "draft_root_config_fingerprint"
-                    ),
-                    work_domain="animation",
-                    group_kind="tv_episodes",
-                )
-            except (TypeError, ValueError) as preview_error:
-                self._persist_provider_subject_boundary_failure(
-                    expected_revision=expected_revision,
-                    evidence_fingerprint=evidence_fingerprint,
-                    evidence=evidence,
-                    error=preview_error,
-                )
-                if self._reload_provider_subject_authority():
-                    self._render_reloaded_provider_subject_authority()
-                notify("无法安全确定季度边界", type="negative")
-                return
-        preview_request: Optional[Mapping[str, object]] = None
-        if same_work and isinstance(cohort_preview, Mapping):
-            request_fingerprint = str(
-                cohort_preview.get("request_fingerprint") or ""
-            )
-            preview_request = cohort_preview.get("request")
-            if (
-                not isinstance(preview_request, Mapping)
-                or provider_subject_cohort_request_fingerprint(
-                    preview_request
-                ) != request_fingerprint
-            ):
-                self._render_reloaded_provider_subject_authority()
-                notify("季度授权范围校验失败，请刷新后重试", type="warning")
-                return
-        else:
-            request_fingerprint = provider_subject_cohort_request_fingerprint({
-                "schema_version": 1,
-                "same_work": bool(same_work),
-                "expected_decision_revision": expected_revision,
-                "evidence_fingerprint": evidence_fingerprint,
-                "boundary_edge": dict(boundary_edge),
-            })
-        if len(request_fingerprint) != 64:
-            self._render_reloaded_provider_subject_authority()
-            notify("页面授权范围不完整，请刷新后重试", type="warning")
-            return
-        receipt_already_matches = self._provider_subject_receipt_matches(
-            request_fingerprint=request_fingerprint,
-            expected_revision=expected_revision,
-        )
-        routing_snapshot = None
-        if not receipt_already_matches:
-            from ..rename.target_routing import (
-                resolve_target_root,
-                snapshot_from_config_manager,
-            )
+            from .tv_boundary_view import confirm
+            return confirm(self, dict(review_command), ui=ui, notify=notify)
 
-            try:
-                routing_snapshot = snapshot_from_config_manager(cm)
-                live_target_root = resolve_target_root(
-                    "animation", "tv_episodes", routing_snapshot
-                )
-            except (TypeError, ValueError) as routing_error:
-                self._render_reloaded_provider_subject_authority()
-                notify(localize_plan_term(routing_error), type="warning")
-                return
-            if same_work:
-                preview_root_fingerprint = str(
-                    preview_request.get("target_root_config_fingerprint")
-                    if isinstance(preview_request, Mapping) else ""
-                )
-                preview_target_root = str(
-                    preview_request.get("resolved_target_root")
-                    if isinstance(preview_request, Mapping) else ""
-                )
-                if (
-                    preview_root_fingerprint != routing_snapshot.fingerprint
-                    or preview_target_root != str(live_target_root)
-                ):
-                    self._render_reloaded_provider_subject_authority()
-                    notify(
-                        "路径配置已经变化，请刷新页面并重新确认整理目标",
-                        type="warning",
-                    )
-                    return
-        if receipt_already_matches:
-            result_revision = self.task_decision.revision
-            if (
-                isinstance(operation, Mapping)
-                and operation.get("state") == "succeeded"
-                and operation.get("result_decision_revision") == result_revision
-            ):
-                self._render_reloaded_provider_subject_authority()
-                return
-            repaired = self._close_provider_subject_selection(
-                expected_revision=expected_revision,
-                evidence_fingerprint=evidence_fingerprint,
-                result_revision=result_revision,
-            )
-            self._render_reloaded_provider_subject_authority()
-            if repaired is not None:
-                notify(
-                    "已确认一起整理" if same_work else "已确认分开整理",
-                    type="positive",
-                )
-            else:
-                notify("页面内容已经更新，请按当前状态继续", type="warning")
-            return
-        if (
-            self.task_decision is None
-            or not isinstance(operation, Mapping)
-            or operation.get("state") not in {"failed", "awaiting_user"}
-            or operation.get("expected_decision_revision") != expected_revision
-            or str(operation.get("evidence_fingerprint") or "")
-            != evidence_fingerprint
-            or not isinstance(evidence, Mapping)
-        ):
-            self._render_reloaded_provider_subject_authority()
-            notify("页面内容已经更新，请按当前状态重新选择", type="warning")
-            return
-        try:
-            try:
-                resolution, boundary_decision = (
-                    resolve_provider_subject_boundary_decision(
-                        evidence,
-                        same_work=same_work,
-                        boundary_edge=boundary_edge,
-                    )
-                )
-            except (TypeError, ValueError) as boundary_error:
-                self._persist_provider_subject_boundary_failure(
-                    expected_revision=expected_revision,
-                    evidence_fingerprint=evidence_fingerprint,
-                    evidence=evidence,
-                    error=boundary_error,
-                )
-                if self._reload_provider_subject_authority():
-                    self._render_reloaded_provider_subject_authority()
-                notify("无法安全确定季度边界", type="negative")
-                return
-            candidate = operation.get("candidate")
-            if not isinstance(candidate, Mapping):
-                raise DecisionStateError("所选作品资料不完整")
-            tmdb_candidate = _trusted_relation_tmdb_anchor(
-                evidence,
-                str(resolution.tmdb_tv_id or ""),
-            )
-            air_date = str(tmdb_candidate.get("first_air_date") or "")
-            provider_year = (
-                int(air_date[:4]) if air_date[:4].isdigit() else None
-            )
-            from ..rename.canonical_naming import (
-                CanonicalNamingError,
-                resolve_title_authority,
-                select_bangumi_work_title_owner,
-            )
+        notify('旧季度确认入口已停用，请安全结束此任务后重新添加来源；源文件不会删除。', type='warning')
 
-            title_selection = {
-                "namespace": "bangumi",
-                "entity_type": "subject",
-                "provider_id": str(candidate.get("provider_id") or ""),
-                "localized_title": str(candidate.get("title") or ""),
-                "original_title": str(candidate.get("original_title") or ""),
-            }
-            if same_work:
-                # A Bangumi sequel chain may represent several seasons of one
-                # TMDB work.  The clicked season is the season authority, but
-                # it must not rename the shared work root to "第二季" etc.
-                # Choose the earliest frozen season as the stable Bangumi
-                # title owner; the selected season remains bound separately by
-                # the cohort receipt and season assignment below.
-                try:
-                    title_owner = select_bangumi_work_title_owner(
-                        subjects=(
-                            item
-                            for item in evidence.get("bangumi_subjects", ()) or ()
-                            if isinstance(item, Mapping)
-                        ),
-                        season_assignments=dict(resolution.season_assignments),
-                    )
-                except CanonicalNamingError as exc:
-                    raise DecisionStateError(str(exc)) from exc
-                title_selection = {
-                    "namespace": "bangumi",
-                    "entity_type": "subject",
-                    "provider_id": str(
-                        title_owner.get("provider_id")
-                        or title_owner.get("id")
-                        or ""
-                    ),
-                    "localized_title": str(
-                        title_owner.get("title")
-                        or title_owner.get("name_cn")
-                        or ""
-                    ),
-                    "original_title": str(
-                        title_owner.get("original_title")
-                        or title_owner.get("name")
-                        or ""
-                    ),
-                }
 
-            try:
-                naming_decision = resolve_title_authority(
-                    selection=title_selection,
-                    mapped_candidates=({
-                        "namespace": "tmdb",
-                        "entity_type": "tv",
-                        "provider_id": str(resolution.tmdb_tv_id or ""),
-                        "localized_title": str(
-                            tmdb_candidate.get("title") or ""
-                        ),
-                        "original_title": str(
-                            tmdb_candidate.get("original_title") or ""
-                        ),
-                    },),
-                    primary_provider_identity={
-                        "namespace": "tmdb",
-                        "entity_type": "tv",
-                        "provider_id": str(resolution.tmdb_tv_id or ""),
-                    },
-                )
-            except CanonicalNamingError as exc:
-                raise DecisionStateError(str(exc)) from exc
-            provider_title = naming_decision.display_title
-            if not self.plan.presentation_groups:
-                raise DecisionStateError("整理计划缺少观看形式")
-            group_id = self.plan.presentation_groups[0].group_id
-            confirmed_plan = self.review_service.upsert_presentation_group(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                group_id=group_id,
-                kind="tv_episodes",
-                display_name="TV 分集版",
-                provider_namespace="tmdb",
-                provider_entity_type="tv",
-                provider_id=str(resolution.tmdb_tv_id),
-                provider_title=provider_title,
-                provider_year=provider_year,
-                provider_original_title=str(
-                    tmdb_candidate.get("original_title") or ""
-                ) or None,
-                reason="用户确认相邻作品的整理边界",
-                persist_revision=False,
-            )
-            if routing_snapshot is None:
-                raise DecisionStateError("冻结目标配置不完整")
-            from ..rename.target_routing import resolve_target_root
-
-            target_root = resolve_target_root(
-                "animation", "tv_episodes", routing_snapshot
-            )
-            confirmed_metadata = dict(confirmed_plan.metadata)
-            confirmed_metadata.update({
-                "allowed_target_root": str(target_root),
-                "target_root": str(target_root),
-                "canonical_naming_required": True,
-                "canonical_naming_decision": naming_decision.to_dict(),
-            })
-            confirmed_plan = replace(
-                confirmed_plan, metadata=confirmed_metadata
-            )
-            selected_subject_id = str(candidate.get("provider_id") or "")
-            season_number = dict(resolution.season_assignments).get(
-                selected_subject_id
-            )
-            if not isinstance(season_number, int):
-                raise DecisionStateError("所选作品的季度编号不完整")
-            completed_plan = self.review_service.complete_inventory_draft(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                group_id=group_id,
-                group_kind="tv_episodes",
-                target_root=target_root,
-                reason="用户确认相邻作品的整理边界",
-                root_snapshot=routing_snapshot.to_dict(),
-                work_domain="animation",
-                season_number=season_number,
-                season_source="provider",
-                series_key=str(resolution.proposed_series_key or ""),
-                season_binding_id=f"season-binding-{uuid.uuid4()}",
-                series_catalog_revision=0,
-                persist_revision=False,
-                _source_plan=confirmed_plan,
-                _revision_parent_fingerprint=PlanStore.fingerprint(self.plan),
-            )
-            # The provider boundary decision supplies the missing work/season
-            # authority.  Deterministic regular episodes and structural
-            # ``13(OVA)`` bonus pairs therefore do not require a second,
-            # per-file confirmation pass.  Other extras and provider specials
-            # keep their existing explicit-review contracts.
-            completed_plan = replace(
-                completed_plan,
-                entries=tuple(
-                    replace(entry, requires_review=False)
-                    if entry.role in {
-                        "main_episode",
-                        "episode_like_bonus",
-                        "extra_subtitle",
-                    }
-                    else entry
-                    for entry in completed_plan.entries
-                ),
-            )
-            completed_metadata = dict(completed_plan.metadata)
-            if same_work and isinstance(cohort_preview, Mapping):
-                request = cohort_preview.get("request")
-                if not isinstance(request, Mapping):
-                    raise DecisionStateError("季度合并授权范围不完整")
-                completed_metadata[
-                    "provider_subject_boundary_selection_receipt"
-                ] = {
-                    "schema_version": 3,
-                    "request_fingerprint": request_fingerprint,
-                    "selected_subject_id": str(
-                        request.get("selected_subject_id") or ""
-                    ),
-                    "cohort_subject_ids": list(
-                        request.get("cohort_subject_ids", ()) or ()
-                    ),
-                    "cohort_edges": [
-                        dict(item)
-                        for item in request.get("cohort_edges", ()) or ()
-                        if isinstance(item, Mapping)
-                    ],
-                    "subject_evidence_fingerprints": dict(
-                        request.get("subject_evidence_fingerprints") or {}
-                    ),
-                    "selected_tmdb_tv_id": str(
-                        request.get("selected_tmdb_tv_id") or ""
-                    ),
-                    "season_assignments": dict(
-                        request.get("season_assignments") or {}
-                    ),
-                    "derived_episode_ranges": [
-                        dict(item)
-                        for item in request.get(
-                            "derived_episode_ranges", ()
-                        ) or () if isinstance(item, Mapping)
-                    ],
-                    "resolution_fingerprint": str(
-                        request.get("resolution_fingerprint") or ""
-                    ),
-                    "cohort_decision_id": str(
-                        request.get("cohort_decision_id") or ""
-                    ),
-                    "target_root_config_fingerprint": str(
-                        request.get("target_root_config_fingerprint") or ""
-                    ),
-                    "resolved_target_root": str(
-                        request.get("resolved_target_root") or ""
-                    ),
-                    "expected_decision_revision": expected_revision,
-                    "result_decision_revision": expected_revision + 1,
-                    "canonical_naming_decision_fingerprint": (
-                        naming_decision.decision_fingerprint
-                    ),
-                }
-            else:
-                completed_metadata[
-                    "provider_subject_boundary_selection_receipt"
-                ] = {
-                    "schema_version": 1,
-                    "request_fingerprint": request_fingerprint,
-                    "expected_decision_revision": expected_revision,
-                    "result_decision_revision": expected_revision + 1,
-                    "canonical_naming_decision_fingerprint": (
-                        naming_decision.decision_fingerprint
-                    ),
-                }
-            completed_plan = replace(
-                completed_plan, metadata=completed_metadata
-            )
-            candidate_state = self.task_decision
-            selected_evidence = {
-                "status": "confirmed",
-                "namespace": "bangumi",
-                "entity_type": "subject",
-                "provider_id": str(candidate.get("provider_id") or ""),
-                "title": str(candidate.get("title") or ""),
-                "original_title": str(candidate.get("original_title") or ""),
-                "decision_source": "explicit_user",
-            }
-            primary_provider = provider_identity_from_metadata(
-                namespace="tmdb",
-                entity_type="tv",
-                provider_id=str(resolution.tmdb_tv_id or ""),
-                title=provider_title,
-                year=provider_year,
-                decision_source="explicit_user",
-                original_title=str(
-                    tmdb_candidate.get("original_title") or ""
-                ) or None,
-            )
-            resolved_work = WorkIdentity(
-                status="confirmed",
-                domain="animation",
-                title=provider_title,
-                year=provider_year,
-                primary_provider=primary_provider,
-                domain_source="provider_selection",
-            )
-            provider_evidence = (primary_provider.to_dict(),) + tuple(
-                item for item in candidate_state.provider_evidence
-                if not (
-                    (
-                        item.get("namespace") == "bangumi"
-                        and item.get("entity_type") == "subject"
-                        and str(item.get("provider_id") or "")
-                        == selected_evidence["provider_id"]
-                    )
-                    or (
-                        item.get("namespace") == "tmdb"
-                        and item.get("entity_type") == "tv"
-                    )
-                )
-            ) + (selected_evidence,)
-            linked_provider_identities = tuple(
-                item for item in candidate_state.linked_provider_identities
-                if not (
-                    item.get("namespace") == "bangumi"
-                    and item.get("entity_type") == "subject"
-                    and str(item.get("provider_id") or "")
-                    == selected_evidence["provider_id"]
-                )
-            ) + (selected_evidence,)
-            season_binding_id = str(
-                completed_plan.metadata.get("season_binding_id") or ""
-            )
-            if not season_binding_id:
-                raise DecisionStateError("整理计划缺少季度决定编号")
-            staging_state = replace(
-                candidate_state,
-                confirmed_work=resolved_work.to_dict(),
-                provider_evidence=provider_evidence,
-                linked_provider_identities=linked_provider_identities,
-                season_binding={
-                    "season_binding_id": season_binding_id,
-                    "season_number": season_number,
-                    "decision_source": str(
-                        completed_plan.metadata.get("season_source") or "provider"
-                    ),
-                },
-                library_domain="animation",
-                layout_mode="tv_episodes",
-            )
-            canonical_root_value = str(
-                completed_plan.metadata.get("canonical_work_root") or ""
-            ).strip()
-            if not canonical_root_value:
-                raise DecisionStateError("整理计划缺少规范作品目录")
-            canonical_root = Path(canonical_root_value)
-            catalog_revision = completed_plan.metadata.get(
-                "series_catalog_revision", 0
-            )
-            if not isinstance(catalog_revision, int):
-                raise DecisionStateError("作品登记版本不完整")
-            staged = stage_provider_link_series_decision(
-                staging_state,
-                resolution,
-                canonical_root=canonical_root,
-                catalog_revision=catalog_revision,
-            )
-            tv_planning_authority = _build_cohort_tv_planning_authority(
-                plan=completed_plan,
-                task_data=self.task_data,
-                evidence=evidence,
-                preview_request=(
-                    preview_request
-                    if isinstance(preview_request, Mapping)
-                    else {
-                        "derived_episode_ranges": [
-                            dict(item)
-                            for item in resolution.derived_episode_ranges
-                            if isinstance(item, Mapping)
-                        ],
-                        "resolution_fingerprint": str(
-                            resolution.resolution_fingerprint or ""
-                        ),
-                    }
-                ),
-                request_fingerprint=request_fingerprint,
-                expected_revision=expected_revision,
-                selected_subject_id=selected_subject_id,
-                tmdb_tv_id=str(resolution.tmdb_tv_id or ""),
-                season_assignments=dict(resolution.season_assignments),
-                display_title=provider_title,
-                title_source=title_selection,
-                series_year=provider_year,
-            )
-            completed_plan = _with_task_episode_ownership(
-                completed_plan,
-                tv_planning_authority,
-            )
-            boundary_decisions = dict(
-                self.task_decision.provider_subject_boundary_decisions
-            )
-            if same_work:
-                if boundary_decision is None:
-                    raise DecisionStateError("相邻作品决定不完整")
-                cohort_edges = tuple(
-                    item for item in boundary_decision.get(
-                        "cohort_edges", ()
-                    ) or () if isinstance(item, Mapping)
-                )
-                shared_decision = {
-                    key: value
-                    for key, value in boundary_decision.items()
-                    if key not in {
-                        "from_subject_id", "to_subject_id", "relation"
-                    }
-                }
-                shared_decision.update({
-                    "expected_decision_revision": expected_revision,
-                    "request_fingerprint": request_fingerprint,
-                })
-                boundary_decisions = {}
-                for edge in cohort_edges:
-                    row = {
-                        **shared_decision,
-                        "from_subject_id": str(
-                            edge.get("from_subject_id") or ""
-                        ),
-                        "to_subject_id": str(
-                            edge.get("to_subject_id") or ""
-                        ),
-                        "relation": str(edge.get("relation") or "sequel"),
-                    }
-                    boundary_key = (
-                        f"{row['from_subject_id']}->{row['to_subject_id']}"
-                    )
-                    boundary_decisions[boundary_key] = row
-            changes = {
-                "confirmed_work": staged.confirmed_work,
-                "provider_evidence": staged.provider_evidence,
-                "linked_provider_identities": (
-                    staged.linked_provider_identities
-                ),
-                "provider_link_binding": staged.provider_link_binding,
-                "series_binding": staged.series_binding,
-                "season_binding": staged.season_binding,
-                "library_domain": staged.library_domain,
-                "layout_mode": staged.layout_mode,
-                "catalog_link_intent": staged.catalog_link_intent,
-                "provider_subject_boundary_decisions": boundary_decisions,
-                "tv_planning_authority": tv_planning_authority,
-            }
-
-            def close_task(_decision, projected, current):
-                active = current.get("selection_operation")
-                if (
-                    not isinstance(active, dict)
-                    or active.get("state") not in {"failed", "awaiting_user"}
-                    or active.get("expected_decision_revision")
-                    != expected_revision
-                    or str(active.get("evidence_fingerprint") or "")
-                    != evidence_fingerprint
-                ):
-                    raise DecisionStateError("任务状态已经变化")
-                active = dict(active)
-                active.update({
-                    "state": "succeeded",
-                    "result_decision_revision": _decision.revision,
-                    "failure_code": None,
-                    "reason_codes": [],
-                    "retryable": False,
-                })
-                active.pop("boundary_resolution_failure", None)
-                current["selection_operation"] = active
-                current.pop("provider_selection_failure", None)
-                projected_verification = PlanVerifier().verify(projected)
-                if projected_verification.issues:
-                    logger.error(
-                        "[作品边界确认] 投影仍被阻断："
-                        + ",".join(
-                            issue.code for issue in projected_verification.issues
-                        )
-                    )
-                current.update({
-                    "workflow_status": "need_confirm",
-                    "error": None,
-                    "completed_at": None,
-                    "name": (
-                        projected.work_identity.title
-                        if projected.work_identity is not None
-                        else current.get("name")
-                    ),
-                    "plan_status": build_plan_review_snapshot(
-                        projected
-                    ).plan_status,
-                    "plan_entry_count": len(projected.entries),
-                })
-                return current
-
-            self.task_decision, revised = self.decision_command_service.update(
-                self.plan.task_id,
-                expected_revision=expected_revision,
-                changes=changes,
-                planner=lambda _state: completed_plan,
-                task_terminal=TaskTerminalMutation.prepare(
-                    TASK_PATH, self.plan.task_id, close_task
-                ),
-            )
-            if revised is None:
-                raise DecisionStateError("未生成确认后的整理计划")
-            self.task_data = get_task(self.plan.task_id)
-        except (TVPlanningAuthorityError, TaskBatchScopeError, OSError) as exc:
-            logger.exception(f"[TV规划权威] 提交前失败：{exc}")
-            self._persist_tv_planning_authority_failure(
-                expected_revision=expected_revision,
-                evidence_fingerprint=evidence_fingerprint,
-            )
-            if self._reload_provider_subject_authority():
-                self._render_reloaded_provider_subject_authority()
-            notify("TV 规划依据未能安全保存，请重试或重新生成计划", type="negative")
-            return
-        except DecisionStateError as exc:
-            logger.exception(f"[作品边界确认] Decision 提交失败：{exc}")
-            if self._reload_provider_subject_authority():
-                self._render_reloaded_provider_subject_authority()
-            notify("页面内容已经更新，请按当前状态重新选择", type="warning")
-            return
-        except (PlanReviewError, PlanStoreError, TypeError, ValueError) as exc:
-            logger.exception(f"[作品边界确认] Plan 提交失败：{exc}")
-            if self._reload_provider_subject_authority():
-                self._render_reloaded_provider_subject_authority()
-            notify("所选边界未能安全保存，请检查当前状态后重试", type="negative")
-            return
-        self._adopt_revision(revised)
-        notify(
-            "已确认一起整理" if same_work else "已确认分开整理",
-            type="positive",
-        )
-
-    def _remove_provider_failure_task(self) -> None:
-        operation = self.task_data.get("selection_operation")
-        if not isinstance(operation, Mapping) or operation.get("state") not in {
-            "failed", "interrupted"
+    async def _remove_provider_failure_task(self) -> None:
+        operation, _unused = build_review_operation(self.task_data)
+        if operation.context.get("lifecycle") not in {
+            "failed", "awaiting_user", "interrupted", "legacy_stale",
         }:
             notify("任务状态已经变化，请刷新后重试", type="warning")
             return
@@ -3180,7 +2631,7 @@ class PlanReviewDialog(ui.dialog):
             self.task_data.get("uuid") or ""
         )
         try:
-            task_queue.abandon_and_remove(
+            await task_queue.abandon_and_remove(
                 task_id,
                 record_root=RECORD_PATH,
                 plan_root=PLAN_PATH,
@@ -3189,63 +2640,45 @@ class PlanReviewDialog(ui.dialog):
         except (OSError, PlanExecutionError):
             notify("任务暂时无法移除，请稍后再试", type="negative")
             return
+        if getattr(self, 'is_deleted', False) or getattr(self, 'exit_requested', False):
+            return
         self._close_review()
         try:
             from . import data_table_page
 
             data_table_page.refresh_dashboard()
-            data_table_page._review_tasks.refresh()
         except (AttributeError, RuntimeError):
             pass
         notify("任务已移除；不会修改媒体文件或作品信息", type="positive")
 
     def _render_completion_workflow(self) -> None:
+        self._refresh_movie_primary_action()
         self.completion_container.clear()
         with self.completion_container:
+            status = completion_status(self.plan, self.task_data)
+            if status:
+                ui.label(status).classes('font-bold text-green-8')
+                ui.label('可使用“核查并补齐”检查现有整理结果。').classes('bar-help')
+                return
             mapping_source = str(self.plan.metadata.get("mapping_source") or "")
-            issue_codes = {
-                str(item.get("code") or "")
-                for item in self.snapshot.issues
-                if isinstance(item, Mapping)
-            }
-            primary_group = (
-                self.plan.presentation_groups[0]
-                if self.plan.presentation_groups else None
-            )
-            if (
-                "subtitle_video_not_content_version" in issue_codes
-                and mapping_source != "inventory_review_draft"
-                and primary_group is not None
-                and primary_group.kind == "movie_continuous"
-            ):
-                self._render_movie_primary_picker(
-                    self._video_options(),
-                    self._selected_movie_primary_sources(),
-                )
             if mapping_source == "inventory_smart_completion":
-                if self.snapshot.issues:
-                    ui.label(
-                        "系统已完成可确定的文件；下面只列出仍需你判断的项目。"
-                    ).classes("bar-help text-orange-8")
-                else:
+                if not self.snapshot.issues:
                     with ui.row().classes(
                         "bar-callout bar-callout-success w-full items-start gap-2"
                     ):
-                        ui.icon("task_alt", color="green-7", size="22px")
+                        ui.icon('o_task_alt', color="green-7", size="22px")
                         with ui.column().classes("gap-1"):
                             ui.label(
                                 "整理计划已生成，尚未创建硬链接"
                             ).classes("font-bold text-green-8")
                             ui.label(
                                 "请先核对下方源文件与建议目标，然后点击"
-                                "“批准全部 · 不执行”；批准完成后，再点击红色"
-                                "“执行已批准的整理计划”才会创建硬链接。"
+                                "“批准整理计划”；批准完成后，再点击"
+                                "“执行整理计划”才会创建硬链接。"
                             ).classes("bar-help")
                             policy = self.plan.execution_policy
                             if (
-                                policy is None
-                                or policy.dry_run
-                                or is_ui_test_mode()
+                                policy is None or policy.dry_run
                             ):
                                 ui.label(
                                     "当前整理计划是只读预演版本，不能创建硬链接。"
@@ -3262,27 +2695,15 @@ class PlanReviewDialog(ui.dialog):
                 )
                 if group is not None:
                     self._render_library_choices()
-                    layout_mode = (
-                        self.task_decision.layout_mode
-                        if self.task_decision is not None else None
-                    )
-                    selected_kind = (
-                        "tv_episodes" if layout_mode == "tv_episodes"
-                        else "movie_continuous" if layout_mode == "movie_versions"
-                        else "movie_segments" if layout_mode == "movie_segments"
-                        else None
-                    )
-                    self._render_completion_choice(
-                        group,
-                        selected_kind=selected_kind,
-                    )
+                    primary = self.plan.work_identity.primary_provider if self.plan.work_identity else None
+                    if primary is not None and not is_confirmed_movie_plan(self.plan):
+                        self._render_completion_choice(group, selected_kind="tv_episodes")
                 return
             if mapping_source != "inventory_review_draft":
                 return
             work = self.snapshot.work_identity
             confirmed = str(work.get("status")) == "confirmed"
-            with ui.card().classes("bar-primary-workflow w-full"):
-                ui.label("整理计划").classes("text-h6 font-bold")
+            with ui.column().classes("w-full gap-2"):
                 if not confirmed:
                     ui.label("第 1 步：请先点击上方“选择这个作品”。").classes(
                         "bar-help text-orange-8 font-bold"
@@ -3309,9 +2730,6 @@ class PlanReviewDialog(ui.dialog):
                     selected_kind=None,
                     video_options=video_options,
                 )
-                ui.label(
-                    "这一步只生成新版整理计划，不会立即移动或创建文件。"
-                ).classes("bar-help")
 
     def _render_library_choices(self) -> None:
         ui.label("保存位置").classes("text-subtitle2 font-bold")
@@ -3319,7 +2737,7 @@ class PlanReviewDialog(ui.dialog):
             self.plan.work_identity.primary_provider
             if self.plan.work_identity is not None else None
         )
-        movie = primary is not None and primary.entity_type == "movie"
+        movie = is_confirmed_movie_plan(self.plan)
         with ui.row().classes(
             "bar-completion-choice-row w-full gap-3 flex-wrap"
         ):
@@ -3334,17 +2752,25 @@ class PlanReviewDialog(ui.dialog):
                 button = ui.button(
                     label,
                     on_click=partial(self._select_library_domain, domain),
-                ).props(
+                icon='o_animation' if domain == 'animation' else 'o_video_library').props(
                     ("color=blue-7 text-color=white no-caps"
                      if selected else "outline color=blue-7 no-caps ")
                     + f" aria-pressed={'true' if selected else 'false'}"
                 ).classes("bar-completion-choice")
                 if selected:
-                    button.tooltip("已选择；选择整理方式后应用")
+                    button.tooltip("已选择；生成新版整理计划后应用")
 
     def _video_options(self) -> Dict[str, str]:
         options: Dict[str, str] = {}
-        for entry in self.plan.entries:
+        entries = list(self.plan.entries)
+        context = self.plan.metadata.get('inventory_completion_context') or {}
+        if context.get('origin_plan_fingerprint'):
+            try:
+                entries += list(self.review_service.plan_store.load_version(
+                    self.plan.task_id, context['origin_plan_fingerprint']).entries)
+            except (ValueError, RuntimeError, OSError):
+                pass  # The edit command reports a missing history before mutation.
+        for entry in entries:
             if entry.media_kind != "video":
                 continue
             try:
@@ -3387,7 +2813,7 @@ class PlanReviewDialog(ui.dialog):
 
         picker = self.movie_primary_video_input
         with picker.add_slot("append"):
-            confirm = ui.button("确定", icon="check").props(
+            confirm = ui.button("确定", icon='o_check').props(
                 "flat dense color=blue-7 no-caps"
             ).classes("bar-movie-primary-confirm")
         confirm.set_visibility(False)
@@ -3417,7 +2843,6 @@ class PlanReviewDialog(ui.dialog):
             if selected_kind == "movie_continuous" else []
         )
         with ui.column().classes("bar-completion-choice-card w-full gap-2"):
-            ui.label("整理方式").classes("text-subtitle2 font-bold")
             binding = (
                 self.task_decision.season_binding
                 if self.task_decision is not None else None
@@ -3445,135 +2870,32 @@ class PlanReviewDialog(ui.dialog):
                 self.tv_season_input.tooltip(
                     "旧计划未记录季度来源；已建议第 1 季，点击剧集整理时才会确认。"
                 )
-            elif needs_season_choice:
-                ui.label(f"自动识别：第 {season_value} 季").classes("bar-help")
-            self._render_movie_primary_picker(video_options, selected_values)
-            with ui.row().classes(
-                "bar-completion-choice-row w-full gap-3 flex-wrap"
-            ):
-                tv_props = (
-                    "color=blue-7 text-color=white no-caps"
-                    if selected_kind == "tv_episodes" else "outline color=blue-7 no-caps"
-                )
-                movie_props = (
-                    "color=blue-7 text-color=white no-caps"
-                    if selected_kind == "movie_continuous" else "outline color=blue-7 no-caps"
-                )
-                ui.button(
-                    "按季和集智能整理",
-                    icon="video_library",
-                    on_click=partial(
-                        self._complete_inventory_draft,
-                        group.group_id,
-                        "tv_episodes",
-                    ),
-                ).props(tv_props).classes("bar-completion-choice")
-                ui.button(
-                    "按所选视频生成电影正片版本",
-                    icon="movie",
-                    on_click=partial(
-                        self._complete_movie_with_primary,
-                        group.group_id,
-                    ),
-                ).props(movie_props).classes("bar-completion-choice")
-            ui.checkbox(
-                "这些视频是同一电影的连续分段",
-                value=selected_kind == "movie_segments",
-                on_change=lambda event: self._toggle_movie_segments(
-                    group.group_id,
-                    bool(event.value),
-                ),
-            ).props("color=blue-7")
+            primary = self.plan.work_identity.primary_provider if self.plan.work_identity else None
+            movie_confirmed = is_confirmed_movie_plan(self.plan)
+            if not movie_confirmed:
+                with ui.row().classes("bar-completion-choice-row w-full gap-3 flex-wrap"):
+                    ui.button(
+                        "重新生成剧集整理计划" if self.plan.metadata.get("mapping_source") == "inventory_smart_completion"
+                        else "生成剧集整理计划",
+                        icon='o_video_library',
+                        on_click=partial(
+                            self._complete_inventory_draft,
+                            group.group_id,
+                            "tv_episodes",
+                        ),
+                    ).props("outline color=blue-7 no-caps").classes("bar-completion-choice")
 
-    def _toggle_movie_segments(self, group_id: str, enabled: bool) -> None:
-        if enabled:
-            self._complete_inventory_draft(group_id, "movie_continuous")
-            return
-        if self.task_decision is None:
-            notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
-            return
-        try:
-            draft = self.review_service.reopen_inventory_draft(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                reason="用户取消连续分段整理方式",
-                persist_revision=False,
-            )
-            self.task_decision, projected = self.decision_command_service.update(
-                self.plan.task_id,
-                expected_revision=self.task_decision.revision,
-                changes={"layout_mode": None},
-                planner=lambda _state: draft,
-                task_terminal=_task_terminal_for_projected_plan(self.plan.task_id),
-            )
-            if projected is None:
-                raise DecisionStateError("未生成 DecisionState 对应的 Plan")
-            draft = projected
-        except (DecisionStateError, PlanReviewError) as exc:
-            notify(localize_plan_term(exc), type="warning")
-            return
-        self._adopt_revision(draft)
-        notify("已取消连续分段整理方式；尚未执行文件操作。")
+    def _inventory_draft_for_completion(self):
+        return _inventory_draft_for_completion(self.plan, self.review_service)
 
-    def _inventory_draft_for_completion(self) -> RenamePlan:
-        mapping_source = str(self.plan.metadata.get("mapping_source") or "")
-        if mapping_source == "inventory_review_draft":
-            return self.plan
-        if mapping_source == "inventory_smart_completion":
-            return self.review_service.reopen_inventory_draft(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                reason="用户重新选择整理方式",
-                persist_revision=False,
-            )
-        raise PlanReviewError("当前整理计划不能重新选择整理方式")
+    def _series_binding_for_tv(self, target_root):
+        return _series_binding_for_tv(self.plan, self.task_decision, self.series_catalog, target_root)
 
-    def _series_binding_for_tv(self, target_root: Path) -> dict:
-        if self.task_decision is None or self.plan.work_identity is None:
-            raise DecisionStateError("缺少剧集系列决策上下文")
-        if self.task_decision.series_binding is not None:
-            return dict(self.task_decision.series_binding)
-        provider = self.plan.work_identity.primary_provider.to_dict()
-        try:
-            match = self.series_catalog.find_by_provider(provider)
-        except SeriesCatalogError as exc:
-            raise DecisionStateError(str(exc)) from exc
-        if match is not None:
-            return {
-                "series_key": match.series_key,
-                "canonical_root": str(match.canonical_root),
-                "catalog_revision": match.revision,
-                "decision_source": "exact_provider",
-            }
-        from ..rename.canonical_naming import (
-            CanonicalNamingError,
-            build_canonical_work_root,
-            decision_from_work_identity,
-            read_naming_decision,
-        )
+    def _edit_movie_version_groups(self, group_id: str) -> None:
+        from .asset_choice_forms import show_movie_versions
+        show_movie_versions(self, group_id, ui=ui, notify=notify, complete_movie=PlanReviewDialog._complete_movie_with_primary)
 
-        try:
-            raw = self.plan.metadata.get("canonical_naming_decision")
-            naming_decision = (
-                read_naming_decision(raw)
-                if raw is not None
-                else decision_from_work_identity(self.plan.work_identity)
-            )
-            canonical_root = build_canonical_work_root(
-                resolved_target_root=target_root,
-                decision=naming_decision,
-                year=self.plan.work_identity.year,
-            )
-        except CanonicalNamingError as exc:
-            raise DecisionStateError(str(exc)) from exc
-        return {
-            "series_key": f"series-{uuid.uuid4()}",
-            "canonical_root": str(canonical_root),
-            "catalog_revision": 0,
-            "decision_source": "new_series_intent",
-        }
-
-    def _complete_movie_with_primary(self, group_id: str) -> None:
+    async def _complete_movie_with_primary(self, group_id: str, *, version_groups=None, excluded_sources=()) -> None:
         if self.task_decision is None:
             notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
             return
@@ -3587,6 +2909,10 @@ class PlanReviewDialog(ui.dialog):
             if isinstance(selected_value, (list, tuple, set))
             else [selected_value]
         )
+        if self.task_decision.content_selection is not None:
+            from .movie_content_actions import complete
+            return await await_result(complete(self, group_id, selected=selected_values, groups=version_groups,
+                            excluded=excluded_sources, notify=notify))
         from ..rename.target_routing import (
             resolve_target_root,
             snapshot_from_config_manager,
@@ -3613,11 +2939,13 @@ class PlanReviewDialog(ui.dialog):
                 target_root=target_root,
                 reason=(
                     f"用户明确选择 {len(selected_values)} 个电影正片版本；"
-                    "未选视频进入版本级特典判断"
+                    "版本组与未整理范围将冻结在当前决定中"
                 ),
                 primary_video_sources=tuple(
                     Path(str(value)) for value in selected_values
                 ),
+                movie_version_groups=version_groups,
+                excluded_movie_sources=excluded_sources,
                 root_snapshot=snapshot.to_dict(),
                 work_domain=domain,
                 persist_revision=False,
@@ -3638,6 +2966,7 @@ class PlanReviewDialog(ui.dialog):
                 changes={
                     "library_domain": domain,
                     "layout_mode": "movie_versions",
+                    "movie_version_selection": self.review_service.movie_selection_for_completion(revised),
                     "recovery_state": "healthy",
                     "series_binding": None,
                     "catalog_link_intent": (
@@ -3659,140 +2988,36 @@ class PlanReviewDialog(ui.dialog):
         except (DecisionStateError, PlanReviewError, TypeError, ValueError) as exc:
             notify(localize_plan_term(exc), type="negative")
             return
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         notify("电影正片版本、特典和字幕已生成新版整理计划；尚未执行文件操作。")
 
-    def _complete_inventory_draft(self, group_id: str, group_kind: str) -> None:
-        from ..rename.target_routing import (
-            resolve_target_root,
-            snapshot_from_config_manager,
-        )
+    async def _complete_inventory_draft(self, group_id: str, group_kind: str) -> None:
+        from ..rename.target_routing import snapshot_from_config_manager
+        from .tv_content_actions import run_revision
         if self.task_decision is None:
             notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
             return
-        draft = None
-        try:
-            snapshot = snapshot_from_config_manager(cm)
-            if self.plan.work_identity is None:
-                raise ValueError("整理计划尚未确认作品域")
-            domain = self._completion_domain()
-            if domain is None:
-                return
-            draft = self._inventory_draft_for_completion()
-            target_root = resolve_target_root(
-                domain,
-                group_kind,
-                snapshot,
-            )
-            completion_kwargs = {}
-            decision_changes = {
-                "library_domain": domain,
-                "layout_mode": (
-                    "tv_episodes" if group_kind == "tv_episodes" else "movie_segments"
-                ),
-                "recovery_state": "healthy",
-            }
-            if group_kind == "tv_episodes":
-                series_binding = self._series_binding_for_tv(target_root)
-                decision_changes["series_binding"] = series_binding
-                decision_changes["catalog_link_intent"] = None
-                completion_kwargs.update({
-                    "series_key": str(series_binding["series_key"]),
-                    "season_binding_id": None,
-                    "series_catalog_revision": int(
-                        series_binding.get("catalog_revision") or 0
-                    ),
-                })
-                selected_season = getattr(self, "tv_season_input", None)
-                if selected_season is not None:
-                    completion_kwargs["season_number"] = selected_season.value
-                    completion_kwargs["season_source"] = "explicit_user"
-                    decision_changes["season_binding"] = {
-                        "season_binding_id": f"season-binding-{uuid.uuid4()}",
-                        "season_number": int(selected_season.value),
-                        "decision_source": "explicit_user",
-                    }
-                elif self.task_decision.season_binding is not None:
-                    completion_kwargs["season_number"] = int(
-                        self.task_decision.season_binding["season_number"]
-                    )
-                    completion_kwargs["season_source"] = str(
-                        self.task_decision.season_binding.get("decision_source")
-                        or "provider"
-                    )
-                else:
-                    raise DecisionStateError("尚未确认季度，不能生成剧集 Plan")
-                binding = decision_changes.get("season_binding") or self.task_decision.season_binding
-                completion_kwargs["season_binding_id"] = str(
-                    binding["season_binding_id"]
-                )
-            if group_kind == "movie_continuous":
-                completion_kwargs["confirmed_segment_sources"] = tuple(
-                    entry.source_path
-                    for entry in draft.entries
-                    if entry.media_kind == "video"
-                )
-            revised = self.review_service.complete_inventory_draft(
-                draft.task_id,
-                PlanStore.fingerprint(draft),
-                group_id=group_id,
-                group_kind=group_kind,
-                target_root=target_root,
-                reason=(
-                    "用户选择按季和集播放并确认智能生成"
-                    if group_kind == "tv_episodes"
-                    else "用户选择连续电影播放并确认智能生成"
-                ),
-                root_snapshot=snapshot.to_dict(),
-                work_domain=domain,
-                persist_revision=False,
-                _source_plan=draft,
-                _revision_parent_fingerprint=PlanStore.fingerprint(self.plan),
-                **completion_kwargs,
-            )
-            if group_kind == "movie_continuous":
-                revised_metadata = (
-                    revised.metadata
-                    if isinstance(revised.metadata, Mapping) else {}
-                )
-                work_key = str(
-                    revised_metadata.get("catalog_work_key")
-                    or revised_metadata.get("proposed_work_key")
-                    or ""
-                ).strip()
-                decision_changes.update({
-                    "series_binding": None,
-                    "catalog_link_intent": (
-                        {
-                            "work_key": work_key,
-                            "catalog_revision": int(
-                                revised_metadata.get("catalog_revision") or 0
-                            ),
-                        }
-                        if work_key else None
-                    ),
-                })
-            self.task_decision, projected = self.decision_command_service.update(
-                self.plan.task_id,
-                expected_revision=self.task_decision.revision,
-                changes=decision_changes,
-                planner=lambda _state: revised,
-                task_terminal=_task_terminal_for_projected_plan(self.plan.task_id),
-            )
-            if projected is None:
-                raise DecisionStateError("未生成 DecisionState 对应的 Plan")
-            revised = projected
-        except (DecisionStateError, PlanReviewError, TypeError, ValueError) as exc:
-            notify(localize_plan_term(exc), type="warning")
+        domain = self._completion_domain()
+        if domain is None:
             return
-        self._adopt_revision(revised)
-        if self.snapshot.issues:
-            notify(
-                f"已完成可确定项目；仍有 {len(self.snapshot.issues)} 个结构问题需要确认",
-                type="warning",
-            )
-        else:
-            notify("智能整理完成；请核对文件列表后批准全部", type="positive")
+        plan, state = self.plan, self.task_decision
+        if plan.work_identity is None:
+            notify("整理计划尚未确认作品域", type="warning")
+            return
+        snapshot = snapshot_from_config_manager(cm)
+        season = getattr(self, 'tv_season_input', None)
+        season = season.value if season is not None else None
+        service, command, catalog = self.review_service, self.decision_command_service, self.series_catalog
+        saved = await run_revision(self,
+            submit=lambda: _complete_inventory_plan(plan, state, service, command, catalog,
+                group_id, group_kind, snapshot, domain, season),
+            expected_revision=state.revision, expected_fingerprint=PlanStore.fingerprint(plan),
+            notify=notify, message='', quiet=True)
+        if saved is not None:
+            if self.snapshot.issues:
+                notify(f"已完成可确定项目；仍有 {len(self.snapshot.issues)} 个结构问题需要确认", type="warning")
+            else:
+                notify("智能整理完成；请核对文件列表后批准全部", type="positive")
 
     def _completion_domain(self) -> Optional[str]:
         if self.task_decision is None:
@@ -3807,14 +3032,33 @@ class PlanReviewDialog(ui.dialog):
             return None
         return selected
 
-    def _select_library_domain(self, domain: str) -> None:
+    async def _select_library_domain(self, domain: str) -> None:
         if domain not in {"animation", "general"}:
             return
         if self.task_decision is None:
             notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
             return
+        if is_confirmed_movie_plan(self.plan):
+            from ..rename.movie_work_correction import observe_domain, prepare_observed
+            from ..rename.initial_movie_completion import commit
+            from ..rename.work_affiliation import AffiliationRequired
+            try:
+                observation = await ui_disk_call(observe_domain, self.review_service, self.plan.task_id,
+                    PlanStore.fingerprint(self.plan), expected_revision=self.task_decision.revision, domain=domain)
+                intent = await ui_disk_call(prepare_observed, self.review_service, observation)
+                projected = await ui_disk_call(commit, self.review_service, intent)
+            except AffiliationRequired as exc:
+                from .work_affiliation_view import show
+                await show(self, ui=ui, notify=notify, correction_inputs=exc.inputs)
+                return
+            except (ValueError, RuntimeError, OSError) as exc:
+                notify(str(exc), type='warning')
+                return
+            await await_result(self._adopt_revision(projected))
+            notify('保存位置已更新，请核对新目标并重新批准。', type='positive')
+            return
         try:
-            self.task_decision, projected = self.decision_command_service.update(
+            self.task_decision, projected = await ui_disk_call(self.decision_command_service.update,
                 self.plan.task_id,
                 expected_revision=self.task_decision.revision,
                 changes={"library_domain": domain},
@@ -3828,15 +3072,15 @@ class PlanReviewDialog(ui.dialog):
         except DecisionStateError as exc:
             notify(str(exc), type="warning")
             return
-        self._adopt_revision(projected)
+        await await_result(self._adopt_revision(projected))
         notify(
-            "保存位置已更新；请重新选择整理方式以生成对应目录，尚未执行文件操作。",
+            "保存位置已更新；请生成新版整理计划并核对目标目录，尚未执行文件操作。",
             type="warning",
         )
 
-    def _change_group_kind(self, group_id: str, kind: str) -> None:
+    async def _change_group_kind(self, group_id: str, kind: str) -> None:
         try:
-            revised = self.review_service.revise_presentation_group_kind(
+            revised = await ui_disk_call(self.review_service.revise_presentation_group_kind,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 group_id=group_id,
@@ -3846,7 +3090,7 @@ class PlanReviewDialog(ui.dialog):
         except PlanReviewError as exc:
             notify(localize_plan_term(exc))
             return
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         self._render_groups()
         self._render_issues()
         self._render_entries()
@@ -3859,6 +3103,10 @@ class PlanReviewDialog(ui.dialog):
         type_label = ENTITY_TYPE_LABELS.get(entity_type, entity_type or "类型未知")
         provider_id = str(candidate.get("provider_id") or "未知")
         url = provider_candidate_url(candidate)
+        capability = _candidate_capability(self, candidate)
+        # Search observations can lack type details. The initial click reads
+        # that exact item first; select() applies the same capability gate.
+        actionable = bool(url) if self.plan is None else capability.actionable
         with ui.card().classes("bar-candidate-card w-full"):
             if poster:
                 ui.image(poster).classes("bar-candidate-poster").props(
@@ -3882,17 +3130,26 @@ class PlanReviewDialog(ui.dialog):
                         "低置信参考：标题证据不足，不会自动确认或改变观看形式。"
                     ).classes("bar-help text-orange-8")
                 with ui.row().classes("items-center gap-2 flex-wrap"):
-                    ui.button(
+                    select_button = ui.button(
                         "选择这个作品",
-                        on_click=partial(self._select_provider_candidate, candidate),
-                        icon="check_circle",
+                        on_click=(
+                            partial(self._select_provider_candidate, candidate)
+                            if actionable else None
+                        ),
+                        icon='o_check_circle',
                     ).props("color=blue-7 no-caps")
+                    select_button.set_enabled(actionable)
+                    if not actionable:
+                        select_button.tooltip(capability.message)
+                        ui.label(capability.message).classes(
+                            "bar-help text-orange-8"
+                        )
                     if url:
                         ui.link("打开资料页", url, new_tab=True).classes(
                             "bar-candidate-link"
                         )
 
-    def _render_selected_provider_identity(self) -> None:
+    def _render_selected_provider_identity(self, context) -> None:
         identity = self.plan.work_identity.primary_provider
         candidate = {
             "namespace": identity.namespace,
@@ -3906,8 +3163,7 @@ class PlanReviewDialog(ui.dialog):
         poster = provider_candidate_poster(candidate)
         url = provider_candidate_url(candidate)
         type_label = ENTITY_TYPE_LABELS.get(identity.entity_type, "类型未知")
-        ui.label("当前已选作品").classes("text-subtitle2")
-        with ui.card().classes("bar-candidate-card w-full"):
+        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
             if poster:
                 ui.image(poster).classes("bar-candidate-poster").props(
                     'fit="cover" loading="lazy"'
@@ -3921,19 +3177,19 @@ class PlanReviewDialog(ui.dialog):
                     f"{identity.namespace.upper()} #{identity.provider_id}"
                 ).classes("bar-evidence")
                 with ui.row().classes("items-center gap-2 flex-wrap"):
-                    ui.button(
-                        "重新选择作品",
-                        icon="swap_horiz",
-                        on_click=self._show_provider_candidates,
-                    ).props("outline color=blue-7 no-caps")
                     if url:
                         ui.link("打开资料页", url, new_tab=True).classes(
                             "bar-candidate-link"
                         )
 
+                self._render_work_actions(context)
+
     def _show_provider_candidates(self) -> None:
         self.provider_selection_expanded = True
-        self._render_groups()
+        if self.plan is None:
+            self._render_initial_selection()
+        else:
+            self._render_groups()
 
     def _render_provider_column(
         self,
@@ -3942,27 +3198,10 @@ class PlanReviewDialog(ui.dialog):
     ) -> None:
         provider_label = "Bangumi" if namespace == "bangumi" else "TMDB"
         visible = provider_candidates_for_display(candidates, namespace)
-        with ui.column().classes("bar-provider-column grow gap-3"):
+        with ui.column().classes("bar-provider-column gap-3"):
             ui.label(f"{provider_label} 结果（最多 4 项）").classes(
                 "text-subtitle2 font-bold"
             )
-            manual_input = ui.input(
-                label=f"粘贴 {provider_label} 作品详情页链接",
-                placeholder=(
-                    "https://bgm.tv/subject/123456"
-                    if namespace == "bangumi"
-                    else "https://www.themoviedb.org/movie/123456"
-                ),
-            ).props("outlined clearable").classes("w-full")
-            if namespace == "bangumi":
-                self.bangumi_manual_url_input = manual_input
-            else:
-                self.tmdb_manual_url_input = manual_input
-            ui.button(
-                "读取链接并选择此作品",
-                icon="link",
-                on_click=partial(self._select_manual_provider_url, namespace),
-            ).props("outline color=blue-7 no-caps").classes("w-full")
             if not visible:
                 ui.label(
                     "自动搜索没有可显示结果；仍可粘贴人工找到的详情页链接。"
@@ -3970,87 +3209,47 @@ class PlanReviewDialog(ui.dialog):
             for candidate in visible:
                 self._render_provider_candidate(candidate)
 
-    async def _select_manual_provider_url(self, namespace: str) -> None:
-        field = getattr(self, f"{namespace}_manual_url_input", None)
-        value = str(field.value if field is not None else "").strip()
-        if not value:
-            notify("请先粘贴作品详情页链接", type="warning")
-            return
-        try:
-            candidate = await asyncio.to_thread(
-                resolve_provider_item_url,
-                value,
-                tmdb_api_key=effective_tmdb_api_key(cm),
-                bangumi_token=cm.get_config("bangumi_token"),
-                bangumi_user_agent=cm.get_config("bangumi_user_agent"),
-            )
-            if str(candidate.get("namespace")) != namespace:
-                expected = "Bangumi" if namespace == "bangumi" else "TMDB"
-                raise ProviderSearchError(f"请在 {expected} 栏粘贴对应网站的链接")
-        except (ProviderSearchError, OSError, TypeError, ValueError) as exc:
-            notify(str(exc), type="negative")
-            return
-        await self._select_provider_candidate(candidate)
+    render_provider_column = _render_provider_column
 
-    async def _select_provider_candidate(
-        self, candidate: Dict[str, object]
-    ) -> None:
-        if self.task_decision is None:
-            notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
-            return
-        selection = {
-            key: candidate.get(key)
-            for key in (
-                "namespace", "entity_type", "provider_id", "title",
-                "original_title", "year", "poster_url", "source_url",
-                "snapshot_at", "library_domain",
-            )
-        }
-        try:
-            await task_queue.enqueue_reidentify(
-                self.plan.task_id,
-                selection,
-                self.task_decision.revision,
-            )
-        except PlanExecutionError as exc:
-            notify(str(exc), type="warning")
-            return
-        self.task_data["provider_selection"] = selection
-        self.task_data["selection_operation"] = {
-            "state": "pending",
-            "candidate": selection,
-        }
-        render_groups = getattr(self, "_render_groups", None)
-        if callable(render_groups):
-            render_groups()
-        notify("正在更新作品信息", type="positive")
-        waiter = getattr(task_queue, "wait_for_selection_result", None)
-        if not callable(waiter):
-            return
-        operation = await waiter(self.plan.task_id)
-        self.task_data = get_task(self.plan.task_id) or self.task_data
-        if operation.get("state") == "succeeded":
-            if not all(hasattr(self, name) for name in (
-                "decision_state_store", "_adopt_revision",
-                "_render_completion_workflow", "_render_issues", "_render_entries",
-            )):
-                return
-            try:
-                self.task_decision = self.decision_state_store.load(self.plan.task_id)
-                self._adopt_revision(PlanStore(PLAN_PATH).load(self.plan.task_id))
-                self._render_completion_workflow()
-                self._render_issues()
-                self._render_entries()
-                notify("作品信息已更新，请继续检查", type="positive")
-            except (DecisionStateError, PlanStoreError):
-                notify("作品信息已更新，请刷新页面查看", type="warning")
-            return
-        if callable(render_groups):
-            render_groups()
+    def _render_provider_link_input(self) -> None:
+        field = getattr(self, 'provider_url_input', None)
+        value = getattr(field, 'value', '')
+        if field is None:
+            from .provider_selection_work import current_work, _matches_result
+            work = current_work(task_queue, self.task_id)
+            if work is not None and _matches_result(work, self.task_data):
+                value = work.draft.get('url') or work.url
+        self.provider_url_input = ui.input(
+            label="Bangumi / TMDB 作品详情页链接",
+            placeholder="粘贴 bgm.tv/subject 或 themoviedb.org/tv、movie 详情页链接",
+            value=value,
+        ).props("outlined clearable").classes("w-full")
+        self.provider_submit_button = ui.button("读取链接并选择此作品", icon='o_link',
+            on_click=self._select_manual_provider_url,
+        ).props("outline color=blue-7 no-caps").classes("w-full")
+
+    async def _select_manual_provider_url(self) -> None:
+        from .provider_selection_work import select
+        await select(self)
+
+    async def _select_provider_candidate(self, candidate, *, season_number=None) -> None:
+        from .provider_selection_work import select
+        await select(self, candidate, season_number=season_number)
+
+    async def _preview_asset_replacement(self):
+        from .asset_actions_view import preview_asset_replacement
+        await preview_asset_replacement(self)
 
     def _render_issues(self) -> None:
         self.issues_container.clear()
         with self.issues_container:
+            from ..rename.default_content import source_only_pending
+            if source_only_pending(self.plan, self.task_decision) and not self.plan.entries:
+                with ui.column().classes('bar-issue-summary w-full gap-1'):
+                    with ui.row().classes('bar-issue-heading w-full items-center gap-2 no-wrap'):
+                        ui.icon('o_warning', color='red-7', size='20px').classes('bar-issue-icon')
+                        ui.label('当前没有纳入的文件').classes('bar-error-title')
+                    ui.label('请在“内容保留与排除”中恢复需要整理的内容。').classes('bar-issue-detail')
             chosen_projection = self.plan.metadata.get("source_episode_projection")
             if isinstance(chosen_projection, Mapping):
                 mode = str(chosen_projection.get("mode") or "")
@@ -4062,30 +3261,36 @@ class PlanReviewDialog(ui.dialog):
                     ui.label(f"已选择：{chosen_label}").classes(
                         "bar-help text-green-8"
                     )
-            if str(self.plan.metadata.get("mapping_source") or "") == "inventory_review_draft":
+            if (str(self.plan.metadata.get("mapping_source") or "") == "inventory_review_draft"
+                    and not any(i['code']=='mixed_presentation_requires_partition' for i in self.snapshot.issues)):
                 work = self.snapshot.work_identity
                 entity_type = str(work.get("provider_entity_type") or "")
                 with ui.column().classes("bar-issue-summary w-full gap-1"):
                     with ui.row().classes(
                         "bar-issue-heading w-full items-center gap-2 no-wrap"
                     ):
-                        ui.icon("info", color="blue-7", size="24px")
+                        ui.icon('o_info', color="blue-7", size="24px")
                         ui.label(
                             "还差一步：选择电影正片"
-                            if entity_type == "movie"
+                            if is_confirmed_movie_plan(self.plan)
                             else (
-                                "还差一步：确认按季和集整理"
+                                "还差一步：生成剧集整理计划"
                                 if entity_type == "tv"
                                 else "还差一步：确认作品和本地播放方式"
                             )
                         ).classes("font-bold text-blue-8")
                     ui.label(
-                        "请使用上方“整理计划”中的正片选择入口。完成前显示的"
+                        ("请点击工具行的“正片选择与标签编辑”。" if is_confirmed_movie_plan(self.plan)
+                         else "请先选择正确作品，再确认本地播放方式。") + "完成前显示的"
                         "目标越界、字幕未关联等都是占位草案的派生状态，不需要逐条处理。"
                     ).classes("bar-issue-detail")
                 return
+            from .asset_actions_view import render_asset_choice
+            if not getattr(self, "_asset_choice_embedded", False):
+                render_asset_choice(self)
             summaries = summarize_plan_issues(
-                self.snapshot.issues, self.snapshot.rows
+                visible_plan_issues(self.plan, self.snapshot.issues, rows=self.snapshot.rows),
+                visible_role_rows(self.plan, self.snapshot.rows)
             )
             if not summaries:
                 return
@@ -4096,7 +3301,7 @@ class PlanReviewDialog(ui.dialog):
                 files = list(summary["files"])
                 with ui.column().classes("bar-issue-summary w-full gap-1"):
                     with ui.row().classes("bar-issue-heading w-full items-center gap-2 no-wrap"):
-                        ui.icon("warning", color="red-7", size="20px").classes(
+                        ui.icon('o_warning', color="red-7", size="20px").classes(
                             "bar-issue-icon"
                         )
                         ui.label(str(summary["title"])).classes("bar-error-title")
@@ -4115,19 +3320,47 @@ class PlanReviewDialog(ui.dialog):
                     ui.label(f"技术代码：{summary['code']}").classes(
                         "bar-help font-mono"
                     )
-                    if summary["code"] == "presentation_asset_owner_unresolved":
+                    if summary["code"] == "mixed_presentation_requires_partition":
+                        render_cross_work_partition_action(self._partition_selected_as_cross_work)
+                    elif summary["code"] == "presentation_asset_owner_unresolved":
                         self._render_asset_owner_repair()
+                    elif summary["code"] == "external_audio_projection_invalid":
+                        from .asset_choice_forms import render_audio_corrections
+                        render_audio_corrections(self, ui=ui, notify=notify)
+                        ui.label('独立CD音频或不需要的音轨无需关联视频；可点击下方按钮，预览并确认本次不整理。').classes('bar-help')
+                        audio_ids = tuple(entry_id(entry) for entry in self.plan.entries
+                                          if entry.role == 'external_audio_unresolved')
+                        ui.button('选择本次不整理的音轨',
+                            on_click=lambda _=None, keys=audio_ids: self._open_content_exclusion(
+                                keys),
+                            icon='o_do_not_disturb').props('outline color=blue-7')
                     elif summary["code"] in {
                         "presentation_asset_role_unknown",
                         "episode_assignment_conflict",
                     }:
-                        self._render_asset_role_repair()
-                    elif summary["code"] == "provider_special_decision_required":
-                        self._render_provider_special_repair()
+                        if self.plan.metadata.get("content_selection") is None:
+                            self._render_asset_role_repair()
                     elif summary["code"] == "source_episode_projection_decision_required":
                         self._render_source_episode_projection_repair()
 
+    def _exclude_unresolved_audio(self, key: str) -> None:
+        self._open_content_exclusion((key,))
+
+    def _open_content_exclusion(self, identifiers) -> None:
+        from .content_review_view import open_content_workbench
+        if self.exit_requested or self.is_deleted:
+            return
+        selected = self._exceptional_entry_ids(identifiers)
+        available = {entry_id(entry) for entry in self.plan.entries}
+        if not selected or not set(selected) <= available:
+            notify('请先选择本次不整理的文件；文件已变化时请重新打开任务。', type='warning')
+            return
+        open_content_workbench(self, ui=ui, notify=notify, selected_ids=selected)
+
     def _render_source_episode_projection_repair(self) -> None:
+        if self.task_decision is None or self.task_decision.content_selection is None:
+            ui.label('旧集号修改入口已停用，请安全结束此任务后重新添加来源。').classes('bar-help')
+            return
         candidates = self.plan.metadata.get("source_episode_projection_candidates")
         if not isinstance(candidates, (list, tuple)):
             return
@@ -4153,7 +3386,7 @@ class PlanReviewDialog(ui.dialog):
                         label,
                         self.task_decision.revision if self.task_decision else None,
                     ),
-                ).props("outline color=blue-7 no-caps")
+                icon='o_format_list_numbered' if mode == 'absolute' else 'o_restart_alt').props("outline color=blue-7 no-caps")
 
     def _apply_source_episode_projection_inline(
         self,
@@ -4161,8 +3394,8 @@ class PlanReviewDialog(ui.dialog):
         label: str,
         expected_revision: Optional[int],
     ) -> None:
-        if self.task_decision is None:
-            notify("此旧任务需要重新识别后再确认集号", type="warning")
+        if self.task_decision is None or self.task_decision.content_selection is None:
+            notify('旧集号修改入口已停用，请安全结束此任务后重新添加来源；源文件不会删除。', type='warning')
             return
         if not isinstance(expected_revision, int):
             notify("页面内容已经更新，请刷新后重新选择", type="warning")
@@ -4185,32 +3418,13 @@ class PlanReviewDialog(ui.dialog):
             )
             if plain_projection is None:
                 raise DecisionStateError("集号候选已经变化")
-            projected_plan = apply_source_episode_projection(
-                self.plan, plain_projection
-            )
-            self.task_decision, revised = self.decision_command_service.update(
-                self.plan.task_id,
-                expected_revision=expected_revision,
-                changes={
-                    "source_episode_projection": plain_projection,
-                    "source_episode_projection_decision": {
-                        "decision": str(projection.get("mode") or ""),
-                        "label": label,
-                        "projection_fingerprint": str(
-                            plain_projection.get("projection_fingerprint") or ""
-                        ),
-                    },
-                },
-                planner=lambda _state: projected_plan,
-                task_terminal=_task_terminal_for_projected_plan(self.plan.task_id),
-            )
-            if revised is None:
-                raise DecisionStateError("未生成集号确认后的整理计划")
+            from .tv_content_actions import revise
+            return revise(self, expected_revision=expected_revision, mode='episode',
+                expected_fingerprint=PlanStore.fingerprint(self.plan),
+                edit={'projection_fingerprint': fingerprint}, notify=notify, message=f'已选择：{label}')
         except (DecisionStateError, PlanStoreError, TypeError, ValueError):
             notify("页面内容已经更新，请刷新后重新选择", type="warning")
             return
-        self._adopt_revision(revised)
-        notify(f"已选择：{label}", type="positive")
 
     def _render_asset_owner_repair(self) -> None:
         affected = {}
@@ -4240,14 +3454,14 @@ class PlanReviewDialog(ui.dialog):
             ).classes("w-56")
             ui.button(
                 "保存归属",
-                icon="save",
+                icon='o_save',
                 on_click=lambda: self._save_asset_owner_inline(
                     file_select.value, owner_select.value
                 ),
             ).props("outline color=red-7")
             ui.button(
                 "本次不整理",
-                icon="do_not_disturb",
+                icon='o_do_not_disturb',
                 on_click=lambda: self._ignore_entry_inline(file_select.value),
             ).props("flat color=grey-8")
 
@@ -4255,10 +3469,11 @@ class PlanReviewDialog(ui.dialog):
         """Keep the common unknown-video repair beside its blocking issue."""
 
         affected = {}
+        role_rows = visible_role_rows(self.plan, self.snapshot.rows)
         for entry in self.plan.entries:
             identifier = entry_id(entry)
             row = next(
-                (item for item in self.snapshot.rows if item["entry_id"] == identifier),
+                (item for item in role_rows if item["entry_id"] == identifier),
                 None,
             )
             if row and set(row.get("issue_codes", ())).intersection({
@@ -4267,171 +3482,107 @@ class PlanReviewDialog(ui.dialog):
                 affected[identifier] = _file_name(entry.source_path)
         if not affected:
             return
-        ui.label("直接确认用途后，系统会从原始库存草案完整重建正片、特典、字幕和目标。") \
+        current_content = self.plan.metadata.get('content_selection') is not None
+        ui.label("不需要的内容请在文件列表旁的“内容保留与排除”中调整；此处可更正正片用途。" if current_content else
+                 "直接确认用途后，系统会从原始库存草案完整重建正片、特典、字幕和目标。") \
             .classes("bar-help")
         with ui.row().classes("w-full items-end gap-2 flex-wrap"):
             file_select = ui.select(affected, label="待确认文件").props(
                 "outlined dense options-dense"
             ).classes("grow")
+            if not current_content:
+                ui.button("设为特典并重建", icon='o_movie_filter',
+                    on_click=lambda: self._rebuild_inventory_role(file_select.value, "extra")
+                ).props("outline color=blue-7")
             ui.button(
-                "设为特典并重建",
-                icon="movie_filter",
-                on_click=lambda: self._rebuild_inventory_role(
-                    file_select.value, "extra"
-                ),
-            ).props("outline color=blue-7")
-            ui.button(
-                "作为正片候选并重建",
-                icon="video_library",
+                "确认为正片候选" if current_content else "作为正片候选并重建",
+                icon='o_video_library',
                 on_click=lambda: self._rebuild_inventory_role(
                     file_select.value, "main_candidate"
                 ),
             ).props("outline color=blue-7")
-            eligible_archives = {
-                identifier for identifier in affected
-                if next(
-                    (
-                        entry.source_path.suffix.casefold() in {".7z", ".zip"}
-                        for entry in self.plan.entries
-                        if entry_id(entry) == identifier
-                    ),
-                    False,
-                )
-            }
-            if eligible_archives:
-                ui.label("保留原文件，不会解包").classes("bar-help")
-                ui.button(
-                    "设为字体包",
-                    icon="font_download",
-                    on_click=lambda: self._confirm_font_inline(
-                        file_select.value
-                    ),
-                ).props("outline color=blue-7")
+    @staticmethod
+    def _exceptional_entry_ids(value: object) -> tuple[str, ...]:
+        raw = value if isinstance(value, (list, tuple, set)) else (value,)
+        return tuple(dict.fromkeys(
+            str(item or "").strip() for item in raw if str(item or "").strip()
+        ))
 
-    def _confirm_font_inline(self, identifier: object) -> None:
-        if not identifier:
-            notify("请先选择待确认文件", type="warning")
+    def _apply_exceptional_special_inline(
+        self,
+        identifiers: object,
+        action: str,
+        provider_episode_id: object,
+    ) -> None:
+        selected = self._exceptional_entry_ids(identifiers)
+        if action == 'unmatched_extra' and self.plan.metadata.get('content_selection') is not None:
+            if provider_episode_id is not None:
+                notify('附加内容不能混入官方特别篇集号。', type='warning')
+                return
+            return self._open_content_exclusion(selected)
+        if len(selected) != 1:
+            notify("请至少选择一个视频；归入官方特别篇时请只选一个。", type="warning")
             return
-        if self.task_decision is None:
-            notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
-            return
-        try:
-            revised = self.review_service.confirm_font_archive(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                str(identifier),
-                reason="用户确认该压缩包是字体包；保留原文件，不解包",
-                persist_revision=False,
-            )
-            roles = dict(self.task_decision.manual_role_decisions)
-            roles[str(identifier)] = "font"
-            self.task_decision, projected = self.decision_command_service.update(
-                self.plan.task_id,
-                expected_revision=self.task_decision.revision,
-                changes={"manual_role_decisions": roles},
-                planner=lambda _state: revised,
-                task_terminal=_task_terminal_for_projected_plan(self.plan.task_id),
-            )
-            if projected is None:
-                raise DecisionStateError("未生成字体确认后的整理计划")
-        except (DecisionStateError, PlanReviewError, TypeError, ValueError) as exc:
-            notify(localize_plan_term(exc), type="negative")
-            return
-        self._adopt_revision(projected)
-        notify("已设为字体包；原文件保持不变", type="positive")
-
-    def _render_provider_special_repair(self) -> None:
-        candidates = self.plan.metadata.get("provider_special_candidates")
-        if not isinstance(candidates, Mapping):
-            return
-        affected = {}
-        for entry in self.plan.entries:
-            identifier = entry_id(entry)
-            row = next(
-                (item for item in self.snapshot.rows if item["entry_id"] == identifier),
-                None,
-            )
-            if (
-                row
-                and "provider_special_decision_required" in row.get("issue_codes", ())
-                and isinstance(candidates.get(identifier), (list, tuple))
-                and candidates[identifier]
-            ):
-                affected[identifier] = _file_name(entry.source_path)
-        if not affected:
-            return
-        selected = next(iter(affected)) if len(affected) == 1 else None
-        ui.label("官方特别篇候选").classes("bar-help font-bold")
-        sample_identifier = selected or next(iter(affected))
-        sample_rows = candidates.get(sample_identifier) or ()
-        episode_options = {}
-        for item in sample_rows:
-            if not isinstance(item, Mapping):
-                continue
-            episode_number = item.get("episode_number")
-            episode_key = str(item.get("provider_episode_id") or "").strip()
-            if not episode_key or not isinstance(episode_number, int):
-                continue
-            title = str(item.get("title") or "标题未提供")
-            air_date = str(item.get("air_date") or "日期未提供")
-            runtime = item.get("runtime")
-            runtime_text = (
-                f"{runtime} 分钟"
-                if isinstance(runtime, int) and not isinstance(runtime, bool)
-                else "时长未提供"
-            )
-            episode_options[episode_key] = (
-                f"S00E{episode_number:02d} · {title} · {air_date} · {runtime_text}"
-            )
-        if not episode_options:
-            return
-        selected_episode = (
-            next(iter(episode_options)) if len(episode_options) == 1 else None
+        return self._apply_provider_special_inline(
+            selected[0], action, provider_episode_id
         )
-        with ui.row().classes("w-full items-end gap-2 flex-wrap"):
-            file_select = ui.select(
-                affected, label="待确认文件", value=selected
-            ).props("outlined dense options-dense").classes("grow")
-            episode_select = ui.select(
-                episode_options,
-                label="选择特别篇",
-                value=selected_episode,
-            ).props("outlined dense options-dense").classes("grow")
-            ui.button(
-                "归入特别篇",
-                icon="playlist_add_check",
-                on_click=lambda: self._apply_provider_special_inline(
-                    file_select.value,
-                    "confirmed_official_special",
-                    episode_select.value,
-                ),
-            ).props("outline color=blue-7")
-            ui.button(
-                "保留为附加内容",
-                icon="movie_filter",
-                on_click=lambda: self._apply_provider_special_inline(
-                    file_select.value, "unmatched_extra", None
-                ),
-            ).props("flat color=grey-8")
 
-    def _apply_provider_special_inline(
+    async def _open_source_regrouping(self, *, selected_entry_ids=None) -> None:
+        from .source_regrouping_view import SourceRegroupingDialog
+        if self.exit_requested or self.is_deleted or getattr(self, '_regrouping_opening', False):
+            return
+        self._regrouping_opening = True
+        fingerprint = PlanStore.fingerprint(self.plan)
+        try:
+            preview = await ui_disk_call(task_queue.preview_source_regrouping,
+                task_id=self.plan.task_id, expected_plan_fingerprint=fingerprint,
+                selected_entry_ids=selected_entry_ids)
+            if self.exit_requested or self.is_deleted or not self.value or PlanStore.fingerprint(self.plan) != fingerprint:
+                return
+            previous = getattr(self, 'regrouping_dialog', None)
+            if previous is not None and not previous.is_deleted:
+                previous.close()
+                previous.delete()
+            with self.client.content:
+                popup = SourceRegroupingDialog(self, task_queue, selected_entry_ids=selected_entry_ids, preview=preview)
+            self.regrouping_dialog = popup
+            popup.open()
+        except (ValueError, RuntimeError, OSError) as exc:
+            if not self.is_deleted and not self.exit_requested:
+                notify(localize_plan_term(exc), type='warning')
+        finally:
+            self._regrouping_opening = False
+
+    async def _partition_exceptional_as_cross_work(self, identifiers: object) -> None:
+        await self._open_selected_source_regrouping(self._exceptional_entry_ids(identifiers))
+
+    async def _open_selected_source_regrouping(self, identifiers) -> None:
+        await self._open_source_regrouping(selected_entry_ids=identifiers)
+
+    async def _apply_provider_special_inline(
         self, identifier: object, action: str, provider_episode_id: object
     ) -> None:
+        if action == 'unmatched_extra' and self.plan.metadata.get('content_selection') is not None:
+            if provider_episode_id is not None:
+                notify('附加内容不能混入官方特别篇集号。', type='warning')
+                return
+            return await await_result(self._open_content_exclusion((identifier,)))
         if not identifier:
             notify("请先选择待确认文件", type="warning")
             return
         if self.task_decision is None:
             notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
             return
-        candidates = self.plan.metadata.get("provider_special_candidates")
-        rows = (
-            candidates.get(str(identifier))
-            if isinstance(candidates, Mapping) else None
-        )
-        if not isinstance(rows, (list, tuple)) or not rows:
-            notify("官方特别篇候选已变化，请刷新后重试", type="warning")
+        from ..rename.provider_special_evidence import official_special_rows
+        try:
+            rows = official_special_rows(self.plan, str(identifier))
+        except ValueError as exc:
+            notify(str(exc), type='warning')
             return
         if action == "confirmed_official_special":
+            if not isinstance(rows, (list, tuple)) or not rows:
+                notify("官方特别篇候选已变化，请刷新后重试", type="warning")
+                return
             selected_key = str(provider_episode_id or "").strip()
             matching = [
                 row for row in rows
@@ -4454,8 +3605,16 @@ class PlanReviewDialog(ui.dialog):
         else:
             notify("特别篇决定无效", type="negative")
             return
+        if self.task_decision.content_selection is not None:
+            from .tv_content_actions import revise
+            return await await_result(revise(self, expected_fingerprint=PlanStore.fingerprint(self.plan),
+                expected_revision=self.task_decision.revision, mode='special',
+                edit={'entry_id': str(identifier), 'action': action,
+                      'provider_episode_id': decision.get('provider_episode_id')},
+                notify=notify, message=('已保留为本季附加内容，目标在 Extras；仍需审核批准，尚未执行。'
+                    if action == 'unmatched_extra' else '特别篇归属已确认；视频与关联字幕、音轨已一并更新，尚未执行。')))
         try:
-            revised = self.review_service.apply_provider_special_decision(
+            revised = await ui_disk_call(self.review_service.apply_provider_special_decision,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 str(identifier),
@@ -4469,7 +3628,7 @@ class PlanReviewDialog(ui.dialog):
             )
             decisions = dict(self.task_decision.provider_special_decisions)
             decisions[str(identifier)] = decision
-            self.task_decision, projected = self.decision_command_service.update(
+            self.task_decision, projected = await ui_disk_call(self.decision_command_service.update,
                 self.plan.task_id,
                 expected_revision=self.task_decision.revision,
                 changes={"provider_special_decisions": decisions},
@@ -4481,14 +3640,16 @@ class PlanReviewDialog(ui.dialog):
         except (DecisionStateError, PlanReviewError, TypeError, ValueError) as exc:
             notify(localize_plan_term(exc), type="negative")
             return
-        self._adopt_revision(projected)
+        await await_result(self._adopt_revision(projected))
         notify(
             "已归入特别篇" if action == "confirmed_official_special"
             else "已保留为附加内容",
             type="positive",
         )
 
-    def _rebuild_inventory_role(self, identifier: object, role: str) -> None:
+    async def _rebuild_inventory_role(self, identifier: object, role: str) -> None:
+        if role == 'extra' and self.plan.metadata.get('content_selection') is not None:
+            return await await_result(self._open_content_exclusion((identifier,)))
         if not identifier:
             notify("请先选择待确认文件", type="warning")
             return
@@ -4500,9 +3661,14 @@ class PlanReviewDialog(ui.dialog):
             notify("此旧任务尚无权威决策状态，请先重新识别", type="warning")
             return
         try:
-            if not self.plan.presentation_groups or self.plan.presentation_groups[0].kind != "tv_episodes":
-                raise PlanReviewError("当前用途修正只适用于按季和集整理")
-            revised = self.review_service.recomplete_inventory_with_role_decisions(
+            if self.task_decision.content_selection is not None and self.task_decision.layout_mode == 'tv_episodes':
+                from .tv_content_actions import revise
+                return await await_result(revise(self,
+                    expected_fingerprint=PlanStore.fingerprint(self.plan),
+                    expected_revision=self.task_decision.revision, mode='role',
+                    edit={'entry_id': str(identifier), 'role': role}, notify=notify,
+                    message='用途已确认；当前TV视频与配套资源已完整重建，尚未执行文件操作。'))
+            revised = await ui_disk_call(self.review_service.recomplete_inventory_with_role_decisions,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 decisions={str(identifier): role},
@@ -4511,7 +3677,7 @@ class PlanReviewDialog(ui.dialog):
             )
             roles = dict(self.task_decision.manual_role_decisions)
             roles[str(identifier)] = role
-            self.task_decision, projected = self.decision_command_service.update(
+            self.task_decision, projected = await ui_disk_call(self.decision_command_service.update,
                 self.plan.task_id,
                 expected_revision=self.task_decision.revision,
                 changes={"manual_role_decisions": roles},
@@ -4524,10 +3690,12 @@ class PlanReviewDialog(ui.dialog):
         except (DecisionStateError, PlanReviewError, TypeError, ValueError) as exc:
             notify(localize_plan_term(exc), type="negative")
             return
-        self._adopt_revision(revised)
-        notify("用途已确认；正片、特典、字幕和目标已完整重建，尚未执行文件操作。")
+        await await_result(self._adopt_revision(revised))
+        notify("已设为正片候选；请在电影版本入口明确选择版本与保留范围，尚未执行。"
+               if role == 'main_candidate' and any(g.kind == 'movie_continuous' for g in revised.presentation_groups)
+               else "用途已确认；正片、特典、字幕和目标已完整重建，尚未执行文件操作。")
 
-    def _save_asset_owner_inline(self, identifier: object, owner: object) -> None:
+    async def _save_asset_owner_inline(self, identifier: object, owner: object) -> None:
         if not identifier or not owner:
             notify("请先选择待修正文件和归属版本", type="warning")
             return
@@ -4537,7 +3705,7 @@ class PlanReviewDialog(ui.dialog):
             return
         asset = matching[0].presentation_asset
         try:
-            revised = self.review_service.revise_presentation_asset(
+            revised = await ui_disk_call(self.review_service.revise_presentation_asset,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 str(identifier),
@@ -4550,199 +3718,20 @@ class PlanReviewDialog(ui.dialog):
         except (PlanReviewError, ValueError) as exc:
             notify(localize_plan_term(exc), type="negative")
             return
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         notify("资源归属已保存为新版整理计划；尚未执行文件操作", type="positive")
 
-    def _ignore_entry_inline(self, identifier: object) -> None:
+    async def _ignore_entry_inline(self, identifier: object) -> None:
         if not identifier:
             notify("请先选择待修正文件", type="warning")
             return
         self.selected_ids = {str(identifier)}
-        self._ignore_selected_entry()
+        await self._ignore_selected_entry()
 
-    def _render_toolbar(self) -> None:
-        with ui.row().classes("w-full items-center gap-3 flex-wrap"):
-            ui.input(
-                "搜索文件名或路径",
-                on_change=lambda event: self._set_query(event.value),
-            ).props("clearable dense outlined").classes("grow")
-            ui.toggle(
-                {"all": "全部文件", "issues": "仅问题文件"},
-                value="all",
-                on_change=lambda event: self._set_view_mode(event.value),
-            ).props(f"dense {SECONDARY_TOGGLE_PROPS}").classes(
-                "bar-equal-filter-toggle"
-            )
-            self.selection_label = ui.label("已选择 0 项").classes("bar-help")
-
-    def _render_entries(self) -> None:
-        self.entries_container.clear()
-        approved = set(self.decision.approved_entry_ids)
-        rows = filter_plan_rows(
-            self.snapshot.rows,
-            self.query,
-            self.review_only,
-            subtitle_only=self.subtitle_only,
-            unresolved_only=self.unresolved_only,
-            conflict_only=self.conflict_only,
-            unknown_only=self.unknown_only,
-            language=self.language_filter,
-            flag=self.flag_filter,
-        )
-        if self.view_mode == "issues":
-            rows = [row for row in rows if row.get("execution_blocked")]
-        page_count = max(1, (len(rows) + REVIEW_PAGE_SIZE - 1) // REVIEW_PAGE_SIZE)
-        self.page = min(max(1, self.page), page_count)
-        start = (self.page - 1) * REVIEW_PAGE_SIZE
-        visible_rows = rows[start:start + REVIEW_PAGE_SIZE]
-        with self.entries_container:
-            if not rows:
-                with ui.column().classes("bar-empty-state w-full items-center"):
-                    ui.icon("search_off", size="38px").classes("bar-muted")
-                    ui.label("没有符合当前筛选条件的条目")
-                return
-            with ui.row().classes("w-full items-center justify-between gap-3"):
-                ui.label(
-                    f"共 {len(rows)} 个文件；当前显示 {start + 1}–"
-                    f"{start + len(visible_rows)}"
-                ).classes("bar-help")
-                if page_count > 1:
-                    with ui.row().classes("items-center gap-1"):
-                        previous = ui.button(
-                            icon="chevron_left",
-                            on_click=lambda: self._change_page(-1),
-                        ).props("flat dense round")
-                        if self.page == 1:
-                            previous.disable()
-                        ui.label(f"{self.page} / {page_count}").classes("bar-help")
-                        following = ui.button(
-                            icon="chevron_right",
-                            on_click=lambda: self._change_page(1),
-                        ).props("flat dense round")
-                        if self.page == page_count:
-                            following.disable()
-            for row in visible_rows:
-                self._render_entry(row, str(row["entry_id"]) in approved)
-
-    def _render_entry(self, row: Dict[str, object], approved: bool) -> None:
-        identifier = str(row["entry_id"])
-        is_inventory_draft = (
-            str(self.plan.metadata.get("mapping_source") or "")
-            == "inventory_review_draft"
-        )
-        review_class = (
-            " bar-review-entry-review"
-            if row.get("requires_review") and not is_inventory_draft else ""
-        )
-        if row.get("execution_blocked") and not is_inventory_draft:
-            review_class += " bar-review-entry-blocked"
-        with ui.card().classes(
-            "bar-review-entry w-full" + review_class
-        ):
-            with ui.row().classes("w-full items-center gap-3 no-wrap"):
-                checkbox = ui.checkbox(
-                    value=identifier in self.selected_ids,
-                    on_change=lambda event, eid=identifier: self._toggle_selected(
-                        eid, event.value
-                    ),
-                ).props("color=red-6")
-                if is_inventory_draft:
-                    checkbox.disable()
-                    checkbox.tooltip("请先使用上方“整理计划”，无需逐文件处理占位草案")
-                elif row.get("execution_blocked"):
-                    checkbox.tooltip("可选中后结构化修正；普通批准不能越过此阻断")
-                with ui.column().classes("grow min-w-0 gap-2"):
-                    with ui.row().classes("items-center gap-2 flex-wrap"):
-                        ui.label(f"#{row['id']}").classes("font-bold")
-                        ui.label(_file_name(row["source"])).classes(
-                            "bar-review-file-name"
-                        )
-                        ui.badge(
-                            MEDIA_LABELS.get(
-                                str(row.get("media_kind")),
-                                str(row.get("media_kind")),
-                            ),
-                            color="blue-7",
-                        ).props("outline")
-                        ui.badge(
-                            ROLE_LABELS.get(
-                                str(row.get("role")), str(row.get("role"))
-                            ),
-                            color="grey-7",
-                        ).props("outline")
-                        if row.get("season") is not None:
-                            ui.label(f"第 {row['season']} 季").classes("bar-meta-chip")
-                        if row.get("episode") is not None:
-                            ui.label(f"第 {row['episode']} 集").classes("bar-meta-chip")
-                        if is_inventory_draft:
-                            ui.badge("等待整包完成", color="blue-7")
-                        elif row.get("requires_review"):
-                            ui.badge("需要确认", color="orange-8")
-                        if row.get("execution_blocked") and not is_inventory_draft:
-                            ui.badge("阻断执行", color="red-7")
-                        if approved:
-                            ui.badge("已批准 · 未执行", color="green-7")
-                        if row.get("presentation_group"):
-                            ui.badge(
-                                str(
-                                    row.get("presentation_group_label")
-                                    or row["presentation_group"]
-                                ),
-                                color="purple-7",
-                            ).props("outline")
-                        if row.get("asset_role"):
-                            ui.badge(
-                                ROLE_LABELS.get(
-                                    str(row["asset_role"]), str(row["asset_role"])
-                                ),
-                                color="teal-7",
-                            ).props("outline")
-                    if row.get("issue_codes") and not is_inventory_draft:
-                        ui.label(
-                            "此文件：" + "、".join(row["issue_codes"])
-                        ).classes("bar-review-file-issue")
-                    with ui.expansion("查看路径与识别详情", icon="expand_more").classes(
-                        "bar-entry-detail w-full"
-                    ):
-                        with ui.column().classes("w-full gap-2"):
-                            ui.label("源文件").classes("bar-field-label")
-                            ui.label(str(row["source"])).classes("bar-path-box w-full")
-                            ui.label("建议目标").classes("bar-field-label")
-                            ui.label(
-                                "完成整包后生成"
-                                if is_inventory_draft else str(row["target"])
-                            ).classes("bar-path-box w-full")
-                            if row.get("evidence"):
-                                ui.label(
-                                    "判断依据：" + str(row["evidence"])
-                                ).classes("bar-evidence")
-                            if row.get("version_ref"):
-                                ui.label(
-                                    f"版本：{row.get('version_label') or '默认单版本'} · "
-                                    f"{row.get('version_ref')}"
-                                ).classes("bar-evidence font-mono")
-                            if row.get("media_kind") == "subtitle" and not is_inventory_draft:
-                                with ui.column().classes("bar-subtitle-contract w-full gap-1"):
-                                    ui.label(
-                                        f"原始标签：{row.get('raw_label') or '空'} · "
-                                        f"关联：{row.get('association_state')} · "
-                                        f"解析：{row.get('parse_state')}"
-                                    ).classes("bar-evidence")
-                                    ui.label(
-                                        "语言："
-                                        f"{row.get('primary_language') or '未定'}"
-                                        f"-{row.get('script') or '?'} · "
-                                        f"附加：{', '.join(row.get('additional_languages', ())) or '无'} · "
-                                        f"flags：{', '.join(row.get('flags', ())) or '无'}"
-                                    ).classes("bar-evidence")
-                                    if row.get("unknown_tokens"):
-                                        ui.label(
-                                            "未知 token：" + ", ".join(row["unknown_tokens"])
-                                        ).classes("bar-error-text")
 
     def _render_presentation_override(self) -> None:
         with ui.expansion(
-            "呈现分组与版本 · 结构化修正", icon="movie_filter"
+            "呈现分组与版本 · 结构化修正", icon='o_movie_filter'
         ).classes("w-full"):
             with ui.column().classes("w-full gap-3"):
                 ui.label("建立或更新呈现分组").classes("text-subtitle2")
@@ -4784,7 +3773,7 @@ class PlanReviewDialog(ui.dialog):
                 ui.button(
                     "保存呈现分组",
                     on_click=self._save_presentation_group,
-                    icon="create_new_folder",
+                    icon='o_create_new_folder',
                 ).props("outline color=purple-7")
                 ui.separator()
                 ui.label(
@@ -4843,12 +3832,12 @@ class PlanReviewDialog(ui.dialog):
                     "不会自动改成所有版本通用。"
                 ).classes("bar-help")
                 ui.label(
-                    "单版本默认项可把下面四项全部留空；非默认版本必须完整填写。"
+                    "电影请使用上方“电影正片版本编辑”；下面规格字段用于分集呈现确认。"
                 ).classes("bar-help")
                 ui.label(
                     "电影连续版的正片目标文件名由作品目录和版本信息自动生成。"
                     "保存这里的版本决定时，会替换此前填写的手工目标路径；"
-                    "要区分电影版本，请修改下面的版本信息。"
+                    "要区分电影版本，请在电影版本列表编辑标签。"
                 ).classes("bar-help text-orange-8")
                 with ui.row().classes("w-full gap-3 flex-wrap"):
                     self.presentation_edition_key = ui.input(
@@ -4866,6 +3855,10 @@ class PlanReviewDialog(ui.dialog):
                     self.presentation_audio = ui.input(
                         "关键音频（如 FLAC 2.0）"
                     ).props("outlined dense").classes("grow")
+                if {g.kind for g in self.plan.presentation_groups} == {'movie_continuous'}:
+                    for control in (self.presentation_edition_key, self.presentation_edition_label,
+                                    self.presentation_resolution, self.presentation_dynamic_range, self.presentation_audio):
+                        control.set_visibility(False)
                 self.presentation_reason = ui.input(
                     "人工确认理由（必填）"
                 ).props("outlined dense").classes("w-full")
@@ -4873,19 +3866,22 @@ class PlanReviewDialog(ui.dialog):
                     ui.button(
                         "保存呈现资产决定",
                         on_click=self._save_presentation_asset,
-                        icon="save_as",
+                        icon='o_save_as',
                     ).props("outline color=purple-7").classes("grow")
                     ui.button(
                         "本次不整理所选文件",
                         on_click=self._ignore_selected_entry,
-                        icon="do_not_disturb",
+                        icon='o_do_not_disturb',
                     ).props("outline color=grey-7").classes("grow")
+                    render_cross_work_partition_action(
+                        self._partition_selected_as_cross_work
+                    )
 
-    def _save_presentation_group(self) -> None:
+    async def _save_presentation_group(self) -> None:
         year_value = self.group_provider_year_input.value
         try:
             provider_year = int(year_value) if year_value not in (None, "") else None
-            revised = self.review_service.upsert_presentation_group(
+            revised = await ui_disk_call(self.review_service.upsert_presentation_group,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 group_id=self.group_id_input.value,
@@ -4901,16 +3897,16 @@ class PlanReviewDialog(ui.dialog):
         except (PlanReviewError, TypeError, ValueError) as exc:
             notify(localize_plan_term(exc))
             return
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         notify("呈现分组已保存为新版整理计划；重新打开整理任务可刷新分组选项。")
 
-    def _save_presentation_asset(self) -> None:
+    async def _save_presentation_asset(self) -> None:
         if len(self.selected_ids) != 1:
             notify("呈现资产决定必须且只能选择一条记录")
             return
         selected_id = next(iter(self.selected_ids))
         try:
-            revised = self.review_service.revise_presentation_asset(
+            revised = await ui_disk_call(self.review_service.revise_presentation_asset,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 selected_id,
@@ -4929,17 +3925,20 @@ class PlanReviewDialog(ui.dialog):
         except (PlanReviewError, ValueError) as exc:
             notify(localize_plan_term(exc))
             return
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         notify(
             "已保存新版整理计划并清空旧批准；结构仍有阻断时可继续逐项修正。"
         )
 
-    def _ignore_selected_entry(self) -> None:
+    async def _ignore_selected_entry(self) -> None:
+        if self.plan.metadata.get('content_selection') is not None:
+            from .content_review_view import open_content_workbench
+            return await await_result(open_content_workbench(self, ui=ui, notify=notify))
         if len(self.selected_ids) != 1:
             notify("不整理决定必须且只能选择一条记录")
             return
         try:
-            revised = self.review_service.ignore_plan_entry(
+            revised = await ui_disk_call(self.review_service.ignore_plan_entry,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 next(iter(self.selected_ids)),
@@ -4948,13 +3947,16 @@ class PlanReviewDialog(ui.dialog):
         except (PlanReviewError, ValueError) as exc:
             notify(localize_plan_term(exc))
             return
-        self._adopt_revision(revised)
+        await await_result(self._adopt_revision(revised))
         notify("所选源文件保持不变，本次整理计划将不处理它。")
+
+    async def _partition_selected_as_cross_work(self) -> None:
+        await self._open_selected_source_regrouping(tuple(sorted(self.selected_ids)))
 
     def _render_override(self) -> None:
         with ui.expansion(
             f"人工覆盖目标 · 生成新版{RENAME_PLAN_TERM}，不执行",
-            icon="edit_note",
+            icon='o_edit_note',
         ).classes("w-full"):
             with ui.column().classes("w-full gap-3"):
                 ui.label("先在上方选择且仅选择一条记录。" ).classes("bar-help")
@@ -4975,184 +3977,66 @@ class PlanReviewDialog(ui.dialog):
                 ui.button(
                     f"保存为新版{RENAME_PLAN_TERM}",
                     on_click=self._override_selected,
-                    icon="save_as",
+                    icon='o_save_as',
                 ).props("outline color=blue-7")
 
-    def _render_subtitle_override(self) -> None:
-        with ui.expansion(
-            "字幕结构化决定 · 自动生成唯一目标", icon="subtitles"
-        ).classes("w-full"):
-            with ui.column().classes("w-full gap-3"):
-                ui.label(
-                    "选择一条字幕记录。这里只修改语言、标题、flags 和未知 token 处置，"
-                    "父目录、视频 stem 与字幕格式由服务端锁定。"
-                ).classes("bar-help")
-                scope_options = {"file": "仅本文件"}
-                if self.plan.series_scope is not None:
-                    scope_options["series"] = (
-                        f"当前系列（仅当前{RENAME_PLAN_TERM}精确匹配）"
-                    )
-                self.subtitle_rule_scope = ui.select(
-                    scope_options,
-                    value="file",
-                    label="规则作用域",
-                ).props("outlined dense options-dense").classes("w-full")
-                if self.plan.series_scope is None:
-                    ui.label(
-                        f"当前{RENAME_PLAN_TERM}缺少稳定 TMDB TV 身份，"
-                        "因此禁用“当前系列”；"
-                        "不会用目录名或作品名猜测系列。"
-                    ).classes("bar-help text-orange-8")
-                else:
-                    identity = self.plan.series_scope
-                    ui.label(
-                        f"系列身份：{identity.provider_namespace.upper()} "
-                        f"{identity.provider_media_type.upper()} #{identity.provider_id}；"
-                        f"系列规则只作用于当前{RENAME_PLAN_TERM}，"
-                        "不会用于未来任务。"
-                    ).classes("bar-help")
-                video_options = {
-                    str(entry.source_path): str(entry.source_path)
-                    for entry in self.plan.entries if entry.media_kind == "video"
-                }
-                self.subtitle_video = ui.select(
-                    video_options, label="关联视频源文件"
-                ).props("outlined dense options-dense").classes("w-full")
-                self.subtitle_rule_scope.on_value_change(
-                    lambda event: self._subtitle_scope_changed(event.value)
-                )
-                with ui.row().classes("w-full gap-3 flex-wrap"):
-                    self.subtitle_language = ui.select(
-                        {"zh": "中文", "ja": "日语", "en": "英语", "ko": "韩语", "hi": "印地语"},
-                        label="主语言",
-                    ).props("outlined dense").classes("w-40")
-                    self.subtitle_script = ui.select(
-                        {None: "不适用", "Hans": "简体 Hans", "Hant": "繁体 Hant"},
-                        value=None,
-                        label="文字体系",
-                    ).props("outlined dense").classes("w-40")
-                    self.subtitle_region = ui.select(
-                        {None: "不指定", "CN": "CN", "TW": "TW", "HK": "HK", "JP": "JP"},
-                        value=None,
-                        label="地区提示",
-                    ).props("outlined dense").classes("w-40")
-                self.subtitle_additional = ui.input(
-                    "附加语言（逗号分隔，如 ja,en）"
-                ).props("outlined dense").classes("w-full")
-                self.subtitle_titles = ui.input(
-                    "轨道标题 token（逗号分隔，顺序保留）"
-                ).props("outlined dense").classes("w-full")
-                self.subtitle_flags = ui.select(
-                    ["default", "forced", "sdh"],
-                    multiple=True,
-                    label="flags（输出固定排序）",
-                ).props("outlined dense use-chips").classes("w-full")
-                self.subtitle_preserve_unknown = ui.input(
-                    "保留为标题的未知 token（逗号分隔）"
-                ).props("outlined dense").classes("w-full")
-                self.subtitle_discard_unknown = ui.input(
-                    "明确删除的未知 token（逗号分隔）"
-                ).props("outlined dense").classes("w-full")
-                self.subtitle_reason = ui.input("人工决定理由（必填）").props(
-                    "outlined dense"
-                ).classes("w-full")
-                ui.label(
-                    "保存会生成新 fingerprint、清空旧批准并重新运行 Verifier；"
-                    "任何未知 token 未处置都会拒绝保存。"
-                ).classes("bar-help text-orange-8")
-                ui.button(
-                    "保存字幕结构化决定",
-                    on_click=self._override_subtitle_selected,
-                    icon="save_as",
-                ).props("outline color=blue-7")
-                self.subtitle_rule_audit_container = ui.column().classes(
-                    "w-full gap-2"
-                )
-                self._render_subtitle_rule_audit()
-
-    def _subtitle_scope_changed(self, value: object) -> None:
-        series = str(value) == SubtitleOverrideScope.SERIES.value
-        self.subtitle_video.disable() if series else self.subtitle_video.enable()
-        if series:
-            self.subtitle_video.tooltip(
-                "系列规则不会传播关联视频；每条字幕保留自己的已确认视频"
-            )
-
-    def _render_subtitle_rule_audit(self) -> None:
-        container = getattr(self, "subtitle_rule_audit_container", None)
-        if container is None:
-            return
-        container.clear()
-        with container:
-            if not self.plan.subtitle_override_rules:
-                return
-            ui.separator()
-            ui.label(f"已应用字幕规则（撤销也会生成新版{RENAME_PLAN_TERM}）").classes(
-                "text-subtitle2"
-            )
-            self.subtitle_revert_reason = ui.input(
-                "撤销理由（必填）"
-            ).props("outlined dense").classes("w-full")
-            latest_id = self.plan.subtitle_override_rules[-1].rule_id
-            for rule in reversed(self.plan.subtitle_override_rules):
-                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-                    ui.label(
-                        f"{rule.scope.value} · {rule.rule_fingerprint[:12]}… · "
-                        f"engine {rule.engine_version} · {rule.reason}"
-                    ).classes("bar-help font-mono")
-                    button = ui.button(
-                        "撤销" if rule.rule_id == latest_id else "历史规则",
-                        on_click=partial(self._revert_subtitle_rule, rule.rule_id),
-                        icon="undo" if rule.rule_id == latest_id else "history",
-                    ).props("flat dense color=orange-8")
-                    if rule.rule_id != latest_id:
-                        button.disable()
-
-    def _render_actions(self) -> None:
+    def render_actions(self) -> None:
+        unresolved = self.plan is None or self._replacement_unfinished() or self.plan.metadata.get('pending_work_affiliation') is not None
         with ui.row().classes(
-            "bar-dialog-actions w-full items-center justify-between gap-3"
+            "bar-plan-actions bar-modal-footer w-full items-center gap-3"
         ):
-            ui.button(
-                "导出 JSON", on_click=self._download, icon="download"
-            ).props("flat color=grey-8")
-            with ui.row().classes("gap-2 flex-wrap justify-end"):
-                self.approve_selected_button = ui.button(
-                    "批准所选 · 不执行",
-                    on_click=self._approve_selected,
-                    icon="done_all",
-                ).props("outline color=orange-8")
+            with ui.row().classes("w-full gap-2 flex-wrap items-center"):
+                ui.button('安全结束任务', on_click=self._safe_end, icon='o_delete').classes('bar-review-action').props('color=red-7')
+                if unresolved:
+                    self._render_close_action()
+                    return
                 self.approve_all_button = ui.button(
-                    "批准全部 · 不执行",
-                    on_click=self._approve_all,
-                    icon="verified",
-                ).props("color=green-7")
-                if not can_approve_plan(self.snapshot.plan_status):
-                    self.approve_selected_button.disable()
+                    "批准整理计划",
+                    on_click=None if unresolved else self._approve_all,
+                    icon='o_verified',
+                ).classes("bar-review-action").props("color=amber-7 text-color=white")
+                if unresolved or not can_approve_plan(self.snapshot.plan_status):
                     self.approve_all_button.disable()
                 self.execute_button = ui.button(
-                    f"执行已批准的{RENAME_PLAN_TERM}",
-                    on_click=self._confirm_execute,
-                    icon="play_arrow",
-                ).props("color=red-7")
-                if not can_execute_approved_plan(
+                    f"执行{RENAME_PLAN_TERM}",
+                    on_click=None if unresolved else self._confirm_execute,
+                    icon='o_play_arrow',
+                ).classes("bar-review-action").props("color=green-7")
+                if unresolved or not can_execute_approved_plan(
                     self.decision.status,
                     str(self.task_data.get("workflow_status")),
-                    test_mode=is_ui_test_mode(),
                     preview_only=bool(self.task_data.get("preview_only")),
+                    execution_policy=self.plan.execution_policy,
                 ):
                     self.execute_button.disable()
-                if is_ui_test_mode():
-                    self.execute_button.tooltip("GUI 测试模式禁止文件执行")
-                ui.button("关闭", on_click=self._close_review, icon="close").props(
-                    "flat color=grey-8"
-                )
+                if (
+                    not unresolved and self.plan.execution_policy is not None and self.plan.execution_policy.dry_run
+                ):
+                    self.execute_button.tooltip(
+                        plan_execution_contract.DRY_RUN_PLAN_RETRY_MESSAGE
+                    )
+                self._render_close_action()
+
+    def _render_close_action(self):
+        ui.button('关闭', on_click=self._close_review, icon='o_close').props(
+            'flat color=grey-8').classes('bar-review-action ml-auto')
+
+    async def _confirm_source_group(self):
+        try:
+            await task_queue.confirm_source_group(self.task_id, opened_evidence=self.retry_open_evidence)
+        except (ValueError, RuntimeError, OSError) as exc:
+            notify(f'无法继续识别：{exc}', type='negative')
+            return
+        self._close_review()
+        from .data_table_page import show_task_queue
+        show_task_queue(self.client)
 
     def _refresh_execute_button(self) -> None:
         enabled = can_execute_approved_plan(
             self.decision.status,
             str(self.task_data.get("workflow_status")),
-            test_mode=is_ui_test_mode(),
             preview_only=bool(self.task_data.get("preview_only")),
+            execution_policy=self.plan.execution_policy,
         )
         self.execute_button.enable() if enabled else self.execute_button.disable()
 
@@ -5160,13 +4044,23 @@ class PlanReviewDialog(ui.dialog):
         if not can_execute_approved_plan(
             self.decision.status,
             str(self.task_data.get("workflow_status")),
-            test_mode=is_ui_test_mode(),
             preview_only=bool(self.task_data.get("preview_only")),
+            execution_policy=self.plan.execution_policy,
         ):
-            notify("只有当前版本全部批准后才能执行", type="warning")
+            if (
+                self.plan.execution_policy is not None
+                and self.plan.execution_policy.dry_run
+            ):
+                notify(
+                    plan_execution_contract.DRY_RUN_PLAN_RETRY_MESSAGE,
+                    type="warning",
+                )
+            else:
+                notify("只有当前版本全部批准后才能执行", type="warning")
             return
         fingerprint = PlanStore.fingerprint(self.plan)
-        with ui.dialog() as confirm, ui.card().classes("bar-dialog max-w-lg"):
+        from .queue_confirmation import QueueConfirmation
+        with ui.dialog().props('persistent') as confirm, dialog_card().classes("scroll bar-dialog max-w-lg"):
             ui.label(f"确认执行已批准的{RENAME_PLAN_TERM}？").classes(
                 "bar-dialog-title"
             )
@@ -5178,49 +4072,46 @@ class PlanReviewDialog(ui.dialog):
             ui.label(f"版本标识：{fingerprint[:16]}…").classes(
                 "font-mono bar-help"
             )
-            with ui.row().classes("w-full justify-end gap-2"):
-                ui.button("取消", on_click=confirm.close).props("flat")
-                ui.button(
+            message = ui.label('确认后先进行后台校验，校验通过才会入队。').classes('bar-help')
+            progress = bar_progress(ui)
+            progress.set_visibility(False)
+            confirm.queue_confirmation = QueueConfirmation(confirm, message, progress)
+            with ui.row().classes("w-full justify-end gap-2").classes('bar-modal-footer'):
+                ui.button("取消", on_click=confirm.queue_confirmation.cancel, icon='o_close').props("flat")
+                confirm.queue_confirmation.button = ui.button(
                     "确认入队执行",
                     on_click=partial(
                         self._queue_execution, confirm, fingerprint
                     ),
-                    icon="play_arrow",
+                    icon='o_play_arrow',
                 ).props("color=red-7")
         confirm.open()
 
     async def _queue_execution(self, confirm: ui.dialog, fingerprint: str) -> None:
-        confirm.close()
-        try:
-            await task_queue.enqueue_approved(self.plan.task_id, fingerprint)
-        except PlanExecutionError as exc:
-            notify(localize_plan_term(exc), type="negative")
+        from .queue_confirmation import QueueConfirmation
+        if getattr(confirm, 'queue_confirmation', None) is None:
+            confirm.queue_confirmation = QueueConfirmation(confirm)
+
+        if confirm.queue_confirmation.closed:
             return
-        self.task_data = get_task(self.plan.task_id)
-        self._refresh_execute_button()
-        notify(
-            f"已批准的{RENAME_PLAN_TERM} {fingerprint[:12]} 已加入执行队列",
-            type="positive",
-        )
+        from .execution_wait import submit
+        try:
+            submit(task_queue, self.plan.task_id, fingerprint)
+        except (ValueError, RuntimeError) as exc:
+            notify(str(exc), type='warning')
+            return
+        confirm.queue_confirmation.closed = True
+        confirm.close()
         self._close_review()
+
+    async def _safe_end(self) -> None:
+        from .data_table_page import _confirm_safe_end
+        await _confirm_safe_end(self.task_id, on_success=self._close_review)
 
     def _close_review(self) -> None:
         self.exit_requested = True
         self.close()
 
-    def _set_query(self, value: str) -> None:
-        self.query = value or ""
-        self.page = 1
-        self._render_entries()
-
-    def _set_view_mode(self, value: object) -> None:
-        self.view_mode = "issues" if str(value) == "issues" else "all"
-        self.page = 1
-        self._render_entries()
-
-    def _change_page(self, delta: int) -> None:
-        self.page = max(1, self.page + int(delta))
-        self._render_entries()
 
     def _set_review_only(self, value: bool) -> None:
         self.review_only = bool(value)
@@ -5231,128 +4122,105 @@ class PlanReviewDialog(ui.dialog):
         self._render_entries()
 
     def _toggle_selected(self, identifier: str, selected: bool) -> None:
+        if identifier not in {entry_id(entry) for entry in self.plan.entries}:
+            return
         if selected:
             self.selected_ids.add(identifier)
         else:
             self.selected_ids.discard(identifier)
         self.selection_label.text = f"已选择 {len(self.selected_ids)} 项"
 
-    def _download(self) -> None:
-        ui.download.content(
-            export_plan_json(self.plan),
-            filename=f"{self.plan.task_id}.plan.json",
-            media_type="application/json",
-        )
-
-    def _approve_selected(self) -> None:
+    async def _approve_selected(self) -> None:
         if not self.selected_ids:
             notify("请先选择要批准的条目")
             return
-        self._approve(tuple(self.selected_ids))
+        await self._approve(tuple(self.selected_ids))
 
-    def _approve_all(self) -> None:
-        self._approve(
-            tuple(str(row["entry_id"]) for row in self.snapshot.rows)
-        )
+    async def _approve_all(self) -> None:
+        await self._approve(tuple(entry_id(entry) for entry in self.plan.entries))
 
-    def _approve(self, selected_ids: Tuple[str, ...]) -> None:
+    async def _approve(self, selected_ids: Tuple[str, ...]) -> None:
+        from ..rename.plan_review import ApprovalTaskContext
+        from ..utils.utils import read_task_at
+        from .tv_content_actions import run_revision, revision_progress
+        state = self.task_decision
+        if state is None:
+            notify('当前计划缺少决定记录，仅供只读查看；请重新生成。', type='warning')
+            return
         fingerprint = PlanStore.fingerprint(self.plan)
-        dialog_disposition = self.task_data.get(
-            "execution_recovery_disposition"
-        )
-        dialog_workflow = self.task_data.get("workflow_status")
-        current_task = get_task(self.plan.task_id)
-        current_disposition = current_task.get(
-            "execution_recovery_disposition"
-        )
-        reapproval_context = dialog_disposition == "reapproval_required"
-        if (
-            not current_task
-            or current_disposition != dialog_disposition
-            or current_task.get("workflow_status") != dialog_workflow
-            or (
-                reapproval_context
-                and (
-                    not requires_execution_reapproval(current_task)
-                    or current_task.get("execution_requested_fingerprint")
-                    != fingerprint
-                )
-            )
-        ):
-            notify("任务状态或整理版本已变化，请刷新后重新审核")
-            return
-        self.task_data = current_task
-        try:
-            self.decision = self.review_service.approve_entries(
-                self.plan.task_id,
-                fingerprint,
-                selected_ids,
-            )
-        except PlanReviewError as exc:
-            notify(localize_plan_term(exc))
-            return
-        self.review_badge.text = REVIEW_STATUS_LABELS[self.decision.status]
-        self._refresh_plan_header()
-        self._render_entries()
-        if self.decision.status == ReviewStatus.APPROVED:
-            def approve_current(payload: dict) -> dict:
-                if (
-                    payload.get("workflow_status") != dialog_workflow
-                    or payload.get("execution_recovery_disposition")
-                    != dialog_disposition
-                ):
-                    raise ValueError("任务状态已变化")
-                if reapproval_context and (
-                    not requires_execution_reapproval(payload)
-                    or payload.get("execution_requested_fingerprint")
-                    != fingerprint
-                ):
-                    raise ValueError("整理版本或核查状态已变化")
-                payload["workflow_status"] = "approved"
-                if reapproval_context:
-                    payload.update(
-                        {
-                            "execution_reapproval_fingerprint": fingerprint,
-                            "execution_recovery_disposition": None,
-                            "execution_requires_manual_check": False,
-                        }
-                    )
-                return payload
+        context = ApprovalTaskContext(state.revision, DecisionStateStore.fingerprint(state),
+            self.task_data.get('workflow_status'), self.task_data.get('execution_recovery_disposition'))
+        service, task_id = self.review_service, self.plan.task_id
+        result = {}
 
-            try:
-                updated = mutate_task(self.plan.task_id, approve_current)
-            except (OSError, RuntimeError, TypeError, ValueError):
-                notify("任务状态或整理版本已变化，请刷新后重新审核")
-                self.task_data = get_task(self.plan.task_id)
-                self._refresh_execute_button()
-                return
-            if updated is None:
-                notify("任务状态或整理版本已变化，请刷新后重新审核")
-                self.task_data = get_task(self.plan.task_id)
-                self._refresh_execute_button()
-                return
-            self.task_data = updated
-            notify(f"当前{RENAME_PLAN_TERM}已全部批准；尚未执行任何文件操作")
-        else:
-            notify(
-                f"已记录 {len(self.decision.approved_entry_ids)} 条批准；"
-                "尚未执行任何文件操作"
-            )
-        self._refresh_execute_button()
+        def submit():
+            result['decision'] = service.approve_entries(
+                task_id, fingerprint, selected_ids, task_context=context)
+            result['task'] = read_task_at(service.task_root, task_id)
+            return service.plan_store.load(task_id)
 
-    def _adopt_revision(self, revised: RenamePlan) -> None:
-        self.plan = revised
-        self.snapshot = build_plan_review_snapshot(revised)
-        self.decision = self.review_service.load_or_create(revised)
-        self.task_data = get_task(self.plan.task_id) or self.task_data
+        def adopt(_plan):
+            # Only consume the worker's saved result; no UI-thread record reads.
+            self.decision = result['decision']
+            self.task_data = result['task']
+            self.review_badge.text = (completion_status(self.plan, self.task_data) or REVIEW_STATUS_LABELS[self.decision.status])
+            self._render_entries()
+            self._refresh_execute_button()
+
+        def finish():
+            enabled = can_approve_plan(self.snapshot.plan_status)
+            for button in (self.approve_all_button,):
+                button.enable() if enabled else button.disable()
+            self._refresh_execute_button()
+
+        if not revision_progress(self).running:
+            self.approve_all_button.disable()
+            self.execute_button.disable()
+        await run_revision(self, submit=submit, expected_revision=state.revision,
+            expected_fingerprint=fingerprint, notify=notify, adopt=adopt, on_finished=finish,
+            approval=True,
+            started_message='正在后台批准并核对文件状态；关闭窗口不影响本次保存。',
+            message='批准决定已保存；尚未执行任何文件操作。')
+
+    async def _adopt_revision(self, revised: RenamePlan) -> None:
+        from ..rename.review_operation import build_review_operation
+        before = self.plan
+        serial = getattr(self, '_display_serial', 0) + 1
+        self._display_serial = serial
+        snapshot, state, decision, task, catalog = await ui_disk_call(
+            _prepare_revision_display, revised, self.review_service, self.series_catalog,
+            self.catalog_detach_service, self.recovery_service, dict(self.task_data))
+        if (getattr(self, 'is_deleted', False) or getattr(self, 'exit_requested', False)
+                or getattr(self, '_tv_content_closed', False)
+                or getattr(self, '_tv_content_worker_disconnected', False)
+                or self._display_serial != serial or self.plan is not before):
+            raise ValueError('页面已关闭或已有后来修订，不采用过期的页面结果')
+        if not hasattr(self, 'selection_label') or self.plan.metadata.get('pending_work_affiliation') is not None:
+            self._load_plan_view(revised, snapshot=snapshot)
+            return
+        previous_operation, _ = build_review_operation(self.task_data)
+        self.plan, self.snapshot, self.task_decision = revised, snapshot, state
+        self.decision, self.task_data, self._catalog_display = decision, task, catalog
+        self._provider_presented = None
+        current_operation, _ = build_review_operation(self.task_data)
+        previous_context, current_context = previous_operation.context, current_operation.context
+        if (previous_context.get('kind') == 'provider_selection'
+                and previous_context.get('lifecycle') in {'failed', 'awaiting_user', 'awaiting_season'}
+                and current_context.get('lifecycle') == 'succeeded'
+                and current_context.get('request_id') == previous_context.get('request_id')
+                and current_context.get('result_plan_fingerprint') == PlanStore.fingerprint(revised)):
+            self.provider_selection_expanded = False
         self.selected_ids.clear()
         self.selection_label.text = "已选择 0 项"
-        self.review_badge.text = REVIEW_STATUS_LABELS[self.decision.status]
-        self.presentation_group.options = {
-            group.group_id: f"{group.display_name} ({group.kind})"
-            for group in revised.presentation_groups
-        }
-        self.presentation_group.update()
+        self.review_badge.text = (completion_status(self.plan, self.task_data) or REVIEW_STATUS_LABELS[self.decision.status])
+        # Current content pages do not construct the retired layout editor.
+        # Historical pages may still own it while adopting a migration.
+        if hasattr(self, 'presentation_group'):
+            self.presentation_group.options = {
+                group.group_id: f"{group.display_name} ({group.kind})"
+                for group in revised.presentation_groups
+            }
+            self.presentation_group.update()
         self._render_groups()
         self._render_catalog_context()
         self._render_completion_workflow()
@@ -5361,13 +4229,13 @@ class PlanReviewDialog(ui.dialog):
         self._render_entries()
         self._refresh_execute_button()
 
-    def _override_selected(self) -> None:
+    async def _override_selected(self) -> None:
         if len(self.selected_ids) != 1:
             notify("人工覆盖必须且只能选择一条记录")
             return
         selected_id = next(iter(self.selected_ids))
         try:
-            revised = self.review_service.override_target(
+            revised = await ui_disk_call(self.review_service.override_target,
                 self.plan.task_id,
                 PlanStore.fingerprint(self.plan),
                 selected_id,
@@ -5377,192 +4245,18 @@ class PlanReviewDialog(ui.dialog):
         except PlanReviewError as exc:
             notify(localize_plan_term(exc))
             return
-        self.plan = revised
-        self.snapshot = build_plan_review_snapshot(revised)
-        self.decision = self.review_service.load_or_create(revised)
-        self.task_data = get_task(self.plan.task_id) or self.task_data
-        self.review_badge.text = REVIEW_STATUS_LABELS[self.decision.status]
-        self._refresh_plan_header()
-        self.override_target.value = ""
-        self.override_reason.value = ""
-        self.selected_ids.clear()
-        self.selection_label.text = "已选择 0 项"
-        self._render_entries()
-        self._refresh_execute_button()
+        await self._adopt_revision(revised)
+        self.override_target.value = ''
+        self.override_reason.value = ''
         notify(
             f"已保存新版{RENAME_PLAN_TERM}并清空旧批准；"
             "请重新批准全部条目，"
             "尚未执行任何文件操作"
         )
 
-    def _override_subtitle_selected(self) -> None:
-        if len(self.selected_ids) != 1:
-            notify("字幕决定必须且只能选择一条记录")
-            return
-        selected_id = next(iter(self.selected_ids))
-        matching = [entry for entry in self.plan.entries if entry_id(entry) == selected_id]
-        if len(matching) != 1 or matching[0].subtitle is None:
-            notify("所选记录不是结构化字幕条目")
-            return
-        unknown_tokens = tuple(matching[0].subtitle.unknown_tokens)
-        preserve_values = _comma_values(self.subtitle_preserve_unknown.value)
-        discard_values = _comma_values(self.subtitle_discard_unknown.value)
-        if (
-            len(set(preserve_values)) != len(preserve_values)
-            or len(set(discard_values)) != len(discard_values)
-        ):
-            notify("未知 token 输入不能重复；请逐项保留其原始拼写")
-            return
-        preserve = set(preserve_values)
-        discard = set(discard_values)
-        if preserve & discard or preserve | discard != set(unknown_tokens):
-            notify("未知 token 必须恰好分配到保留或删除，且不能重复")
-            return
-        reason = str(self.subtitle_reason.value or "").strip()
-        dispositions = tuple(
-            UnknownTokenDisposition(
-                token,
-                UnknownTokenAction.PRESERVE_AS_TITLE
-                if token in preserve else UnknownTokenAction.DISCARD_MANUAL,
-                "" if token in preserve else reason,
-            )
-            for token in unknown_tokens
-        )
-        titles = list(_comma_values(self.subtitle_titles.value))
-        for token in matching[0].subtitle.unknown_tokens:
-            if token in preserve and token not in titles:
-                titles.append(token)
-        flags = tuple(
-            flag for flag in ("default", "forced", "sdh")
-            if flag in tuple(self.subtitle_flags.value or ())
-        )
-        arguments = {
-            "scope": SubtitleOverrideScope(self.subtitle_rule_scope.value),
-            "associated_video_source_path": self.subtitle_video.value,
-            "primary_language": self.subtitle_language.value,
-            "script": self.subtitle_script.value,
-            "region_hint": self.subtitle_region.value,
-            "additional_languages": _comma_values(self.subtitle_additional.value),
-            "track_title_tokens": tuple(titles),
-            "flags": flags,
-            "unknown_dispositions": dispositions,
-            "reason": reason,
-        }
-        if arguments["scope"] == SubtitleOverrideScope.SERIES:
-            self._preview_series_subtitle_override(selected_id, arguments)
-            return
-        self._save_subtitle_override(selected_id, arguments)
-
-    def _preview_series_subtitle_override(
-        self, selected_id: str, arguments: Dict[str, object]
-    ) -> None:
-        try:
-            preview = self.review_service.apply_subtitle_override_rule(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                selected_id,
-                **arguments,
-                _persist=False,
-            )
-        except PlanReviewError as exc:
-            notify(localize_plan_term(exc))
-            return
-        before = {entry_id(entry): entry for entry in self.plan.entries}
-        impacted = [
-            entry for entry in preview.entries
-            if entry_id(entry) in before
-            and entry.subtitle is not None
-            and preview.subtitle_override_rules
-            and entry.subtitle.applied_rule_id
-            == preview.subtitle_override_rules[-1].rule_id
-        ]
-        selected = before[selected_id]
-        raw_label = selected.subtitle.raw_label if selected.subtitle else ""
-        with ui.dialog() as dialog, ui.card().classes("bar-dialog max-w-3xl"):
-            ui.label("确认当前系列精确批量规则").classes("bar-dialog-title")
-            ui.label(
-                f"完整标签签名：{raw_label}；命中 {len(impacted)} 条。"
-                f"仅修改当前{RENAME_PLAN_TERM}，不会用于未来任务；"
-                "每条字幕保留自己的关联视频。"
-            ).classes("bar-muted")
-            with ui.scroll_area().classes("w-full max-h-96"):
-                for entry in impacted:
-                    original = before[entry_id(entry)]
-                    with ui.column().classes("w-full gap-0 mb-3"):
-                        ui.label(str(entry.source_path)).classes(
-                            "bar-help break-all"
-                        )
-                        ui.label(f"旧：{original.target_path}").classes(
-                            "bar-help break-all text-grey-7"
-                        )
-                        ui.label(f"新：{entry.target_path}").classes(
-                            "bar-help break-all text-blue-8"
-                        )
-            with ui.row().classes("w-full justify-end gap-2"):
-                ui.button("取消", on_click=dialog.close).props("flat")
-                ui.button(
-                    f"确认修改 {len(impacted)} 条并生成新版{RENAME_PLAN_TERM}",
-                    on_click=lambda: (
-                        dialog.close(),
-                        self._save_subtitle_override(selected_id, arguments),
-                    ),
-                    icon="rule",
-                ).props("color=orange-8")
-        dialog.open()
-
-    def _save_subtitle_override(
-        self, selected_id: str, arguments: Dict[str, object]
-    ) -> None:
-        try:
-            revised = self.review_service.apply_subtitle_override_rule(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                selected_id,
-                **arguments,
-            )
-        except PlanReviewError as exc:
-            notify(localize_plan_term(exc))
-            return
-        self.plan = revised
-        self.snapshot = build_plan_review_snapshot(revised)
-        self.decision = self.review_service.load_or_create(revised)
-        self.task_data = get_task(self.plan.task_id) or self.task_data
-        self.selected_ids.clear()
-        self.selection_label.text = "已选择 0 项"
-        self.review_badge.text = REVIEW_STATUS_LABELS[self.decision.status]
-        self._refresh_plan_header()
-        self._render_entries()
-        self._render_subtitle_rule_audit()
-        self._refresh_execute_button()
-        notify(f"字幕决定已保存为新版{RENAME_PLAN_TERM}；旧批准已清空，尚未执行文件操作")
-
-    def _revert_subtitle_rule(self, rule_id: str) -> None:
-        reason_widget = getattr(self, "subtitle_revert_reason", None)
-        reason = str(getattr(reason_widget, "value", "") or "").strip()
-        try:
-            revised = self.review_service.revert_subtitle_rule(
-                self.plan.task_id,
-                PlanStore.fingerprint(self.plan),
-                rule_id,
-                reason,
-            )
-        except PlanReviewError as exc:
-            notify(localize_plan_term(exc))
-            return
-        self.plan = revised
-        self.snapshot = build_plan_review_snapshot(revised)
-        self.decision = self.review_service.load_or_create(revised)
-        self.task_data = get_task(self.plan.task_id) or self.task_data
-        self.selected_ids.clear()
-        self.selection_label.text = "已选择 0 项"
-        self.review_badge.text = REVIEW_STATUS_LABELS[self.decision.status]
-        self._refresh_plan_header()
-        self._render_entries()
-        self._render_subtitle_rule_audit()
-        self._refresh_execute_button()
-        notify(f"字幕规则已撤销为新版{RENAME_PLAN_TERM}；旧批准未恢复，尚未执行文件操作")
-
     def _refresh_plan_header(self) -> None:
+        PlanReviewDialog._refresh_official_special_action(self)
+        self.plan_badge.set_visibility(entry_status(self.plan, self.task_data) != "已整理")
         self.plan_badge.text = PLAN_STATUS_LABELS.get(
             self.snapshot.plan_status, self.snapshot.plan_status
         )
@@ -5581,7 +4275,7 @@ class PlanReviewDialog(ui.dialog):
         if not authoritative_title and self.plan.work_identity is not None:
             authoritative_title = str(self.plan.work_identity.title or "").strip()
         for element, value in (
-            (getattr(self, "header_title_value", None), authoritative_title or "未记录"),
+            (getattr(self, "header_title_value", None), authoritative_title or PlanReviewDialog._pending_work_title(self)),
             (getattr(self, "header_season_value", None), self._header_season_text()),
             (
                 getattr(self, "header_recognition_value", None),
@@ -5589,17 +4283,15 @@ class PlanReviewDialog(ui.dialog):
             ),
             (
                 getattr(self, "header_entry_count_value", None),
-                str(len(self.snapshot.rows)),
+                str(len(self.plan.entries)),
             ),
         ):
             if element is not None:
                 element.text = value
                 element.update()
         if can_approve_plan(self.snapshot.plan_status):
-            self.approve_selected_button.enable()
             self.approve_all_button.enable()
         else:
-            self.approve_selected_button.disable()
             self.approve_all_button.disable()
         self._render_issues()
 
@@ -5610,10 +4302,23 @@ class PlanReviewDialog(ui.dialog):
         return "不适用" if bool(self.plan.metadata.get("is_movie")) else "待确认"
 
     def _header_recognition_text(self) -> str:
+        if self._replacement_unfinished():
+            return '本次选择未完成'
         work = getattr(self.plan, "work_identity", None)
         if work is not None and work.status == "confirmed":
             return "已确认作品"
+        operation, _ = build_review_operation(self.task_data)
+        if operation.context.get('candidate'):
+            return '本次选择未完成'
         return "等待选择作品"
+
+    def _pending_work_title(self) -> str:
+        operation, _ = build_review_operation(self.task_data)
+        pending_read = self._pre_admission_selection()
+        candidate = pending_read.candidate if pending_read is not None else operation.context.get('candidate')
+        if isinstance(candidate, Mapping) and candidate.get('title'):
+            return f"{candidate['title']}（待确认）"
+        return '尚未选择'
 
 
 def _meta_item(label: str, value: str, monospace: bool = False):
@@ -5622,13 +4327,6 @@ def _meta_item(label: str, value: str, monospace: bool = False):
         return ui.label(value).classes(
             "font-medium " + ("font-mono" if monospace else "")
         )
-
-
-def _comma_values(value: object) -> Tuple[str, ...]:
-    return tuple(
-        item.strip() for item in str(value or "").replace("，", ",").split(",")
-        if item.strip()
-    )
 
 
 def _media_type_from_flags(is_anime: object, is_movie: object) -> str:
@@ -5650,7 +4348,7 @@ async def _reenqueue_from_workspace(
     media_type: object,
     name_value: object,
     season_value: object,
-    use_ai: bool,
+    opened_evidence=None,
 ) -> bool:
     source_path = str(path_value or "").strip()
     if not source_path:
@@ -5662,154 +4360,122 @@ async def _reenqueue_from_workspace(
     except (TypeError, ValueError, KeyError):
         notify("季度或媒体类型无效", type="negative")
         return False
-    task_data.update({
-        "path": source_path,
-        "is_anime": is_anime,
-        "is_movie": is_movie,
-        "name": str(name_value or "").strip() or "等待识别",
-        "season_id": season_id,
-        "use_ai": use_ai,
-    })
-    write_task(task_id, task_data)
-    await task_queue.reenqueue_workspace(
-        task_id,
-        Path(source_path),
-        is_anime=is_anime,
-        is_movie=is_movie,
-        custom_name=str(name_value or "").strip() or None,
-        custom_season_id=season_id,
-        use_ai=use_ai,
-        preview_only=bool(task_data.get("preview_only", False)),
-    )
-    notify("设置已保存，任务已重新加入队列", type="positive")
+    if opened_evidence is None:
+        notify("缺少开窗时的任务依据，请关闭后重新打开", type="warning")
+        return False
+    with ui.dialog() as confirmation, ui.card():
+        ui.label('重新识别此任务').classes('text-lg font-bold')
+        ui.label('来源文件和任务卡保留。旧计划、批准、版本选择和特别篇归属将退出，按当前设置重新识别。')
+        with ui.row():
+            ui.button('取消', on_click=lambda: confirmation.submit(False), icon='o_close').props('flat')
+            ui.button('确认重新识别', on_click=lambda: confirmation.submit(True), icon='o_refresh')
+    if not await confirmation:
+        return False
+    try:
+        await task_queue.reenqueue_workspace(
+            task_id, Path(source_path), is_anime=is_anime, is_movie=is_movie,
+            custom_name=str(name_value or "").strip() or None,
+            custom_season_id=season_id,
+            preview_only=bool(task_data.get("preview_only", False)),
+            opened_evidence=opened_evidence,
+        )
+    except (PlanExecutionError, RuntimeError, ValueError, OSError) as exc:
+        notify(str(exc), type="warning")
+        return False
+    notify("任务已重新加入队列", type="positive")
     return True
 
 
-class RecognitionRecoveryDialog(ui.dialog):
-    """Single-workspace fallback for tasks which do not have a readable plan."""
+async def _read_manual_provider_url(value):
+    return await ui_disk_call(resolve_provider_item_url, value,
+        tmdb_api_key=effective_tmdb_api_key(cm), bangumi_token=cm.get_config('bangumi_token'),
+        bangumi_user_agent=cm.get_config('bangumi_user_agent'))
 
-    def __init__(self, task_id: str, task_data: Dict[str, object], error: Exception):
-        super().__init__()
-        self.task_id = task_id
-        self.task_data = task_data
-        with self, ui.card().classes("bar-dialog bar-review-dialog"):
-            ui.label("整理任务").classes("bar-dialog-title")
-            ui.label(
-                "当前没有可读取的整理计划。请修正重新识别设置后生成新计划。"
-            ).classes("bar-muted")
-            ui.label(
-                "当前任务没有可读取的整理计划（可能尚未生成、已过期或已损坏）。"
-            ).classes(
-                "bar-task-feedback bar-error-text"
-            )
-            self.path_input = ui.input(
-                "来源目录", value=str(task_data.get("path") or "")
-            ).props("outlined dense").classes("w-full")
-            with ui.row().classes("w-full items-end gap-3 flex-wrap"):
-                self.media_type = ui.select(
-                    MEDIA_OPTIONS,
-                    value=_media_type_from_flags(
-                        task_data.get("is_anime"), task_data.get("is_movie")
-                    ),
-                    label="媒体类型",
-                ).props("outlined dense options-dense").classes("w-48")
-                self.name_input = ui.input(
-                    "检索名称", value=str(task_data.get("name") or "")
-                ).props("outlined dense clearable").classes("grow")
-                self.season_input = ui.number(
-                    "季度", value=task_data.get("season_id")
-                ).props("outlined dense clearable").classes("w-32")
-                self.use_ai = ui.checkbox(
-                    "允许 AI 辅助", value=bool(task_data.get("use_ai", False))
-                )
-            with ui.row().classes("w-full gap-3"):
-                ui.button(icon="folder_open", on_click=self._pick_source).props(
-                    'outline color=blue-8 aria-label="从文件夹树选择来源目录"'
-                ).tooltip("从文件夹树选择来源目录")
-                ui.button(
-                    "保存并重新识别", icon="refresh", on_click=self._restart
-                ).props("unelevated color=blue-8")
-                ui.button("关闭", on_click=self.close).props("flat color=grey-8")
 
-    async def _pick_source(self) -> None:
-        current = str(self.path_input.value or cm.get_config("docker_mnt") or "/volume1")
-        result = await local_file_picker(current, multiple=False, title="选择来源目录")
-        if isinstance(result, (list, tuple)) and result:
-            self.path_input.value = str(result[0])
-            self.path_input.update()
 
-    async def _restart(self) -> None:
-        saved = await _reenqueue_from_workspace(
-            self.task_id,
-            self.task_data,
-            path_value=self.path_input.value,
-            media_type=self.media_type.value,
-            name_value=self.name_input.value,
-            season_value=self.season_input.value,
-            use_ai=bool(self.use_ai.value),
-        )
-        if saved:
-            self.close()
+
+class RecognitionRecoveryDialog(PlanReviewDialog):
+    """旧计划异常和来源确认使用同一个整理窗口。"""
+    def __init__(self, task_id, task_data, error):
+        from ..rename.input_directory_discovery import source_group_pending
+        super().__init__(None, task_data,
+            recovery_error=None if source_group_pending(task_data) else error)
+
+    async def _select_url(self):
+        from .provider_selection_work import select
+        await select(self)
 
 
 async def plan_review_page(task_id: str) -> None:
-    task_data = get_task(task_id)
     try:
-        plan = PlanStore(PLAN_PATH).load(task_id)
+        client = ui.context.client
+    except RuntimeError:
+        client = None  # Non-UI callers exercise the same preparation path.
+    openings = getattr(client, '_bar_review_openings', set())
+    if task_id in openings:
+        return
+    if client is not None:
+        client._bar_review_openings = openings
+    openings.add(task_id)
+    try:
+        await _open_plan_review_page(task_id, client)
+    finally:
+        openings.discard(task_id)
+
+
+async def _open_plan_review_page(task_id: str, client) -> None:
+    from .provider_selection_work import waiting
+    from .data_table_page import show_task_queue
+    if waiting(task_queue, task_id) or task_queue.is_active(task_id) or task_id in task_queue._pending:
+        show_task_queue(client)
+        return
+    task_data = await ui_disk_call(get_task, task_id)
+    try:
+        plan = await ui_disk_call(PlanStore(PLAN_PATH).load, task_id)
     except PlanStoreError as exc:
-        if task_data.get("plan_status") != "inventory_only":
-            with _dialog_mount_context():
+        # A first failed lookup is not a corrupt historical Plan. Keep the
+        # normal unresolved workspace (including direct links) available.
+        def workspace_missing():
+            return (not PlanStore(PLAN_PATH).path_for(task_id).exists()
+                    and not DecisionStateStore(DECISION_STATE_PATH).path_for(task_id).exists())
+        first_workspace = await ui_disk_call(workspace_missing)
+        from ..rename.input_directory_discovery import source_group_pending
+        if not first_workspace or source_group_pending(task_data):
+            with client.content if client is not None else _dialog_mount_context():
                 dialog = RecognitionRecoveryDialog(task_id, task_data, exc)
             try:
-                await dialog
+                from .provider_selection_work import attach
+                attach(dialog)
+                next_action = await dialog
             finally:
                 dialog.delete()
+            if next_action == 'review':
+                await _open_plan_review_page(task_id, client)
             return
-        try:
-            plan = build_inventory_review_draft(
-                task_data,
-                dry_run=is_dry_run_enabled(),
-            )
-            decision_store = DecisionStateStore(DECISION_STATE_PATH)
-            # Persisted provider payloads and candidates are observations.  If
-            # the authoritative Decision/Plan pair is missing, persist an empty
-            # Decision plus a blocked review Plan instead of guessing whether
-            # an observation came from an explicit choice or a unique result.
-            recognition = UnresolvedRecognitionInput(task_id=task_id)
-
-            def finalize_inventory(_decision, projected, current):
-                snapshot = build_plan_review_snapshot(projected)
-                current.update({
-                    "workflow_status": "invalid",
-                    "plan_status": snapshot.plan_status,
-                    "plan_entry_count": len(snapshot.rows),
-                    "inventory_draft_created": True,
-                })
-                return current
-
-            task_decision, plan = commit_recognition_projection(
-                decision_store,
-                PlanStore(PLAN_PATH),
-                recognition,
-                plan,
-                task_terminal=TaskTerminalMutation.prepare(
-                    TASK_PATH, task_id, finalize_inventory
-                ),
-            )
-        except (InventoryDraftError, PlanStoreError) as draft_exc:
-            notify(f"无法建立库存处理草案：{localize_plan_term(draft_exc)}")
-            return
-        snapshot = build_plan_review_snapshot(plan)
-        task_data = get_task(task_id)
-        notify("已从未漂移的只读库存建立阻断式处理草案；尚未执行文件操作")
+        plan = None
+    if waiting(task_queue, task_id) or task_queue.is_active(task_id) or task_id in task_queue._pending:
+        show_task_queue(client)
+        return
     # This callback is invoked by a button inside the refreshable review-task
     # list.  If the dialog inherits that button's slot, the dashboard timer
     # deletes it as soon as approval changes the task signature.  Mount it on
     # the stable client root so approval can refresh the card behind it while
     # the dialog remains open for the execution step.
-    with _dialog_mount_context():
-        dialog = PlanReviewDialog(plan, task_data or get_task(task_id))
+    if not task_data:
+        task_data = await ui_disk_call(get_task, task_id)
+    if client is not None and client.id not in client.instances:
+        return
+    with client.content if client is not None else _dialog_mount_context():
+        dialog = PlanReviewDialog(plan, task_data, loading=plan is not None)
     try:
+        if plan is not None:
+            if (not await _prepare_visible_plan_dialog(dialog, plan, client)
+                    or dialog.exit_requested or dialog.is_deleted or not dialog.value
+                    or dialog.submitted.is_set()
+                    or (client is not None and client.id not in client.instances)):
+                return
+        from .provider_selection_work import attach
+        attach(dialog)
         await dialog
         if not getattr(dialog, "exit_requested", True):
             # A dashboard refresh can transiently detach the portal even
@@ -5818,4 +4484,66 @@ async def plan_review_page(task_id: str) -> None:
             dialog.open()
             await dialog
     finally:
-        dialog.delete()
+        if not dialog.is_deleted:
+            dialog.delete()
+
+
+async def _prepare_visible_plan_dialog(dialog, plan: RenamePlan, client, *, is_current=None) -> bool:
+    """Show feedback first; only a still-open, current window may consume the read."""
+    fingerprint = PlanStore.fingerprint(plan)
+    documents = frozenset(getattr(client, '_socket_to_document_id', {}).values())
+    reconnected = asyncio.Event()
+    dialog.submitted.clear()
+    dialog.open()
+
+    def disconnected():
+        if not dialog.is_deleted:
+            dialog._close_review()
+
+    if client is not None:
+        client.on_disconnect(disconnected)
+        client.on_connect(reconnected.set)
+    worker = asyncio.create_task(ui_disk_call(prepare_plan_review_open, plan))
+    closed = asyncio.create_task(dialog.submitted.wait())
+    reconnect_waits = []
+    try:
+        await asyncio.wait((worker, closed), return_when=asyncio.FIRST_COMPLETED)
+        # 同一页面短暂断线时保留读取结果；实际关闭仍立即结束等待。
+        while documents and not client._socket_to_document_id and not closed.done():
+            reconnected.clear()
+            connected = asyncio.create_task(reconnected.wait())
+            reconnect_waits.append(connected)
+            await asyncio.wait((connected, closed), return_when=asyncio.FIRST_COMPLETED)
+        # A close wins even if the read finished in the same event-loop turn.
+        if (dialog.submitted.is_set() or dialog.exit_requested or dialog.is_deleted
+                or not dialog.value
+                or (is_current is not None and not is_current())
+                or (client is not None and client.id not in client.instances)
+                or (documents and documents != frozenset(client._socket_to_document_id.values()))):
+            return False
+        snapshot = worker.result()
+        current = await ui_disk_call(PlanStore(PLAN_PATH).load, plan.task_id)
+        if (dialog.submitted.is_set() or dialog.exit_requested or dialog.is_deleted
+                or not dialog.value or (is_current is not None and not is_current())
+                or (client is not None and client.id not in client.instances)
+                or (documents and documents != frozenset(client._socket_to_document_id.values()))):
+            return False
+        if PlanStore.fingerprint(current) != fingerprint:
+            notify('整理计划已更新，请重新打开任务', type='warning')
+            return False
+        dialog._load_plan_view(plan, snapshot=snapshot)
+        return True
+    except Exception:
+        logger.exception('读取整理计划失败')
+        notify('读取整理计划失败，请关闭后重新打开任务', type='warning')
+        return False
+    finally:
+        if client is not None and disconnected in client.disconnect_handlers:
+            client.disconnect_handlers.remove(disconnected)
+        if client is not None and reconnected.set in client.connect_handlers:
+            client.connect_handlers.remove(reconnected.set)
+        for pending in (worker, closed, *reconnect_waits):
+            if not pending.done():
+                pending.cancel()
+        # 页面关闭不采用结果；已经启动的审核记录准备仍可完成。
+        await asyncio.gather(worker, closed, *reconnect_waits, return_exceptions=True)

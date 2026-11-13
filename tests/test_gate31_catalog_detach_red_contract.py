@@ -48,6 +48,7 @@ from src.rename.series_catalog import SERIES_CATALOG_SCHEMA_VERSION, SeriesCatal
 from src.rename.work_catalog import WORK_CATALOG_SCHEMA_VERSION, WorkCatalog
 from tests.presentation_fixtures import with_tv_presentation
 from tests.projection_test_support import save_plan_fixture
+from tests.test_plan_execution import _save_registered_tv_fixture
 
 
 WORK_KEY = "work-12345678-1234-1234-1234-123456789abc"
@@ -98,7 +99,7 @@ def _detached_tv_plan(root: Path, task_id: str = "gate31-detached") -> RenamePla
             execution_policy=ExecutionPolicy(target_root=target_root, dry_run=False),
             work_identity=WorkIdentity(
                 "confirmed",
-                "animation",
+                "general",
                 "Current Show",
                 2024,
                 ProviderIdentity(
@@ -122,13 +123,19 @@ def _detached_tv_plan(root: Path, task_id: str = "gate31-detached") -> RenamePla
             if key not in {"recovery_reason", "recovery_nonce"}
         },
     )
+    # Explicit component preconditions: real temporary sources, identity,
+    # manual Catalog binding, policy and Decision-owned font observation are
+    # projected before detach. This is not proof of a live detach operation.
+    baseline = _save_registered_tv_fixture(
+        PlanStore(root / "plans"), baseline, task_root=root / "tasks")
     verification = PlanVerifier().verify(baseline)
     if verification.status not in {PlanStatus.ACCEPTED, PlanStatus.NEED_CONFIRM} or verification.issues:
         raise AssertionError(
-            "Gate 3.1 fixture must be executable before the detach marker: "
+            "Gate 3.1 fixture must be current and approvable before the detach marker: "
             f"{verification.status.value} / {[item.code for item in verification.issues]}"
         )
-    return plan
+    return replace(baseline, metadata={**dict(baseline.metadata),
+        "recovery_reason": "catalog_detached", "recovery_nonce": "gate31-nonce"})
 
 
 class CatalogDetachedPlanRedContracts(unittest.TestCase):
@@ -166,7 +173,7 @@ class CatalogDetachedPlanRedContracts(unittest.TestCase):
             root = Path(directory)
             plan = _detached_tv_plan(root, "gate31-forged-approval")
             task_root = root / "tasks"
-            task_root.mkdir()
+            task_root.mkdir(exist_ok=True)
             (task_root / f"{plan.task_id}.json").write_text(
                 json.dumps(
                     {
@@ -179,8 +186,12 @@ class CatalogDetachedPlanRedContracts(unittest.TestCase):
                 encoding="utf-8",
             )
             plan_store = PlanStore(root / "plans")
-            plan = save_plan_fixture(plan_store, plan)
-            review = PlanReviewService(plan_store, root / "reviews")
+            # Negative-only corruption of an actually receipted component
+            # fixture. Never ask a fixture writer to accept a detached Plan.
+            source_before = {p: p.read_bytes() for p in plan.expected_sources}
+            plan_store.path_for(plan.task_id).write_text(json.dumps(plan.to_dict()), encoding="utf-8")
+            review = PlanReviewService(plan_store, root / "reviews", root / "work_catalog",
+                decision_state_root=root / "decision_state", task_root=task_root)
             fingerprint = plan_store.fingerprint(plan)
             # Deliberately bypass the public approval gate: execution must have
             # its own fail-closed defense against a forged/stale review file.
@@ -207,16 +218,17 @@ class CatalogDetachedPlanRedContracts(unittest.TestCase):
                 task_root=task_root,
                 record_root=root / "records",
                 transfer_factory=FakeTransfer,
-                catalog_root=root / "catalog",
-                series_catalog_root=root / "series",
-                decision_state_root=root / "decisions",
+                catalog_root=root / "work_catalog",
+                series_catalog_root=root / "series_catalog",
+                decision_state_root=root / "decision_state",
                 recovery_transaction_root=root / "transactions",
             )
 
-            with self.assertRaises(PlanExecutionError):
+            with self.assertRaisesRegex(PlanExecutionError, "catalog_detached_replan_required"):
                 service.execute(plan.task_id, fingerprint)
 
             self.assertEqual([], transfer_calls)
+            self.assertEqual(source_before, {p: p.read_bytes() for p in plan.expected_sources})
 
     def test_review_page_offers_one_explicit_replan_action_for_detached_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -242,6 +254,13 @@ class CatalogDetachedPlanRedContracts(unittest.TestCase):
                 recovery_service=Mock(),
                 _restart_recognition=Mock(),
                 _render_detach_transaction_recovery=Mock(),
+                catalog_detach_service=CatalogDetachService(
+                    transaction_store=RecoveryTransactionStore(Path(directory)/'transactions'),
+                    decision_store=DecisionStateStore(Path(directory)/'decision_state'),
+                    plan_store=PlanStore(Path(directory)/'plans'),
+                    work_catalog=WorkCatalog(Path(directory)/'work_catalog'),
+                    series_catalog=SeriesCatalog(Path(directory)/'series_catalog'),
+                    task_root=Path(directory)/'tasks'),
             )
             with (
                 patch("src.pages.plan_review_page.ui.row", return_value=stub),
@@ -251,6 +270,7 @@ class CatalogDetachedPlanRedContracts(unittest.TestCase):
                 patch("src.pages.plan_review_page.ui.icon", return_value=stub),
                 patch("src.pages.plan_review_page.ui.button", side_effect=record_button),
             ):
+                dialog.snapshot = SimpleNamespace(opening_context=None)
                 PlanReviewDialog._render_catalog_context_content(dialog)
 
             replan_actions = [
@@ -388,6 +408,8 @@ class TombstoneSchemaValidationRedContracts(unittest.TestCase):
 
     def _prepare_pending_reconciliation(self, backend: str):
         task_id = f"gate31-{backend}-reconcile"
+        (self.task_root / f'{task_id}.json').write_text(
+            json.dumps({'uuid': task_id, 'workflow_status': 'need_confirm'}), encoding='utf-8')
         key = SERIES_KEY if backend == "series" else WORK_KEY
         source = self.root / f"{backend}-source.mkv"
         source.write_bytes(b"media")

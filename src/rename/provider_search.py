@@ -8,6 +8,8 @@ or approve a rename plan.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from .provider_operation import provider_operation, successful_json
+from .provider_transport import BangumiTransport, ProviderSearchError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -23,14 +25,12 @@ import requests
 BANGUMI_API_BASE = "https://api.bgm.tv"
 BANGUMI_TIMEOUT = (5, 12)
 BANGUMI_MAX_RESULTS = 12
-BANGUMI_MAX_ATTEMPTS = 2
 CANDIDATE_RANKING_VERSION = "v1"
 TITLE_WEIGHT = 0.68
 YEAR_MATCH_BONUS = 0.12
 YEAR_CONFLICT_PENALTY = -0.18
 ANIMATION_PROVIDER_BONUS = 0.10
 MIN_TITLE_SIMILARITY = 0.28
-MAX_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_PROVIDER_DEADLINE_SECONDS = 60.0
 MANUAL_PROVIDER_RANKING_VERSION = "manual-url-v1"
 
@@ -127,10 +127,16 @@ def build_search_policy(
             expected.append(SOURCE_BANGUMI)
         expected.extend((SOURCE_TMDB_TV, SOURCE_TMDB_MOVIE))
     elif media_hint == "movie":
+        if bangumi_configured:
+            expected.append(SOURCE_BANGUMI)
         expected.append(SOURCE_TMDB_MOVIE)
     elif media_hint == "tv":
+        if bangumi_configured:
+            expected.append(SOURCE_BANGUMI)
         expected.append(SOURCE_TMDB_TV)
     else:
+        if bangumi_configured:
+            expected.append(SOURCE_BANGUMI)
         expected.extend((SOURCE_TMDB_TV, SOURCE_TMDB_MOVIE))
 
     scheduled = tuple(
@@ -210,6 +216,7 @@ class ProviderSearchCoordinator:
             return
 
     @staticmethod
+    @provider_operation
     def _run_worker(source: str, worker: ProviderWorker) -> ProviderSearchResult:
         started = time.monotonic()
         try:
@@ -297,10 +304,6 @@ class ProviderSearchCoordinator:
         return ProviderSearchBatch(policy, results, tuple(fused))
 
 
-class ProviderSearchError(RuntimeError):
-    """A provider could not return a trustworthy bounded response."""
-
-
 def parse_provider_item_url(url: str) -> Tuple[str, str, str]:
     """Parse one supported public detail URL without following the supplied host."""
 
@@ -362,7 +365,15 @@ def resolve_provider_item_url(
         if not title:
             raise ProviderSearchError("TMDB 条目没有可用标题")
         poster_path = str(payload.get("poster_path") or "")
+        from .tmdb_genre import classify_tmdb_animation_evidence
+        animation = classify_tmdb_animation_evidence(
+            genres=payload.get("genres"), genre_ids=payload.get("genre_ids"))
         candidate = {
+            "library_domain": ("animation" if animation.is_anime is True else
+                               "general" if animation.is_anime is False else "unknown"),
+            "library_domain_source": animation.evidence_source,
+            "library_domain_policy": animation.policy_version,
+            "library_domain_reason": animation.reason_code,
             "namespace": "tmdb",
             "entity_type": entity_type,
             "provider_id": provider_id,
@@ -386,16 +397,8 @@ def resolve_provider_item_url(
         token = str(bangumi_token or "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        response = client.get(
-            f"{BANGUMI_API_BASE}/v0/subjects/{provider_id}",
-            headers=headers,
-            timeout=BANGUMI_TIMEOUT,
-        )
-        try:
-            response.raise_for_status()
-            payload = response.json()
-        except (requests.RequestException, ValueError, TypeError) as exc:
-            raise ProviderSearchError("Bangumi 条目读取失败，请检查链接") from exc
+        payload = BangumiProviderClient(token=token, user_agent=user_agent,
+                                        session=client)._get_json(f"/v0/subjects/{provider_id}")
         if not isinstance(payload, Mapping):
             raise ProviderSearchError("Bangumi 条目返回结构无效")
         title = str(payload.get("name_cn") or payload.get("name") or "").strip()
@@ -403,7 +406,10 @@ def resolve_provider_item_url(
         images = payload.get("images") if isinstance(payload.get("images"), Mapping) else {}
         if not title:
             raise ProviderSearchError("Bangumi 条目没有可用标题")
+        subject_domain = {2: "animation", 6: "general"}.get(payload.get("type"), "unknown") if type(payload.get("type")) is int else "unknown"
         candidate = {
+            "library_domain": subject_domain,
+            "library_domain_source": "bangumi_subject_type" if subject_domain != "unknown" else "unknown",
             "namespace": "bangumi",
             "entity_type": "subject",
             "provider_id": provider_id,
@@ -411,6 +417,7 @@ def resolve_provider_item_url(
             "original_title": str(payload.get("name") or ""),
             "aliases": [],
             "year": int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None,
+            "platform": str(payload.get("platform") or ""),
             "poster_url": str(images.get("large") or images.get("common") or ""),
             "source_url": f"https://bgm.tv/subject/{provider_id}",
             "group_kind": "",
@@ -447,13 +454,21 @@ class BangumiProviderClient:
         self._user_agent = user_agent
         self._session = session or requests.Session()
         self._sleeper = sleeper
+        headers = {"Accept": "application/json", "User-Agent": self._user_agent}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        self._transport = BangumiTransport(self._session, headers, sleeper=sleeper)
 
-    def search_animation(
+    def search_animation(self, query, *, year=None, limit=8):
+        return self.search_subjects(query, domain="animation", year=year, limit=limit)
+
+    def search_subjects(
         self,
         query: str,
         *,
         year: Optional[int] = None,
         limit: int = 8,
+        domain: str = "animation",
     ) -> List[Dict[str, object]]:
         query = str(query).strip()
         if not query:
@@ -464,41 +479,15 @@ class BangumiProviderClient:
         }
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
-        filters: Dict[str, object] = {"type": [2]}
+        subject_types = {"animation": [2], "general": [6], "unknown": [2, 6]}
+        if domain not in subject_types:
+            raise ValueError("作品领域无效")
+        filters: Dict[str, object] = {"type": subject_types[domain]}
         if year:
             filters["air_date"] = [f">={int(year)}-01-01", f"<{int(year)+1}-01-01"]
-        last_error: Optional[BaseException] = None
-        payload = None
-        for attempt in range(BANGUMI_MAX_ATTEMPTS):
-            response = None
-            try:
-                response = self._session.post(
-                    f"{BANGUMI_API_BASE}/v0/search/subjects",
-                    params={"limit": min(max(int(limit), 1), BANGUMI_MAX_RESULTS), "offset": 0},
-                    json={"keyword": query, "sort": "match", "filter": filters},
-                    headers=headers,
-                    timeout=BANGUMI_TIMEOUT,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                break
-            except (requests.RequestException, ValueError, TypeError) as exc:
-                last_error = exc
-                if attempt + 1 < BANGUMI_MAX_ATTEMPTS:
-                    retry_after = 0.0
-                    if getattr(response, "status_code", None) == 429:
-                        try:
-                            retry_after = float(
-                                getattr(response, "headers", {}).get("Retry-After", 0)
-                            )
-                        except (TypeError, ValueError):
-                            retry_after = 0.0
-                    if retry_after > 0:
-                        self._sleeper(min(retry_after, MAX_RETRY_DELAY_SECONDS))
-        if payload is None:
-            raise ProviderSearchError(
-                f"Bangumi 搜索失败（{type(last_error).__name__}）"
-            ) from last_error
+        payload = self._transport.request('post', '/v0/search/subjects', stage='search',
+            params={"limit": min(max(int(limit), 1), BANGUMI_MAX_RESULTS), "offset": 0},
+            json={"keyword": query, "sort": "match", "filter": filters})
         if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
             raise ProviderSearchError("Bangumi 搜索返回结构不符合预期")
         snapshot_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -513,6 +502,8 @@ class BangumiProviderClient:
             images = item.get("images") if isinstance(item.get("images"), Mapping) else {}
             provider_id = str(item["id"])
             candidates.append({
+                "library_domain": {2: "animation", 6: "general"}.get(item.get("type"), "unknown"),
+                "library_domain_source": "bangumi_subject_type",
                 "namespace": "bangumi",
                 "entity_type": "subject",
                 "provider_id": provider_id,
@@ -520,6 +511,7 @@ class BangumiProviderClient:
                 "original_title": str(item.get("name") or ""),
                 "aliases": [],
                 "year": int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None,
+                "platform": str(item.get("platform") or ""),
                 "poster_url": str(images.get("large") or images.get("common") or ""),
                 "source_url": f"https://bgm.tv/subject/{provider_id}",
                 "snapshot_at": snapshot_at,
@@ -535,58 +527,59 @@ class BangumiProviderClient:
     ) -> Tuple[Tuple[Dict[str, object], ...], Tuple[Dict[str, object], ...]]:
         """Freeze one bounded prequel/sequel component from Bangumi."""
 
-        seed = str(subject_id or "").strip()
-        if not seed.isdigit():
-            raise ProviderSearchError("Bangumi 条目 ID 无效")
-        limit = min(max(int(max_subjects), 1), 20)
-        pending = [seed]
-        visited: set[str] = set()
-        subjects: Dict[str, Dict[str, object]] = {}
-        relations: Dict[Tuple[str, str, str], Dict[str, object]] = {}
-        while pending and len(visited) < limit:
-            current = pending.pop(0)
-            if current in visited:
-                continue
-            visited.add(current)
-            detail = self._get_json(f"/v0/subjects/{current}")
-            snapshot = self._crosswalk_subject_snapshot(detail)
-            if snapshot is not None:
-                subjects[current] = snapshot
-            related_payload = self._get_json(f"/v0/subjects/{current}/subjects")
-            related_items = (
-                related_payload
-                if isinstance(related_payload, list)
-                else related_payload.get("data", ())
-                if isinstance(related_payload, Mapping)
-                else ()
-            )
-            for item in related_items:
-                if not isinstance(item, Mapping):
+        with self._transport.operation():
+            seed = str(subject_id or "").strip()
+            if not seed.isdigit():
+                raise ProviderSearchError("Bangumi 条目 ID 无效")
+            limit = min(max(int(max_subjects), 1), 20)
+            pending = [seed]
+            visited: set[str] = set()
+            subjects: Dict[str, Dict[str, object]] = {}
+            relations: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+            while pending and len(visited) < limit:
+                current = pending.pop(0)
+                if current in visited:
                     continue
-                relation = str(item.get("relation") or "").strip()
-                # Bangumi currently returns related subjects as flat objects;
-                # older deployments and fixtures used {"subject": {...}}.
-                # The relation item only supplies an id and traversal edge.
-                # A full detail request below remains the TV evidence gate.
-                nested = item.get("subject")
-                related = nested if isinstance(nested, Mapping) else item
-                related_id = str(related.get("id") or "")
-                if not related_id.isdigit():
-                    continue
-                normalized = unicodedata.normalize("NFKC", relation).casefold()
-                if normalized not in {"前传", "续集", "prequel", "sequel"}:
-                    continue
-                key = (current, related_id, relation)
-                relations[key] = {
-                    "from": current,
-                    "to": related_id,
-                    "relation": relation,
-                }
-                if related_id not in visited and related_id not in pending:
-                    pending.append(related_id)
-        if seed not in subjects:
-            raise ProviderSearchError("Bangumi 条目缺少可用的 TV 证据")
-        return tuple(subjects.values()), tuple(relations.values())
+                visited.add(current)
+                detail = self._get_json(f"/v0/subjects/{current}")
+                snapshot = self._crosswalk_subject_snapshot(detail)
+                if snapshot is not None:
+                    subjects[current] = snapshot
+                related_payload = self._get_json(f"/v0/subjects/{current}/subjects")
+                related_items = (
+                    related_payload
+                    if isinstance(related_payload, list)
+                    else related_payload.get("data", ())
+                    if isinstance(related_payload, Mapping)
+                    else ()
+                )
+                for item in related_items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    relation = str(item.get("relation") or "").strip()
+                    # Bangumi currently returns related subjects as flat objects;
+                    # older deployments and fixtures used {"subject": {...}}.
+                    # The relation item only supplies an id and traversal edge.
+                    # A full detail request below remains the TV evidence gate.
+                    nested = item.get("subject")
+                    related = nested if isinstance(nested, Mapping) else item
+                    related_id = str(related.get("id") or "")
+                    if not related_id.isdigit():
+                        continue
+                    normalized = unicodedata.normalize("NFKC", relation).casefold()
+                    if normalized not in {"前传", "续集", "prequel", "sequel"}:
+                        continue
+                    key = (current, related_id, relation)
+                    relations[key] = {
+                        "from": current,
+                        "to": related_id,
+                        "relation": relation,
+                    }
+                    if related_id not in visited and related_id not in pending:
+                        pending.append(related_id)
+            if seed not in subjects:
+                raise ProviderSearchError("Bangumi 条目缺少可用的 TV 证据")
+            return tuple(subjects.values()), tuple(relations.values())
 
     def load_subject_evidence(self, subject_id: str) -> Dict[str, object]:
         """Load one exact Bangumi subject for non-series evidence linking."""
@@ -616,43 +609,16 @@ class BangumiProviderClient:
         }
 
     def _get_json(self, endpoint: str) -> object:
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": self._user_agent,
-        }
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-        last_error: Optional[BaseException] = None
-        for attempt in range(BANGUMI_MAX_ATTEMPTS):
-            response = None
-            try:
-                response = self._session.get(
-                    f"{BANGUMI_API_BASE}{endpoint}",
-                    headers=headers,
-                    timeout=BANGUMI_TIMEOUT,
-                )
-                response.raise_for_status()
-                return response.json()
-            except (requests.RequestException, ValueError, TypeError) as exc:
-                last_error = exc
-                if attempt + 1 < BANGUMI_MAX_ATTEMPTS:
-                    retry_after = 0.0
-                    if getattr(response, "status_code", None) == 429:
-                        try:
-                            retry_after = float(
-                                getattr(response, "headers", {}).get(
-                                    "Retry-After", 0
-                                )
-                            )
-                        except (TypeError, ValueError):
-                            retry_after = 0.0
-                    if retry_after > 0:
-                        self._sleeper(
-                            min(retry_after, MAX_RETRY_DELAY_SECONDS)
-                        )
-        raise ProviderSearchError(
-            f"Bangumi 关系读取失败（{type(last_error).__name__}）"
-        ) from last_error
+        self._transport.check_deadline(self._request_stage(endpoint))
+        return successful_json(('bangumi', self._session, self._token, self._user_agent, endpoint),
+                               lambda: self._fetch_json(endpoint))
+
+    @staticmethod
+    def _request_stage(endpoint):
+        return 'relations' if endpoint.endswith('/subjects') else 'detail'
+
+    def _fetch_json(self, endpoint: str) -> object:
+        return self._transport.request('get', endpoint, stage=self._request_stage(endpoint))
 
     @staticmethod
     def _crosswalk_subject_snapshot(
@@ -663,7 +629,10 @@ class BangumiProviderClient:
             return None
         platform = str(value.get("platform") or "").strip()
         subject_type = value.get("type")
-        if platform and unicodedata.normalize("NFKC", platform).upper() != "TV":
+        from .provider_selection_authority import is_bangumi_serial_platform
+        if subject_type not in {2, "2", 6, "6", None}:
+            return None
+        if platform and not is_bangumi_serial_platform(platform):
             return None
         if not platform and subject_type not in {2, "2", None}:
             return None
@@ -679,6 +648,7 @@ class BangumiProviderClient:
             "air_date": str(value.get("date") or ""),
             "episode_count": episode_count,
             "platform": platform or "TV",
+            "library_domain": "general" if subject_type in {6, "6"} else "animation",
         }
 
 

@@ -21,48 +21,40 @@ CONFIG_DEFAULT = {
     "anime_movie_path": "",
     "mode": "链接",
     "docker_mnt": "/volume1",
-    "ai_provider": "openai",
-    "ai_api_key": "",
-    "ai_base_url": "https://api.openai.com/v1",
-    "ai_model": "gpt-4o-mini",
-    "ai_temperature": 0.1,  # OpenAI温度
-    "gemini_api_key": "",
-    "gemini_base_url": "https://generativelanguage.googleapis.com",
-    "gemini_model": "gemini-2.5-flash",
-    "gemini_temperature": 0.5,  # Gemini温度
-    "ai_enabled": False,
-    "ai_confidence_threshold": "Medium",
-    "openai_output_format": "function_calling",  # OpenAI输出格式选择
-    "ai_auto_save": False,  # 是否自动保存AI分析结果
     "log_level": "INFO",  # 日志等级
 }
 
 CN_MAP = {
-    "api_key": "🔑 TMDB API密钥",
-    "bangumi_enabled": "🌐 启用 Bangumi 动画检索",
-    "bangumi_token": "🔑 Bangumi Access Token（可选）",
-    "bangumi_user_agent": "🪪 Bangumi User-Agent",
-    "bangumi_path": "🎬 电视剧路径",
-    "movie_path": "🎬 电影路径",
-    "anime_path": "🎬 动画路径",
-    "anime_movie_path": "🎬 动画电影路径",
-    "mode": "💿 重命名模式",
-    "docker_mnt": "📁 容器浏览根目录",
-    "ai_provider": "🤖 AI提供商",
-    "ai_api_key": "🤖 OpenAI API密钥",
-    "ai_base_url": "🌐 OpenAI API地址",
-    "ai_model": "🧠 OpenAI模型",
-    "gemini_api_key": "💎 Gemini API密钥",
-    "gemini_base_url": "🌐 Gemini API地址",
-    "gemini_model": "💎 Gemini模型",
-    "ai_enabled": "🚀 启用AI识别",
-    "ai_confidence_threshold": "📊 AI置信度阈值",
-    "openai_output_format": "🎯 OpenAI输出格式",
-    "ai_temperature": "🔥 OpenAI温度",
-    "gemini_temperature": "🔥 Gemini温度",
-    "ai_auto_save": "💾 自动保存AI分析",
-    "log_level": "📝 日志等级",
+    "api_key": "TMDB API密钥",
+    "bangumi_enabled": "Bangumi 动画检索",
+    "bangumi_token": "Bangumi Token",
+    "bangumi_user_agent": "Bangumi UA",
+    "bangumi_path": "电视剧路径",
+    "movie_path": "电影路径",
+    "anime_path": "动画路径",
+    "anime_movie_path": "动画电影路径",
+    "mode": "重命名模式",
+    "docker_mnt": "容器浏览根目录",
+    "log_level": "日志等级",
 }
+
+
+# 仅保留旧配置原值；不生成默认值，也不提供读写设置入口。
+RETIRED_AI_CONFIG_KEYS = frozenset({
+    'ai_api_key',
+    'ai_auto_save',
+    'ai_base_url',
+    'ai_confidence_threshold',
+    'ai_enabled',
+    'ai_model',
+    'ai_provider',
+    'ai_temperature',
+    'gemini_api_key',
+    'gemini_base_url',
+    'gemini_model',
+    'gemini_temperature',
+    'openai_output_format',
+})
 
 
 class ConfigManager:
@@ -105,14 +97,7 @@ class ConfigManager:
             key: data.get(key, default)
             for key, default in CONFIG_DEFAULT.items()
         }
-        if current.get("docker_mnt") == "/media":
-            current["docker_mnt"] = "/volume1"
-        for key in ("bangumi_path", "movie_path", "anime_path", "anime_movie_path"):
-            value = current.get(key)
-            if value == "/media":
-                current[key] = "/volume1/Vault/Anime"
-            elif isinstance(value, str) and value.startswith("/media/"):
-                current[key] = "/volume1/Vault/Anime/" + value[len("/media/"):]
+        current.update({key: data[key] for key in RETIRED_AI_CONFIG_KEYS if key in data})
         return current
 
     def _read_current_unlocked(self) -> Dict[str, Any]:
@@ -158,6 +143,8 @@ class ConfigManager:
             self.config = normalized
 
     def get_config(self, key: str) -> str:
+        if key in RETIRED_AI_CONFIG_KEYS:
+            return ''
         if key in self.config:
             return self.config[key]
         elif key in CONFIG_DEFAULT:
