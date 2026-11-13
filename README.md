@@ -1,6 +1,6 @@
 # BangumiAutoRenamer
 
-BangumiAutoRenamer 是一个人工监督的影视整理工具。通过 Bangumi、TMDB 查找作品，确认作品与季度、编辑文件内容、审核计划，再执行保留源文件的硬链接整理。WebUI 使用 NiceGUI，支持动画、真人剧集和电影。
+BangumiAutoRenamer 是一个影视整理工具。通过 Bangumi、TMDB 查找作品，确认作品与季度、编辑文件内容、审核计划，再执行保留源文件的硬链接整理。WebUI 使用 NiceGUI，支持动画、真人剧集和电影。
 
 当前版本：**0.3.0-rc.83**。运行环境以 **Python 3.11** 为验证基准。
 
